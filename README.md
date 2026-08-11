@@ -85,13 +85,30 @@ Anthropic 模型的 `output_config.effort`，以及 Gemini 3+ 的
 每个 trial 的 `agent/` 目录会包含可用的以下文件：
 
 - `nexau.txt`：NexAU 标准输出和错误输出。
-- `nexau_history.json`：NexAU 对话历史。
-- `nexau_in_memory_tracer.json`：LLM tracer 数据。
+- `nexau_history.json`：NexAU 最终执行历史，可能包含上下文压缩结果。
+- `nexau_full_trace.json`：NexAU 在压缩前保存的完整对话历史。
+- `nexau_in_memory_tracer.json`：完整的 LLM/工具 span、输入、输出和 usage。
 - `nexau_result.json`：NexAU 最终响应。
+- `nexau_trace_checkpoint.json`：最近一次 trace checkpoint 的状态和文件清单。
 - `trajectory.json`：适配器生成的 ATIF-v1.7 轨迹。
 
+运行期间默认每 30 秒原子刷新 history 和原始 tracer；可通过
+`NEXAU_TRACE_CHECKPOINT_SEC` 修改间隔，设为 `0` 可关闭周期 checkpoint。正常结束后会
+再次原子写入最终文件，且 ATIF 优先从未压缩的 `nexau_full_trace.json` 生成。若进程被
+强制终止，最近一次 `status=running` 的 checkpoint 仍可用于诊断，但它只代表终止前的
+部分轨迹。
+
 Harbor 0.21.x 负责从本地或云环境统一下载 `/logs/agent`，随后适配器从上述日志回填
-token/cost context 并生成 ATIF 文件。
+token/cost context 并生成 ATIF 文件。每道题（每个 attempt）的评分、异常、耗时和 token
+统计位于 `jobs/<job-name>/<trial-name>/result.json`，verifier 原始输出位于同目录的
+`verifier/`；`jobs/<job-name>/result.json` 保存整项 job 的聚合统计。
+
+可以按题输出结果摘要：
+
+```bash
+find jobs/<job-name> -mindepth 2 -maxdepth 2 -name result.json \
+  -exec jq -c '{task: .task_name, trial: .trial_name, reward: .verifier_result.rewards, error: .exception_info.exception_type}' {} \;
+```
 
 ## 跟进 Harbor 更新
 

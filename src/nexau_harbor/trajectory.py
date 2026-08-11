@@ -177,6 +177,7 @@ def history_to_trajectory(
     agent_version: str,
     model_name: str | None,
     reasoning_effort: str | None,
+    history_source: str = "nexau_history.json",
 ) -> Trajectory | None:
     if not isinstance(history, list) or not history:
         return None
@@ -284,7 +285,7 @@ def history_to_trajectory(
             name=agent_name,
             version=agent_version,
             model_name=model_name,
-            extra={"history_source": "nexau_history.json"},
+            extra={"history_source": history_source},
         ),
         steps=steps,
         final_metrics=totals,
@@ -304,10 +305,17 @@ def populate_context_from_logs(
     metrics, totals = collect_metrics(
         logs_dir / "nexau_in_memory_tracer.json", logger
     )
-    history_path = logs_dir / "nexau_history.json"
-    if history_path.exists():
+    history_candidates = (
+        logs_dir / "nexau_full_trace.json",
+        logs_dir / "nexau_history.json",
+    )
+    for history_path in history_candidates:
+        if not history_path.exists():
+            continue
         try:
             history = json.loads(history_path.read_text(encoding="utf-8"))
+            if not isinstance(history, list) or not history:
+                continue
             trajectory = history_to_trajectory(
                 history,
                 metrics,
@@ -317,6 +325,7 @@ def populate_context_from_logs(
                 agent_version=agent_version,
                 model_name=model_name,
                 reasoning_effort=reasoning_effort,
+                history_source=history_path.name,
             )
             if trajectory is not None:
                 (logs_dir / "trajectory.json").write_text(
@@ -324,6 +333,7 @@ def populate_context_from_logs(
                     encoding="utf-8",
                 )
                 totals = trajectory.final_metrics
+                break
         except (OSError, ValueError):
             logger.exception("Failed to convert NexAU history: %s", history_path)
 

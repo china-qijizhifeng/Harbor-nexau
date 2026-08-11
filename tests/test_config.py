@@ -22,6 +22,10 @@ def test_default_config_references_existing_assets() -> None:
 
     assert config["system_prompt"] == "./systemprompt_tb2.md"
     assert (config_path.parent / "systemprompt_tb2.md").is_file()
+    assert config["tracers"] == [
+        {"import": "gdpval_nexau_tracer:ThreadSafeInMemoryTracer"}
+    ]
+    assert (config_path.parent / "gdpval_nexau_tracer.py").is_file()
     assert len(config["tools"]) == 6
     for tool in config["tools"]:
         assert (config_path.parent / tool["yaml_path"]).is_file()
@@ -47,6 +51,10 @@ def test_nexau_builds_migrated_config(monkeypatch, tmp_path: Path) -> None:
         "effort": "medium",
         "summary": "detailed",
     }
+    assert agent.config.resolved_tracer.__class__.__name__ == (
+        "ThreadSafeInMemoryTracer"
+    )
+    assert hasattr(agent, "full_trace")
     assert "harbor_reasoning_effort" not in agent.config.llm_config.extra_params
 
 

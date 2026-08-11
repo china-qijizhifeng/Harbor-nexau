@@ -133,6 +133,50 @@ def test_invalid_history_does_not_create_trajectory(tmp_path: Path) -> None:
     assert not (logs_dir / "trajectory.json").exists()
 
 
+def test_uncompacted_full_trace_is_preferred_over_final_history(
+    tmp_path: Path,
+) -> None:
+    logs_dir = tmp_path / "agent"
+    logs_dir.mkdir()
+    compacted_history = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "compacted summary"}],
+        }
+    ]
+    full_trace = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "original task"}],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "original answer"}],
+        },
+    ]
+    (logs_dir / "nexau_history.json").write_text(json.dumps(compacted_history))
+    (logs_dir / "nexau_full_trace.json").write_text(json.dumps(full_trace))
+
+    populate_context_from_logs(
+        logs_dir=logs_dir,
+        context=AgentContext(),
+        agent_name="nexau",
+        agent_version="0.4.0",
+        model_name="openai/gpt-5",
+        reasoning_effort="medium",
+        logger=logging.getLogger("test"),
+    )
+
+    trajectory = Trajectory.model_validate_json(
+        (logs_dir / "trajectory.json").read_text()
+    )
+    assert [step.message for step in trajectory.steps] == [
+        "original task",
+        "original answer",
+    ]
+    assert trajectory.agent.extra == {"history_source": "nexau_full_trace.json"}
+
+
 def test_gemini_usage_metadata_is_normalized(tmp_path: Path) -> None:
     trace_path = tmp_path / "nexau_in_memory_tracer.json"
     trace_path.write_text(

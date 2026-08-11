@@ -55,12 +55,21 @@ def test_agent_uses_packaged_config_and_harbor_model_connection(tmp_path: Path) 
     assert runtime_env["LLM_KIND"] == "openai_responses"
     assert runtime_env["LLM_API_KEY"] == "test-key"
     assert runtime_env["LLM_BASE_URL"] == "https://example.test/v1"
+    assert runtime_env["NEXAU_TRACE_CHECKPOINT_SEC"] == "30"
     assert runtime_env["GDPVAL_NEXAU_SUMMARY_MODEL"] == "gpt-5"
 
 
 def test_agent_allows_explicit_api_type(tmp_path: Path) -> None:
     agent = make_agent(tmp_path, api_type="openai_chat_completion")
     assert agent._runtime_env()["LLM_KIND"] == "openai_chat_completion"
+
+
+def test_trace_checkpoint_interval_can_be_overridden(tmp_path: Path) -> None:
+    agent = make_agent(
+        tmp_path,
+        extra_env={"NEXAU_TRACE_CHECKPOINT_SEC": "5"},
+    )
+    assert agent._runtime_env()["NEXAU_TRACE_CHECKPOINT_SEC"] == "5"
 
 
 def test_agent_strips_generic_harbor_provider_prefix(tmp_path: Path) -> None:

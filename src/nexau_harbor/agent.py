@@ -40,6 +40,7 @@ class NexAUAgent(BaseInstalledAgent):
     _FORWARDED_EXACT = (
         "HTTP_PROXY",
         "HTTPS_PROXY",
+        "NEXAU_TRACE_CHECKPOINT_SEC",
         "NO_PROXY",
         "SERPER_API_KEY",
     )
@@ -192,6 +193,9 @@ class NexAUAgent(BaseInstalledAgent):
                 "LLM_MAX_TOKENS": env.get("LLM_MAX_TOKENS", "32000"),
                 "LLM_TIMEOUT_SEC": env.get("LLM_TIMEOUT_SEC", "600"),
                 "LLM_MAX_RETRIES": env.get("LLM_MAX_RETRIES", "3"),
+                "NEXAU_TRACE_CHECKPOINT_SEC": env.get(
+                    "NEXAU_TRACE_CHECKPOINT_SEC", "30"
+                ),
                 "GDPVAL_TOOL_RESULT_MAX_CHARS": env.get(
                     "GDPVAL_TOOL_RESULT_MAX_CHARS", "10000"
                 ),

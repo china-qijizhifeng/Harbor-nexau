@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
+import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+_DEFAULT_TRACE_CHECKPOINT_SEC = 30.0
+_TRACE_CHECKPOINT_ENV = "NEXAU_TRACE_CHECKPOINT_SEC"
 
 
 def _ensure_config_dir_on_sys_path(config_path: Path) -> None:
@@ -32,11 +37,14 @@ def _load_raw_config(config_path: Path) -> dict[str, Any]:
 
 
 def _has_in_memory_tracer(tracer_configs: list[Any]) -> bool:
-    import_path = "nexau.archs.tracer.adapters.in_memory:InMemoryTracer"
+    import_paths = {
+        "nexau.archs.tracer.adapters.in_memory:InMemoryTracer",
+        "gdpval_nexau_tracer:ThreadSafeInMemoryTracer",
+    }
     for entry in tracer_configs:
-        if isinstance(entry, str) and entry.strip() == import_path:
+        if isinstance(entry, str) and entry.strip() in import_paths:
             return True
-        if isinstance(entry, dict) and entry.get("import") == import_path:
+        if isinstance(entry, dict) and entry.get("import") in import_paths:
             return True
     return False
 
@@ -216,10 +224,21 @@ def _jsonable(value: Any) -> Any:
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    path.write_text(
-        json.dumps(_jsonable(payload), ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    """Atomically replace a JSON artifact so interrupted writes stay readable."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rendered = json.dumps(_jsonable(payload), ensure_ascii=False, indent=2)
+    temporary_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     )
+    try:
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _dump_history(agent: Any, log_dir: Path) -> None:
@@ -227,15 +246,148 @@ def _dump_history(agent: Any, log_dir: Path) -> None:
     _write_json(log_dir / "nexau_history.json", history)
 
 
-def _dump_in_memory_traces(agent: Any, log_dir: Path) -> None:
+def _dump_full_trace(agent: Any, log_dir: Path) -> bool:
+    """Persist NexAU's append-only, pre-compaction conversation trace."""
+
+    full_trace = getattr(agent, "full_trace", None)
+    if callable(full_trace):
+        full_trace = full_trace()
+    if not full_trace:
+        return False
+    _write_json(
+        log_dir / "nexau_full_trace.json",
+        [_jsonable(message) for message in list(full_trace)],
+    )
+    return True
+
+
+def _dump_in_memory_traces(agent: Any, log_dir: Path) -> bool:
     tracer = _get_in_memory_tracer(agent)
     if tracer is None:
-        return
+        return False
     try:
         tracer.flush()
     except Exception:
         pass
     _write_json(log_dir / "nexau_in_memory_tracer.json", tracer.dump_traces())
+    return True
+
+
+def _trace_checkpoint_interval() -> float:
+    raw = os.environ.get(
+        _TRACE_CHECKPOINT_ENV,
+        str(_DEFAULT_TRACE_CHECKPOINT_SEC),
+    ).strip()
+    try:
+        interval = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TRACE_CHECKPOINT_ENV} must be a non-negative number, got {raw!r}"
+        ) from exc
+    if not math.isfinite(interval) or interval < 0:
+        raise ValueError(
+            f"{_TRACE_CHECKPOINT_ENV} must be a finite non-negative number, "
+            f"got {raw!r}"
+        )
+    return interval
+
+
+def _write_trace_checkpoint_state(
+    log_dir: Path,
+    *,
+    status: str,
+    interval_sec: float,
+    written_files: list[str] | None = None,
+    errors: list[str] | None = None,
+) -> None:
+    _write_json(
+        log_dir / "nexau_trace_checkpoint.json",
+        {
+            "schema_version": 1,
+            "status": status,
+            "checkpointed_at": datetime.now().astimezone().isoformat(
+                timespec="seconds"
+            ),
+            "interval_sec": interval_sec,
+            "written_files": written_files or [],
+            "errors": errors or [],
+        },
+    )
+
+
+def _checkpoint_trace_artifacts(
+    agent: Any,
+    log_dir: Path,
+    *,
+    interval_sec: float,
+) -> None:
+    """Best-effort running checkpoint; each artifact is independently atomic."""
+
+    written_files: list[str] = []
+    errors: list[str] = []
+    dumpers = (
+        ("nexau_history.json", _dump_history),
+        ("nexau_full_trace.json", _dump_full_trace),
+        ("nexau_in_memory_tracer.json", _dump_in_memory_traces),
+    )
+    for filename, dumper in dumpers:
+        try:
+            if dumper(agent, log_dir) is not False:
+                written_files.append(filename)
+        except Exception as exc:
+            errors.append(f"{filename}: {type(exc).__name__}: {exc}")
+
+    _write_trace_checkpoint_state(
+        log_dir,
+        status="running",
+        interval_sec=interval_sec,
+        written_files=written_files,
+        errors=errors,
+    )
+
+
+class _PeriodicTraceCheckpointer:
+    def __init__(self, agent: Any, log_dir: Path, interval_sec: float) -> None:
+        self._agent = agent
+        self._log_dir = log_dir
+        self._interval_sec = interval_sec
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _checkpoint(self) -> None:
+        try:
+            _checkpoint_trace_artifacts(
+                self._agent,
+                self._log_dir,
+                interval_sec=self._interval_sec,
+            )
+        except Exception as exc:
+            print(
+                f"[nexau-harbor] Trace checkpoint failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval_sec):
+            self._checkpoint()
+
+    def start(self) -> None:
+        if self._interval_sec <= 0 or self._thread is not None:
+            return
+        self._checkpoint()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="nexau-trace-checkpointer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
 
 
 def _normalize_response(response: Any) -> tuple[Any, Any | None]:
@@ -297,26 +449,76 @@ def main() -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     agent: Any | None = None
+    checkpointer: _PeriodicTraceCheckpointer | None = None
+    checkpoint_interval = _trace_checkpoint_interval()
     try:
         agent = _build_agent(config_path)
-        response = agent.run(
-            message=args.query,
-            context=_build_runtime_context(agent),
+        checkpointer = _PeriodicTraceCheckpointer(
+            agent,
+            log_dir,
+            checkpoint_interval,
         )
+        checkpointer.start()
+        try:
+            response = agent.run(
+                message=args.query,
+                context=_build_runtime_context(agent),
+            )
+        finally:
+            checkpointer.stop()
         _dump_history(agent, log_dir)
+        _dump_full_trace(agent, log_dir)
         _dump_in_memory_traces(agent, log_dir)
         _dump_result(response, log_dir)
+        _write_trace_checkpoint_state(
+            log_dir,
+            status="complete",
+            interval_sec=checkpoint_interval,
+            written_files=[
+                path.name
+                for path in (
+                    log_dir / "nexau_history.json",
+                    log_dir / "nexau_full_trace.json",
+                    log_dir / "nexau_in_memory_tracer.json",
+                    log_dir / "nexau_result.json",
+                )
+                if path.exists()
+            ],
+        )
         return 0
     except Exception:
+        if checkpointer is not None:
+            checkpointer.stop()
         if agent is not None:
             try:
                 _dump_history(agent, log_dir)
             except Exception:
                 pass
             try:
+                _dump_full_trace(agent, log_dir)
+            except Exception:
+                pass
+            try:
                 _dump_in_memory_traces(agent, log_dir)
             except Exception:
                 pass
+        try:
+            _write_trace_checkpoint_state(
+                log_dir,
+                status="failed",
+                interval_sec=checkpoint_interval,
+                written_files=[
+                    path.name
+                    for path in (
+                        log_dir / "nexau_history.json",
+                        log_dir / "nexau_full_trace.json",
+                        log_dir / "nexau_in_memory_tracer.json",
+                    )
+                    if path.exists()
+                ],
+            )
+        except Exception:
+            pass
         traceback.print_exc()
         return 1
 

@@ -75,4 +75,4 @@ middlewares:
       summary_api_type: ${env.GDPVAL_NEXAU_SUMMARY_API_TYPE}
 
 tracers:
-  - import: nexau.archs.tracer.adapters.in_memory:InMemoryTracer
+  - import: gdpval_nexau_tracer:ThreadSafeInMemoryTracer
