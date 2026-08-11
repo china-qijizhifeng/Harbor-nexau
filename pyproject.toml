@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "harbor>=0.21.0,<0.22.0",
     "nexau @ git+https://github.com/nex-agi/NexAU.git@114c537dce877c5b521b5c33cc20d6001403ee92",
+    "python-dotenv>=1.2,<2",
 ]
 
 [project.optional-dependencies]

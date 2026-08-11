@@ -48,6 +48,14 @@ uv run harbor run \
 也可以使用封装脚本：
 
 ```bash
+scripts/smoke_tb3.sh --job-name nexau-smoke
+```
+
+脚本会通过 `python-dotenv` 自动读取仓库根目录的 `.env`，不需要先执行
+`source .env`。调用脚本前已经导出的环境变量优先于 `.env`；如需读取其他文件，可设置
+`HARBOR_NEXAU_ENV_FILE=/absolute/path/to/profile.env`。没有 `.env` 时也可以沿用内联配置：
+
+```bash
 HARBOR_NEXAU_MODEL=openai/gpt-5 scripts/smoke_tb3.sh
 ```
 

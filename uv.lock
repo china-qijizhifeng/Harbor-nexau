@@ -1188,6 +1188,7 @@ source = { editable = "." }
 dependencies = [
     { name = "harbor" },
     { name = "nexau" },
+    { name = "python-dotenv" },
 ]
 
 [package.optional-dependencies]
@@ -1207,6 +1208,7 @@ requires-dist = [
     { name = "harbor", specifier = ">=0.21.0,<0.22.0" },
     { name = "harbor", extras = ["daytona", "e2b", "modal"], marker = "extra == 'cloud'", specifier = ">=0.21.0,<0.22.0" },
     { name = "nexau", git = "https://github.com/nex-agi/NexAU.git?rev=114c537dce877c5b521b5c33cc20d6001403ee92" },
+    { name = "python-dotenv", specifier = ">=1.2,<2" },
 ]
 provides-extras = ["cloud"]
 
