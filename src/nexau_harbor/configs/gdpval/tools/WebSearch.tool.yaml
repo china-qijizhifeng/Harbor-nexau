@@ -1,0 +1,15 @@
+type: tool
+name: web_search
+description: Search the web for current external information.
+input_schema:
+  type: object
+  properties:
+    query:
+      type: string
+      description: Focused search query.
+    num_results:
+      type: integer
+      default: 10
+  required: [query]
+  additionalProperties: false
+  $schema: http://json-schema.org/draft-07/schema#

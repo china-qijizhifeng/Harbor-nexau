@@ -1,0 +1,44 @@
+[project]
+name = "harbor-nexau"
+version = "0.1.0"
+description = "NexAU installed-agent integration for the official Harbor framework."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "harbor>=0.21.0,<0.22.0",
+    "nexau @ git+https://github.com/nex-agi/NexAU.git@114c537dce877c5b521b5c33cc20d6001403ee92",
+]
+
+[project.optional-dependencies]
+cloud = [
+    "harbor[daytona,e2b,modal]>=0.21.0,<0.22.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "nexau_harbor"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "ruff>=0.12.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-q", "--strict-markers", "--strict-config"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nexau_harbor"]

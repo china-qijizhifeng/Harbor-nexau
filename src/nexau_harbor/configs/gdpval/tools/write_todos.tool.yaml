@@ -1,0 +1,23 @@
+type: tool
+name: write_todo
+description: >-
+  Replace the current subtask list. Use this for multi-step work, keep at most
+  one item in_progress, and update statuses as work advances.
+input_schema:
+  type: object
+  properties:
+    todos:
+      type: array
+      items:
+        type: object
+        properties:
+          description:
+            type: string
+          status:
+            type: string
+            enum: [pending, in_progress, completed, cancelled]
+        required: [description, status]
+        additionalProperties: false
+  required: [todos]
+  additionalProperties: false
+  $schema: http://json-schema.org/draft-07/schema#

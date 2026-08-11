@@ -1,0 +1,78 @@
+type: agent
+name: nexau_harbor_agent
+description: NexAU task-completion agent for Harbor evaluations.
+
+max_iterations: ${env.LLM_MAX_TURNS}
+max_context_tokens: ${env.LLM_CONTEXT_WINDOW_TOKENS}
+
+llm_config:
+  model: ${env.LLM_MODEL}
+  base_url: ${env.LLM_BASE_URL}
+  api_key: ${env.LLM_API_KEY}
+  max_tokens: ${env.LLM_MAX_TOKENS}
+  timeout: ${env.LLM_TIMEOUT_SEC}
+  max_retries: ${env.LLM_MAX_RETRIES}
+  api_type: ${env.LLM_KIND}
+  stream: true
+  # runner.py converts this neutral setting to each provider's native schema.
+  harbor_reasoning_effort: ${env.LLM_REASONING_EFFORT}
+
+system_prompt: ./systemprompt_tb2.md
+system_prompt_type: jinja
+tool_call_mode: structured
+stop_tools:
+  - finish
+
+tools:
+  - name: run_shell
+    yaml_path: ./tools/run_shell_command.tool.yaml
+    binding: gdpval_harbor_bindings:run_shell_command
+  - name: web_fetch
+    yaml_path: ./tools/WebFetch.tool.yaml
+    binding: nexau.archs.tool.builtin.web_tools:web_fetch
+  - name: web_search
+    yaml_path: ./tools/WebSearch.tool.yaml
+    binding: nexau.archs.tool.builtin.web_tools:google_web_search
+  - name: finish
+    yaml_path: ./tools/finish.tool.yaml
+    binding: gdpval_harbor_bindings:finish
+  - name: describe_image
+    yaml_path: ./tools/describe_image.tool.yaml
+    binding: gdpval_harbor_bindings:describe_image
+  - name: write_todo
+    yaml_path: ./tools/write_todos.tool.yaml
+    binding: nexau.archs.tool.builtin.session_tools:write_todos
+
+middlewares:
+  - import: gdpval_nexau_middlewares:LongToolOutputMiddleware
+    params:
+      max_output_chars: ${env.GDPVAL_TOOL_RESULT_MAX_CHARS}
+      head_lines: 50
+      tail_lines: 30
+      head_chars: 5000
+      tail_chars: 5000
+      bypass_tool_names:
+        - run_shell
+  - import: gdpval_nexau_middlewares:ContextCompactionMiddleware
+    params:
+      max_context_tokens: ${env.LLM_CONTEXT_WINDOW_TOKENS}
+      auto_compact: true
+      threshold: ${env.GDPVAL_NEXAU_PRIMARY_COMPACTION_THRESHOLD}
+      compaction_strategy: tool_result_compaction
+      keep_iterations: ${env.GDPVAL_NEXAU_KEEP_ITERATIONS}
+      keep_user_rounds: ${env.GDPVAL_NEXAU_KEEP_USER_ROUNDS}
+  - import: gdpval_nexau_middlewares:ContextCompactionMiddleware
+    params:
+      max_context_tokens: ${env.LLM_CONTEXT_WINDOW_TOKENS}
+      auto_compact: true
+      threshold: ${env.GDPVAL_NEXAU_FALLBACK_COMPACTION_THRESHOLD}
+      compaction_strategy: llm_summary
+      keep_iterations: ${env.GDPVAL_NEXAU_KEEP_ITERATIONS}
+      keep_user_rounds: ${env.GDPVAL_NEXAU_KEEP_USER_ROUNDS}
+      summary_model: ${env.GDPVAL_NEXAU_SUMMARY_MODEL}
+      summary_base_url: ${env.GDPVAL_NEXAU_SUMMARY_BASE_URL}
+      summary_api_key: ${env.GDPVAL_NEXAU_SUMMARY_API_KEY}
+      summary_api_type: ${env.GDPVAL_NEXAU_SUMMARY_API_TYPE}
+
+tracers:
+  - import: nexau.archs.tracer.adapters.in_memory:InMemoryTracer

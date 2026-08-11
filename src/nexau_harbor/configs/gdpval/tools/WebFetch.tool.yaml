@@ -1,0 +1,12 @@
+type: tool
+name: web_fetch
+description: Fetch and return readable content from one fully qualified URL.
+input_schema:
+  type: object
+  properties:
+    url:
+      type: string
+      description: Fully qualified HTTP or HTTPS URL.
+  required: [url]
+  additionalProperties: false
+  $schema: http://json-schema.org/draft-07/schema#

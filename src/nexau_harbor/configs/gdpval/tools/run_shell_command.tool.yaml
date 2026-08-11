@@ -1,0 +1,27 @@
+type: tool
+name: run_shell
+description: >-
+  Execute a bash command in the task sandbox. Use is_background only for
+  long-running services and use dir_path when the command needs another working
+  directory.
+input_schema:
+  type: object
+  properties:
+    command:
+      type: string
+      description: Exact bash command to execute.
+    description:
+      type: string
+      description: Brief purpose of the command.
+    is_background:
+      type: boolean
+      default: false
+    dir_path:
+      type: string
+      description: Existing directory in which to execute the command.
+    timeout_ms:
+      type: integer
+      description: Optional positive timeout in milliseconds.
+  required: [command]
+  additionalProperties: false
+  $schema: http://json-schema.org/draft-07/schema#

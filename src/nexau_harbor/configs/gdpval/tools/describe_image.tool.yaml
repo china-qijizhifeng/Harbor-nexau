@@ -1,0 +1,18 @@
+type: tool
+name: describe_image
+description: Describe a sandbox image with the configured external VLM.
+input_schema:
+  type: object
+  properties:
+    file_path:
+      type: string
+    question:
+      type: string
+    detail:
+      type: string
+      enum: [low, high, auto]
+    max_output_tokens:
+      type: integer
+  required: [file_path]
+  additionalProperties: false
+  $schema: http://json-schema.org/draft-07/schema#

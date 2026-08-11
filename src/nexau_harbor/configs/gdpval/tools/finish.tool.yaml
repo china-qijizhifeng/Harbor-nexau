@@ -1,0 +1,19 @@
+type: tool
+name: finish
+description: Submit the final summary and absolute output file paths.
+input_schema:
+  type: object
+  properties:
+    summary:
+      type: string
+    reason:
+      type: string
+    file_paths:
+      type: array
+      items:
+        type: string
+    paths:
+      type: array
+      items:
+        type: string
+  additionalProperties: true
