@@ -63,15 +63,25 @@ HARBOR_NEXAU_MODEL=openai/gpt-5 scripts/smoke_tb3.sh
 
 ```dotenv
 HARBOR_NEXAU_ENV=nexau_harbor.e2b_environment:NexAUE2BEnvironment
+HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC=86400
 E2B_API_KEY=...
 ```
 
 此后仍直接运行 `scripts/smoke_tb3.sh`；命令行显式传入的 `--env`/`-e` 会覆盖
 `HARBOR_NEXAU_ENV`。仓库内的 E2B environment 使用 3600 秒租期，避免 Harbor 0.21.x
 内置 E2B environment 请求 86400 秒而被一小时限额的账户拒绝；运行期间每 60 秒续租
-一次，因此正常存活的长任务可以超过初始一小时。停止环境时会先停止续租再删除 sandbox；
-若本地进程异常退出，最后一次续租到期后 E2B 仍会自动回收。E2B 负责运行任务沙箱，
-远程 API 模型不要求该沙箱配备 GPU。
+一次。停止环境时会先停止续租再删除 sandbox；若本地进程异常退出，最后一次续租到期后
+E2B 仍会自动回收。E2B 负责运行任务沙箱，远程 API 模型不要求该沙箱配备 GPU。
+
+`HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC` 是包含所有续租在内的累计硬上限，默认 86400 秒
+（24 小时）。临近上限时 adapter 会缩短最后几次租期，确保不会因最后一次 3600 秒续租
+而额外存活近一小时。也可以用
+`--environment-kwarg max_lifetime_sec=43200` 对单次运行覆盖为 12 小时。
+
+该参数只会进一步收紧生命周期，不能突破 E2B 账户等级的连续运行限制。
+[E2B 官方文档](https://e2b.dev/docs/sandbox) 当前限制 Base 为 1 小时、Pro 为 24 小时，
+所以实际有效上限是本参数与账户上限中的较小值；当前会拒绝 86400 秒请求的一小时账户，
+即使把本参数设为 86400，也不能连续运行 24 小时。
 
 上述 hash 是本仓库创建时由 Harbor 0.21.0 registry 实际解析到的 75-task TB3
 revision。只有在明确验证新 revision 时才设置 `HARBOR_NEXAU_DATASET` 覆盖它，避免

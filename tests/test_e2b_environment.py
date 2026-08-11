@@ -5,12 +5,15 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.utils.import_path import import_class
 
 from nexau_harbor import e2b_environment
 from nexau_harbor.e2b_environment import (
+    E2B_DEFAULT_MAX_LIFETIME_SEC,
     E2B_KEEPALIVE_INTERVAL_SEC,
+    E2B_MAX_LIFETIME_ENV,
     E2B_SANDBOX_TIMEOUT_SEC,
     NexAUE2BEnvironment,
 )
@@ -23,6 +26,53 @@ def test_custom_environment_import_path_is_loadable() -> None:
     )
 
     assert environment_class is NexAUE2BEnvironment
+
+
+def test_max_lifetime_defaults_to_24_hours_and_accepts_overrides(monkeypatch) -> None:
+    monkeypatch.delenv(E2B_MAX_LIFETIME_ENV, raising=False)
+    assert e2b_environment._resolve_max_lifetime_sec(None) == 86_400
+
+    monkeypatch.setenv(E2B_MAX_LIFETIME_ENV, "7200")
+    assert e2b_environment._resolve_max_lifetime_sec(None) == 7_200
+    assert e2b_environment._resolve_max_lifetime_sec("1800") == 1_800
+    assert E2B_DEFAULT_MAX_LIFETIME_SEC == 86_400
+
+
+def test_environment_kwarg_takes_precedence_over_env(monkeypatch) -> None:
+    monkeypatch.setenv(E2B_MAX_LIFETIME_ENV, "7200")
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b.E2BEnvironment,
+        "__init__",
+        lambda self, *args, **kwargs: None,
+    )
+
+    environment = NexAUE2BEnvironment(max_lifetime_sec="1800")
+
+    assert environment._max_lifetime_sec == 1_800
+
+
+@pytest.mark.parametrize("value", [0, -1, "0", "invalid", True, 1.5])
+def test_max_lifetime_rejects_invalid_values(value) -> None:
+    with pytest.raises(ValueError, match=E2B_MAX_LIFETIME_ENV):
+        e2b_environment._resolve_max_lifetime_sec(value)
+
+
+@pytest.mark.parametrize(
+    ("remaining_lifetime_sec", "expected_timeout_sec"),
+    [
+        (90_000, 3_600),
+        (3_599.9, 3_599),
+        (61.2, 61),
+        (1.1, 1),
+        (0.9, None),
+        (0, None),
+    ],
+)
+def test_lease_timeout_never_exceeds_remaining_lifetime(
+    remaining_lifetime_sec: float,
+    expected_timeout_sec: int | None,
+) -> None:
+    assert e2b_environment._bounded_lease_timeout(remaining_lifetime_sec) == expected_timeout_sec
 
 
 async def test_create_sandbox_uses_and_renews_one_hour_timeout(monkeypatch) -> None:
@@ -55,6 +105,9 @@ async def test_create_sandbox_uses_and_renews_one_hour_timeout(monkeypatch) -> N
     environment.task_env_config = EnvironmentConfig(env={"TASK_ENV": "task"})
     environment._persistent_env = {"TRIAL_ENV": "trial"}
     environment._network_policy = NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    environment._max_lifetime_sec = E2B_DEFAULT_MAX_LIFETIME_SEC
+    environment._keepalive_task = None
+    environment._keepalive_deadline = None
     environment.logger = logging.getLogger("test-e2b-keepalive")
 
     await environment._create_sandbox()
@@ -80,6 +133,33 @@ async def test_create_sandbox_uses_and_renews_one_hour_timeout(monkeypatch) -> N
         await environment._stop_keepalive()
 
 
+async def test_initial_lease_does_not_exceed_smaller_lifetime_cap(monkeypatch) -> None:
+    sandbox = SimpleNamespace(
+        sandbox_id="sandbox-1",
+        set_timeout=AsyncMock(),
+    )
+    create = AsyncMock(return_value=sandbox)
+    monkeypatch.setattr(e2b_environment.harbor_e2b.AsyncSandbox, "create", create)
+
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment.environment_name = "terminal-bench-task"
+    environment.session_id = "trial-session"
+    environment._template_name = "terminal-bench-template"
+    environment.task_env_config = EnvironmentConfig()
+    environment._persistent_env = {}
+    environment._network_policy = NetworkPolicy(network_mode=NetworkMode.PUBLIC)
+    environment._max_lifetime_sec = 1_800
+    environment._keepalive_task = None
+    environment._keepalive_deadline = None
+    environment.logger = logging.getLogger("test-e2b-short-cap")
+
+    await environment._create_sandbox()
+    try:
+        assert create.await_args.kwargs["timeout"] == 1_800
+    finally:
+        await environment._stop_keepalive()
+
+
 async def test_stop_cancels_keepalive_before_killing_sandbox() -> None:
     sandbox = SimpleNamespace(
         sandbox_id="sandbox-1",
@@ -90,6 +170,9 @@ async def test_stop_cancels_keepalive_before_killing_sandbox() -> None:
     environment.session_id = "trial-session"
     environment.logger = logging.getLogger("test-e2b-stop")
     environment._sandbox = sandbox
+    environment._max_lifetime_sec = E2B_DEFAULT_MAX_LIFETIME_SEC
+    environment._keepalive_task = None
+    environment._keepalive_deadline = None
     environment._start_keepalive()
     keepalive_task = environment._keepalive_task
 
