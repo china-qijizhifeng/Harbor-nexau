@@ -62,12 +62,14 @@ HARBOR_NEXAU_MODEL=openai/gpt-5 scripts/smoke_tb3.sh
 本机没有 Docker 时，可在 `.env` 中选择 E2B 并配置对应凭据：
 
 ```dotenv
-HARBOR_NEXAU_ENV=e2b
+HARBOR_NEXAU_ENV=nexau_harbor.e2b_environment:NexAUE2BEnvironment
 E2B_API_KEY=...
 ```
 
 此后仍直接运行 `scripts/smoke_tb3.sh`；命令行显式传入的 `--env`/`-e` 会覆盖
-`HARBOR_NEXAU_ENV`。E2B 负责运行任务沙箱，远程 API 模型不要求该沙箱配备 GPU。
+`HARBOR_NEXAU_ENV`。仓库内的 E2B environment 将 sandbox 生命周期设置为 3600 秒，
+避免 Harbor 0.21.x 内置 E2B environment 请求 86400 秒而被一小时限额的账户拒绝。
+E2B 负责运行任务沙箱，远程 API 模型不要求该沙箱配备 GPU。
 
 上述 hash 是本仓库创建时由 Harbor 0.21.0 registry 实际解析到的 75-task TB3
 revision。只有在明确验证新 revision 时才设置 `HARBOR_NEXAU_DATASET` 覆盖它，避免
