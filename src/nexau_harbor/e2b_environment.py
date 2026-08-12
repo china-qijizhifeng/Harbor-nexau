@@ -3,17 +3,29 @@
 import asyncio
 import os
 import re
+import shlex
+from dataclasses import dataclass
 from typing import override
+from uuid import uuid4
 
 from harbor.environments import e2b as harbor_e2b
+from harbor.environments.base import ExecResult
+from harbor.environments.definition import effective_exec_cwd
 from harbor.models.task.config import NetworkMode
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV, REMOTE_LOG_DIR
 
 E2B_SANDBOX_TIMEOUT_SEC = 3_600
 E2B_KEEPALIVE_INTERVAL_SEC = 60
 E2B_DEFAULT_MAX_LIFETIME_SEC = 24 * 60 * 60
 E2B_MAX_LIFETIME_ENV = "HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC"
 E2B_NO_PROXY_HOSTS_ENV = "HARBOR_NEXAU_NO_PROXY_HOSTS"
+E2B_DETACHED_POLL_INTERVAL_SEC = 30
+E2B_DETACHED_REQUEST_TIMEOUT_SEC = 30
+E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS = 5
+
+_DETACHED_STATUS_PREFIX = "__HARBOR_NEXAU_STATUS__:"
 
 _DOCKERFILE_FROM_PATTERN = re.compile(
     r"^[ \t]*FROM(?:[ \t]+--platform=\S+)?[ \t]+(?P<image>\S+)",
@@ -25,6 +37,69 @@ _ASTRAL_UV_COPY_PATTERN = re.compile(
     r"/usr/local/bin/[ \t]*$",
     flags=re.IGNORECASE | re.MULTILINE,
 )
+
+
+@dataclass(frozen=True)
+class _DetachedExecPaths:
+    directory: str
+    pid: str
+    stdout: str
+    stderr: str
+    exit_code: str
+
+
+def _detached_exec_paths() -> _DetachedExecPaths:
+    directory = (REMOTE_LOG_DIR / f"harbor-exec-{uuid4().hex}").as_posix()
+    return _DetachedExecPaths(
+        directory=directory,
+        pid=f"{directory}/pid",
+        stdout=f"{directory}/stdout",
+        stderr=f"{directory}/stderr",
+        exit_code=f"{directory}/exitcode",
+    )
+
+
+def _detached_command_wrapper(command: str, paths: _DetachedExecPaths) -> str:
+    quote = shlex.quote
+    exit_code_tmp = f"{paths.exit_code}.tmp"
+    return "\n".join(
+        (
+            f"mkdir -p {quote(paths.directory)}",
+            f"printf '%s\\n' \"$$\" > {quote(paths.pid)}",
+            "set +e",
+            "(",
+            command,
+            f") > {quote(paths.stdout)} 2> {quote(paths.stderr)}",
+            "harbor_nexau_rc=$?",
+            f"printf '%s\\n' \"$harbor_nexau_rc\" > {quote(exit_code_tmp)}",
+            f"mv {quote(exit_code_tmp)} {quote(paths.exit_code)}",
+            'exit "$harbor_nexau_rc"',
+        )
+    )
+
+
+def _detached_status_command(pid: int, paths: _DetachedExecPaths) -> str:
+    quote = shlex.quote
+    return " ".join(
+        (
+            f"if test -f {quote(paths.exit_code)}; then",
+            f"printf '%s' {quote(f'{_DETACHED_STATUS_PREFIX}DONE:')};",
+            f"tr -d '\\r\\n' < {quote(paths.exit_code)};",
+            "printf '\\n';",
+            f"elif kill -0 {pid} 2>/dev/null; then",
+            f"printf '%s\\n' {quote(f'{_DETACHED_STATUS_PREFIX}RUNNING')};",
+            "else",
+            f"printf '%s\\n' {quote(f'{_DETACHED_STATUS_PREFIX}CRASHED')};",
+            "fi",
+        )
+    )
+
+
+def _parse_detached_status(stdout: str) -> str:
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(_DETACHED_STATUS_PREFIX):
+            return line.removeprefix(_DETACHED_STATUS_PREFIX)
+    raise ValueError(f"Detached E2B status marker missing from output: {stdout!r}")
 
 
 def _is_python_image(image: str) -> bool:
@@ -114,6 +189,8 @@ def _bounded_lease_timeout(remaining_lifetime_sec: float) -> int | None:
 class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
     """Use a bounded renewable lease without exceeding the E2B plan limit."""
 
+    SUPPORTS_DETACHED_AGENT_EXEC = True
+
     def __init__(
         self,
         *args,
@@ -125,6 +202,221 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_deadline: float | None = None
         super().__init__(*args, **kwargs)
+
+    async def _read_detached_output(
+        self,
+        path: str,
+        *,
+        user: str,
+    ) -> tuple[str, str | None]:
+        if self._sandbox is None:
+            return "", "E2B sandbox disappeared before detached output could be read"
+        try:
+            content = await self._sandbox.files.read(
+                path,
+                format="text",
+                user=user,
+                request_timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
+            )
+            return str(content), None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.warning("Failed to read detached E2B output %s: %s", path, exc)
+            return "", f"Failed to read detached E2B output {path}: {exc}"
+
+    async def _detached_exec_result(
+        self,
+        paths: _DetachedExecPaths,
+        *,
+        user: str,
+        return_code: int,
+        diagnostic: str | None = None,
+    ) -> ExecResult:
+        stdout, stdout_error = await self._read_detached_output(paths.stdout, user=user)
+        stderr, stderr_error = await self._read_detached_output(paths.stderr, user=user)
+        details = [item for item in (diagnostic, stdout_error, stderr_error) if item]
+        if details:
+            suffix = "\n".join(details)
+            stderr = f"{stderr.rstrip()}\n{suffix}".lstrip()
+        return ExecResult(stdout=stdout, stderr=stderr, return_code=return_code)
+
+    async def _poll_detached_command(
+        self,
+        *,
+        pid: int,
+        paths: _DetachedExecPaths,
+        user: str,
+    ) -> ExecResult:
+        status_command = _detached_status_command(pid, paths)
+        consecutive_errors = 0
+
+        while True:
+            await asyncio.sleep(E2B_DETACHED_POLL_INTERVAL_SEC)
+            sandbox = self._sandbox
+            if sandbox is None:
+                return await self._detached_exec_result(
+                    paths,
+                    user=user,
+                    return_code=-1,
+                    diagnostic="E2B sandbox disappeared while detached Agent was running",
+                )
+
+            try:
+                status_result = await sandbox.commands.run(
+                    status_command,
+                    timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
+                    request_timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
+                    user=user,
+                )
+                status = _parse_detached_status(status_result.stdout)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consecutive_errors += 1
+                if consecutive_errors >= E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS:
+                    raise RuntimeError(
+                        "Failed to poll detached E2B Agent command "
+                        f"{consecutive_errors} consecutive times"
+                    ) from exc
+                self.logger.warning(
+                    "Failed to poll detached E2B Agent command (attempt %s/%s); "
+                    "the remote process remains running: %s",
+                    consecutive_errors,
+                    E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS,
+                    exc,
+                )
+                continue
+
+            consecutive_errors = 0
+            if status == "RUNNING":
+                continue
+            if status == "CRASHED":
+                return await self._detached_exec_result(
+                    paths,
+                    user=user,
+                    return_code=-1,
+                    diagnostic=(
+                        f"Detached E2B Agent process {pid} disappeared without writing "
+                        f"an exit status; state directory: {paths.directory}"
+                    ),
+                )
+            if not status.startswith("DONE:"):
+                return await self._detached_exec_result(
+                    paths,
+                    user=user,
+                    return_code=-1,
+                    diagnostic=f"Unrecognized detached E2B Agent status: {status!r}",
+                )
+
+            raw_exit_code = status.removeprefix("DONE:").strip()
+            try:
+                return_code = int(raw_exit_code)
+            except ValueError:
+                return await self._detached_exec_result(
+                    paths,
+                    user=user,
+                    return_code=-1,
+                    diagnostic=f"Invalid detached E2B Agent exit status: {raw_exit_code!r}",
+                )
+            return await self._detached_exec_result(
+                paths,
+                user=user,
+                return_code=return_code,
+            )
+
+    async def _exec_detached(
+        self,
+        command: str,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        timeout_sec: int | None,
+        user: str | int | None,
+    ) -> ExecResult:
+        resolved_user = self._resolve_user(user)
+        user_string = str(resolved_user) if resolved_user is not None else "root"
+        merged_env = self._merge_env(env)
+        paths = _detached_exec_paths()
+        wrapper = _detached_command_wrapper(command, paths)
+        handle = await self._dispatch_command(
+            wrapper,
+            cwd=effective_exec_cwd(cwd, self.task_env_config.workdir, self._workdir),
+            env=merged_env,
+            timeout_sec=timeout_sec,
+            user=user_string,
+        )
+        pid = int(handle.pid)
+        self.logger.info(
+            "Started detached E2B Agent command as process %s; polling every %s seconds",
+            pid,
+            E2B_DETACHED_POLL_INTERVAL_SEC,
+        )
+        try:
+            try:
+                await handle.disconnect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to close the initial E2B Agent event stream; switching to "
+                    "short polling anyway: %s",
+                    exc,
+                )
+            result = await self._poll_detached_command(
+                pid=pid,
+                paths=paths,
+                user=user_string,
+            )
+            self.logger.info(
+                "Detached E2B Agent command %s finished with exit code %s",
+                pid,
+                result.return_code,
+            )
+            return result
+        except asyncio.CancelledError:
+            sandbox = self._sandbox
+            if sandbox is not None:
+                try:
+                    await sandbox.commands.kill(
+                        pid,
+                        request_timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Failed to kill detached E2B Agent command %s after cancellation: %s",
+                        pid,
+                        exc,
+                    )
+            raise
+
+    @override
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        user: str | int | None = None,
+    ) -> ExecResult:
+        sanitized_env = dict(env) if env is not None else None
+        detached = False
+        if sanitized_env is not None:
+            detached = sanitized_env.pop(NEXAU_DETACHED_EXEC_ENV, None) == "1"
+        if not detached:
+            return await super().exec(
+                command,
+                cwd=cwd,
+                env=sanitized_env,
+                timeout_sec=timeout_sec,
+                user=user,
+            )
+        return await self._exec_detached(
+            command,
+            cwd=cwd,
+            env=sanitized_env,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
 
     async def _keepalive_loop(self) -> None:
         while True:

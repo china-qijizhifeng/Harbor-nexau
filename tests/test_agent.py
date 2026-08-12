@@ -9,7 +9,11 @@ from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
 
 from nexau_harbor.agent import NexAUAgent
-from nexau_harbor.constants import NEXAU_GIT_COMMIT, REMOTE_WORKSPACE
+from nexau_harbor.constants import (
+    NEXAU_DETACHED_EXEC_ENV,
+    NEXAU_GIT_COMMIT,
+    REMOTE_WORKSPACE,
+)
 
 
 class FakeEnvironment:
@@ -29,6 +33,10 @@ class FakeEnvironment:
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         self.uploaded_files.append((source_path, target_path))
+
+
+class DetachedFakeEnvironment(FakeEnvironment):
+    SUPPORTS_DETACHED_AGENT_EXEC = True
 
 
 def make_agent(tmp_path: Path, **kwargs: Any) -> NexAUAgent:
@@ -183,3 +191,21 @@ async def test_run_quotes_instruction_and_passes_runtime_env(tmp_path: Path) -> 
     assert "quoted value" in call["command"]
     assert call["env"]["LLM_MODEL"] == "gpt-5"
     assert call["env"]["LLM_API_KEY"] == "test-key"
+    assert NEXAU_DETACHED_EXEC_ENV not in call["env"]
+
+
+@pytest.mark.asyncio
+async def test_run_requests_detached_execution_only_from_supporting_environment(
+    tmp_path: Path,
+) -> None:
+    agent = make_agent(tmp_path)
+    environment = DetachedFakeEnvironment()
+
+    await agent.run(
+        "inspect /app/input.bin",
+        environment,  # type: ignore[arg-type]
+        AgentContext(),
+    )
+
+    call = environment.exec_calls[-1]
+    assert call["env"][NEXAU_DETACHED_EXEC_ENV] == "1"

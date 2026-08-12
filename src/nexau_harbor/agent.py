@@ -12,6 +12,7 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 from nexau_harbor.constants import (
+    NEXAU_DETACHED_EXEC_ENV,
     NEXAU_SOURCE,
     NEXAU_VERSION,
     REMOTE_LOG_DIR,
@@ -362,13 +363,16 @@ class NexAUAgent(BaseInstalledAgent):
             ]
         )
         output_path = (REMOTE_LOG_DIR / "nexau.txt").as_posix()
+        runtime_env = self._runtime_env()
+        if getattr(environment, "SUPPORTS_DETACHED_AGENT_EXEC", False):
+            runtime_env[NEXAU_DETACHED_EXEC_ENV] = "1"
         await self.exec_as_agent(
             environment,
             command=(
                 f"mkdir -p {REMOTE_LOG_DIR} && "
                 f"{command} 2>&1 </dev/null | tee {shlex.quote(output_path)} >/dev/null"
             ),
-            env=self._runtime_env(),
+            env=runtime_env,
             timeout_sec=self._execution_timeout(),
         )
 

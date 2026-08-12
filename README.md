@@ -78,6 +78,11 @@ E2B 仍会自动回收。E2B 负责运行任务沙箱，远程 API 模型不要�
 `NO_PROXY` 和 `no_proxy`，保留原有的 localhost 等排除项。它适用于宿主机已经设置本地
 HTTP 代理、但 E2B 控制连接需要直连的情况；无需覆盖或清空现有代理变量。
 
+运行 NexAU 时，自定义 E2B environment 会将远程 Agent 作为独立后台进程启动，保存 PID、
+stdout、stderr 和退出码后立即断开初始事件流，再每 30 秒用短连接检查一次状态。暂时的轮询
+错误不会重新启动或重复执行 Agent；连续失败才中止 trial。这样本机仍可用 `tmux` 保护
+Harbor 进程，同时远程 Agent 不依赖一条贯穿整道题的 HTTP 长连接。
+
 E2B SDK 2.x 的 Dockerfile 解析器不接受 Docker 原生支持的绝对路径
 `COPY --from=ghcr.io/astral-sh/uv:<version> /uv /uvx /usr/local/bin/`。自定义 environment
 在构建 Python verifier 模板时会在内存中将该语句转换为相同固定版本的 `uv` 包安装；

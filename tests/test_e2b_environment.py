@@ -7,13 +7,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from harbor.environments.base import ResourceMode
+from harbor.environments.base import ExecResult, ResourceMode
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.utils.import_path import import_class
 
 from nexau_harbor import e2b_environment
+from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV
 from nexau_harbor.e2b_environment import (
     E2B_DEFAULT_MAX_LIFETIME_SEC,
+    E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS,
+    E2B_DETACHED_POLL_INTERVAL_SEC,
+    E2B_DETACHED_REQUEST_TIMEOUT_SEC,
     E2B_KEEPALIVE_INTERVAL_SEC,
     E2B_MAX_LIFETIME_ENV,
     E2B_NO_PROXY_HOSTS_ENV,
@@ -31,6 +35,224 @@ def test_custom_environment_import_path_is_loadable() -> None:
     )
 
     assert environment_class is NexAUE2BEnvironment
+
+
+async def test_exec_routes_internal_marker_to_detached_mode_without_forwarding_it() -> None:
+    expected = ExecResult(stdout="done", stderr="", return_code=0)
+    detached_exec = AsyncMock(return_value=expected)
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment._exec_detached = detached_exec
+
+    result = await environment.exec(
+        "long-running-agent",
+        cwd="/root",
+        env={NEXAU_DETACHED_EXEC_ENV: "1", "VISIBLE": "yes"},
+        timeout_sec=123,
+        user="root",
+    )
+
+    assert result is expected
+    detached_exec.assert_awaited_once_with(
+        "long-running-agent",
+        cwd="/root",
+        env={"VISIBLE": "yes"},
+        timeout_sec=123,
+        user="root",
+    )
+
+
+async def test_exec_without_internal_marker_uses_standard_harbor_path(monkeypatch) -> None:
+    expected = ExecResult(stdout="setup complete", stderr="", return_code=0)
+    standard_exec = AsyncMock(return_value=expected)
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b.E2BEnvironment,
+        "exec",
+        standard_exec,
+    )
+    environment = object.__new__(NexAUE2BEnvironment)
+
+    result = await environment.exec(
+        "setup-command",
+        cwd="/root",
+        env={"VISIBLE": "yes"},
+        timeout_sec=123,
+        user="root",
+    )
+
+    assert result is expected
+    standard_exec.assert_awaited_once_with(
+        "setup-command",
+        cwd="/root",
+        env={"VISIBLE": "yes"},
+        timeout_sec=123,
+        user="root",
+    )
+
+
+def _detached_test_environment(
+    command_run: AsyncMock,
+    file_read: AsyncMock,
+) -> tuple[NexAUE2BEnvironment, AsyncMock]:
+    command_kill = AsyncMock(return_value=True)
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment._sandbox = SimpleNamespace(
+        sandbox_id="sandbox-detached",
+        commands=SimpleNamespace(run=command_run, kill=command_kill),
+        files=SimpleNamespace(read=file_read),
+    )
+    environment.task_env_config = EnvironmentConfig()
+    environment._workdir = None
+    environment._resolve_user = MagicMock(side_effect=lambda user: user or "root")
+    environment._merge_env = MagicMock(side_effect=lambda env: env)
+    environment.logger = logging.getLogger("test-e2b-detached")
+    return environment, command_kill
+
+
+async def test_detached_exec_disconnects_and_polls_short_commands(monkeypatch) -> None:
+    handle = SimpleNamespace(pid=321, disconnect=AsyncMock())
+    command_run = AsyncMock(
+        side_effect=[
+            handle,
+            SimpleNamespace(stdout="__HARBOR_NEXAU_STATUS__:RUNNING\n"),
+            SimpleNamespace(stdout="__HARBOR_NEXAU_STATUS__:DONE:0\n"),
+        ]
+    )
+
+    async def read_file(path: str, **kwargs) -> str:  # noqa: ANN003
+        del kwargs
+        if path.endswith("/stdout"):
+            return "captured stdout"
+        if path.endswith("/stderr"):
+            return "captured stderr"
+        raise AssertionError(f"Unexpected detached output path: {path}")
+
+    file_read = AsyncMock(side_effect=read_file)
+    environment, _ = _detached_test_environment(command_run, file_read)
+    monkeypatch.setattr(e2b_environment, "E2B_DETACHED_POLL_INTERVAL_SEC", 0)
+
+    result = await environment._exec_detached(
+        "python /nexau-workspace/runner.py",
+        cwd="/root",
+        env={"VISIBLE": "yes"},
+        timeout_sec=None,
+        user=None,
+    )
+
+    assert result == ExecResult(
+        stdout="captured stdout",
+        stderr="captured stderr",
+        return_code=0,
+    )
+    handle.disconnect.assert_awaited_once_with()
+    assert command_run.await_count == 3
+    launch = command_run.await_args_list[0].kwargs
+    assert launch["background"] is True
+    assert launch["timeout"] == 0
+    assert launch["envs"] == {"VISIBLE": "yes"}
+    assert "python /nexau-workspace/runner.py" in launch["cmd"]
+    assert "exitcode.tmp" in launch["cmd"]
+    for poll in command_run.await_args_list[1:]:
+        assert poll.kwargs["timeout"] == E2B_DETACHED_REQUEST_TIMEOUT_SEC
+        assert poll.kwargs["request_timeout"] == E2B_DETACHED_REQUEST_TIMEOUT_SEC
+
+
+async def test_detached_exec_preserves_nonzero_exit_code(monkeypatch) -> None:
+    handle = SimpleNamespace(pid=654, disconnect=AsyncMock())
+    command_run = AsyncMock(
+        side_effect=[
+            handle,
+            SimpleNamespace(stdout="__HARBOR_NEXAU_STATUS__:DONE:137\n"),
+        ]
+    )
+    file_read = AsyncMock(side_effect=["", "killed"])
+    environment, _ = _detached_test_environment(command_run, file_read)
+    monkeypatch.setattr(e2b_environment, "E2B_DETACHED_POLL_INTERVAL_SEC", 0)
+
+    result = await environment._exec_detached(
+        "long-agent",
+        cwd=None,
+        env=None,
+        timeout_sec=None,
+        user="root",
+    )
+
+    assert result.return_code == 137
+    assert result.stderr == "killed"
+
+
+async def test_detached_exec_reports_process_disappearing_without_status(monkeypatch) -> None:
+    handle = SimpleNamespace(pid=987, disconnect=AsyncMock())
+    command_run = AsyncMock(
+        side_effect=[
+            handle,
+            SimpleNamespace(stdout="__HARBOR_NEXAU_STATUS__:CRASHED\n"),
+        ]
+    )
+    file_read = AsyncMock(side_effect=["partial output", ""])
+    environment, _ = _detached_test_environment(command_run, file_read)
+    monkeypatch.setattr(e2b_environment, "E2B_DETACHED_POLL_INTERVAL_SEC", 0)
+
+    result = await environment._exec_detached(
+        "long-agent",
+        cwd=None,
+        env=None,
+        timeout_sec=None,
+        user="root",
+    )
+
+    assert result.return_code == -1
+    assert result.stdout == "partial output"
+    assert "process 987 disappeared without writing an exit status" in result.stderr
+
+
+async def test_detached_exec_retries_transient_poll_failure(monkeypatch) -> None:
+    handle = SimpleNamespace(pid=246, disconnect=AsyncMock())
+    command_run = AsyncMock(
+        side_effect=[
+            handle,
+            ConnectionError("temporary poll failure"),
+            SimpleNamespace(stdout="__HARBOR_NEXAU_STATUS__:DONE:0\n"),
+        ]
+    )
+    file_read = AsyncMock(side_effect=["", ""])
+    environment, _ = _detached_test_environment(command_run, file_read)
+    monkeypatch.setattr(e2b_environment, "E2B_DETACHED_POLL_INTERVAL_SEC", 0)
+
+    result = await environment._exec_detached(
+        "long-agent",
+        cwd=None,
+        env=None,
+        timeout_sec=None,
+        user="root",
+    )
+
+    assert result.return_code == 0
+    assert command_run.await_count == 3
+    assert E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS == 5
+    assert E2B_DETACHED_POLL_INTERVAL_SEC == 30
+
+
+async def test_detached_exec_kills_remote_process_when_cancelled(monkeypatch) -> None:
+    handle = SimpleNamespace(pid=135, disconnect=AsyncMock())
+    command_run = AsyncMock(return_value=handle)
+    file_read = AsyncMock()
+    environment, command_kill = _detached_test_environment(command_run, file_read)
+    poll = AsyncMock(side_effect=asyncio.CancelledError())
+    monkeypatch.setattr(environment, "_poll_detached_command", poll)
+
+    with pytest.raises(asyncio.CancelledError):
+        await environment._exec_detached(
+            "long-agent",
+            cwd=None,
+            env=None,
+            timeout_sec=None,
+            user="root",
+        )
+
+    command_kill.assert_awaited_once_with(
+        135,
+        request_timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
+    )
 
 
 def test_rewrites_astral_uv_copy_for_python_stage_without_mutating_other_lines() -> None:
