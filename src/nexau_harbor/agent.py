@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import shlex
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, override
+from urllib.parse import urlsplit
 
 from harbor.agents.installed.base import BaseInstalledAgent, with_prompt_template
 from harbor.agents.model_connection import ModelConnectionSpec
@@ -17,6 +19,37 @@ from nexau_harbor.constants import (
     REMOTE_WORKSPACE,
 )
 from nexau_harbor.trajectory import populate_context_from_logs
+
+_PROXY_ENV_NAMES = frozenset(("HTTP_PROXY", "HTTPS_PROXY"))
+
+
+def _is_local_only_proxy(value: str) -> bool:
+    """Return whether a proxy URL points back to the process-local machine."""
+
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if "://" not in candidate:
+        candidate = f"//{candidate}"
+
+    try:
+        hostname = urlsplit(candidate).hostname
+    except ValueError:
+        return False
+    if hostname is None:
+        return False
+
+    normalized_hostname = hostname.rstrip(".").lower()
+    if normalized_hostname in {"localhost", "localhost.localdomain"} or (
+        normalized_hostname.endswith(".localhost")
+    ):
+        return True
+
+    try:
+        address = ip_address(normalized_hostname)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified
 
 
 class NexAUAgent(BaseInstalledAgent):
@@ -101,13 +134,22 @@ class NexAUAgent(BaseInstalledAgent):
 
     def _forwarded_env(self) -> dict[str, str]:
         env: dict[str, str] = {}
+        skipped_local_proxies: list[str] = []
         for prefix in self._FORWARDED_PREFIXES:
             for suffix, value in self._get_env_prefixed(prefix).items():
                 env[f"{prefix}{suffix}"] = value
         for name in self._FORWARDED_EXACT:
             value = self._get_env(name)
             if value is not None:
+                if name in _PROXY_ENV_NAMES and _is_local_only_proxy(value):
+                    skipped_local_proxies.append(name)
+                    continue
                 env[name] = value
+        if skipped_local_proxies:
+            self.logger.info(
+                "Did not forward process-local proxy variables to the remote agent: %s",
+                ", ".join(skipped_local_proxies),
+            )
         return env
 
     def _provider(self) -> str | None:

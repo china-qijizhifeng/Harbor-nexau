@@ -72,6 +72,51 @@ def test_trace_checkpoint_interval_can_be_overridden(tmp_path: Path) -> None:
     assert agent._runtime_env()["NEXAU_TRACE_CHECKPOINT_SEC"] == "5"
 
 
+@pytest.mark.parametrize(
+    "proxy_url",
+    [
+        "http://127.0.0.1:7890",
+        "localhost:7890",
+        "http://worker.localhost:7890",
+        "socks5://[::1]:7890",
+        "http://0.0.0.0:7890",
+    ],
+)
+def test_agent_does_not_forward_process_local_proxies(
+    tmp_path: Path, proxy_url: str
+) -> None:
+    agent = make_agent(
+        tmp_path,
+        extra_env={
+            "HTTP_PROXY": proxy_url,
+            "HTTPS_PROXY": proxy_url,
+            "NO_PROXY": "127.0.0.1,localhost,::1",
+        },
+    )
+
+    runtime_env = agent._runtime_env()
+
+    assert "HTTP_PROXY" not in runtime_env
+    assert "HTTPS_PROXY" not in runtime_env
+    assert runtime_env["NO_PROXY"] == "127.0.0.1,localhost,::1"
+
+
+def test_agent_still_forwards_remotely_reachable_proxies(tmp_path: Path) -> None:
+    proxy_url = "http://proxy.example.test:8080"
+    agent = make_agent(
+        tmp_path,
+        extra_env={
+            "HTTP_PROXY": proxy_url,
+            "HTTPS_PROXY": proxy_url,
+        },
+    )
+
+    runtime_env = agent._runtime_env()
+
+    assert runtime_env["HTTP_PROXY"] == proxy_url
+    assert runtime_env["HTTPS_PROXY"] == proxy_url
+
+
 def test_agent_strips_generic_harbor_provider_prefix(tmp_path: Path) -> None:
     agent = NexAUAgent(
         logs_dir=tmp_path,
