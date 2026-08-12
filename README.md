@@ -51,6 +51,18 @@ uv run harbor run \
 scripts/smoke_tb3.sh --job-name nexau-smoke
 ```
 
+如果 Harbor Hub 暂时无法解析固定的 TB3 digest，但任务已经缓存到本机，可以直接绕过
+Hub 使用本地任务目录：
+
+```bash
+scripts/smoke_tb3.sh \
+  --path /root/.cache/harbor/tasks/packages/terminal-bench/ico-path-patch/0115a4136189b48da79070f9b3004dc4e0dfc1a60725c5acebdd7f380d037d14 \
+  --job-name nexau-smoke-local
+```
+
+显式传入 `--path`/`-p` 或 `--dataset`/`-d` 时，脚本不会再附加默认的
+`HARBOR_NEXAU_DATASET`，因此本地路径不会触发 Harbor Hub 查询。
+
 脚本会通过 `python-dotenv` 自动读取仓库根目录的 `.env`，不需要先执行
 `source .env`。调用脚本前已经导出的环境变量优先于 `.env`；如需读取其他文件，可设置
 `HARBOR_NEXAU_ENV_FILE=/absolute/path/to/profile.env`。没有 `.env` 时也可以沿用内联配置：

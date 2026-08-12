@@ -17,6 +17,18 @@ model="${HARBOR_NEXAU_MODEL:?Set HARBOR_NEXAU_MODEL, for example openai/gpt-5}"
 dataset="${HARBOR_NEXAU_DATASET:-terminal-bench/terminal-bench-3@sha256:88433fbcecd1a3f81f7a71bff4cc76c394d0edbefb7e028f90d4109b639fefba}"
 environment="${HARBOR_NEXAU_ENV:-}"
 
+task_source_args=(--dataset "$dataset")
+for argument in "$@"; do
+  case "$argument" in
+    --path | --path=* | -p | --dataset | --dataset=* | -d)
+      # An explicit local path or dataset owns task selection. In particular,
+      # --path must bypass Harbor Hub instead of being combined with the default.
+      task_source_args=()
+      break
+      ;;
+  esac
+done
+
 environment_args=()
 if [[ -n "$environment" ]]; then
   has_environment_arg=0
@@ -39,7 +51,7 @@ if [[ "${_HARBOR_NEXAU_DOTENV_LOADED:-0}" == "1" ]]; then
 fi
 
 exec "${harbor_command[@]}" run \
-  --dataset "$dataset" \
+  "${task_source_args[@]}" \
   --agent nexau_harbor.agent:NexAUAgent \
   --model "$model" \
   "${environment_args[@]}" \
