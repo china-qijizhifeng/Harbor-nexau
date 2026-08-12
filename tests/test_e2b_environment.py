@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from harbor.environments.base import ResourceMode
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.utils.import_path import import_class
 
@@ -18,6 +19,8 @@ from nexau_harbor.e2b_environment import (
     NexAUE2BEnvironment,
 )
 
+UV_COPY = "COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /uvx /usr/local/bin/"
+
 
 def test_custom_environment_import_path_is_loadable() -> None:
     environment_class = import_class(
@@ -26,6 +29,104 @@ def test_custom_environment_import_path_is_loadable() -> None:
     )
 
     assert environment_class is NexAUE2BEnvironment
+
+
+def test_rewrites_astral_uv_copy_for_python_stage_without_mutating_other_lines() -> None:
+    dockerfile = f"""\
+FROM python:3.12-slim-bookworm
+{UV_COPY}
+RUN uv pip install --system pytest==9.1.1
+"""
+
+    rewritten, rewrite_count = e2b_environment._rewrite_e2b_incompatible_uv_copy(dockerfile)
+
+    assert rewrite_count == 1
+    assert UV_COPY not in rewritten
+    assert "RUN python -m pip install --no-cache-dir uv==0.9.7" in rewritten
+    assert "RUN uv pip install --system pytest==9.1.1" in rewritten
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        UV_COPY,
+        f"FROM debian:bookworm-slim\n{UV_COPY}\n",
+        (
+            "FROM python:3.12-slim-bookworm\n"
+            "COPY --from=example.invalid/uv:0.9.7 /uv /uvx /usr/local/bin/\n"
+        ),
+    ],
+)
+def test_does_not_rewrite_uv_copy_outside_supported_python_case(dockerfile: str) -> None:
+    rewritten, rewrite_count = e2b_environment._rewrite_e2b_incompatible_uv_copy(dockerfile)
+
+    assert rewrite_count == 0
+    assert rewritten == dockerfile
+
+
+async def test_create_template_passes_compatible_dockerfile_without_changing_source(
+    tmp_path, monkeypatch
+) -> None:
+    dockerfile_path = tmp_path / "Dockerfile"
+    original_dockerfile = f"FROM python:3.12-slim-bookworm\n{UV_COPY}\n"
+    dockerfile_path.write_text(original_dockerfile)
+
+    parsed_template = object()
+    template_builder = MagicMock()
+    template_builder.from_dockerfile.return_value = parsed_template
+    template_factory = MagicMock(return_value=template_builder)
+    build = AsyncMock()
+    monkeypatch.setattr(e2b_environment.harbor_e2b, "Template", template_factory)
+    monkeypatch.setattr(e2b_environment.harbor_e2b.AsyncTemplate, "build", build)
+
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment.environment_dir = tmp_path
+    environment.task_env_config = EnvironmentConfig(cpus=2, memory_mb=4096)
+    environment._cpu_resource_mode = ResourceMode.AUTO
+    environment._memory_resource_mode = ResourceMode.AUTO
+    environment._template_name = "ico-path-patch__template"
+    environment.logger = logging.getLogger("test-e2b-template-compatibility")
+
+    await environment._create_template()
+
+    template_factory.assert_called_once_with(file_context_path=str(tmp_path))
+    compatible_dockerfile = template_builder.from_dockerfile.call_args.kwargs[
+        "dockerfile_content_or_path"
+    ]
+    assert UV_COPY not in compatible_dockerfile
+    assert "RUN python -m pip install --no-cache-dir uv==0.9.7" in compatible_dockerfile
+    build.assert_awaited_once_with(
+        template=parsed_template,
+        alias="ico-path-patch__template",
+        cpu_count=2,
+        memory_mb=4096,
+    )
+    assert dockerfile_path.read_text() == original_dockerfile
+
+
+async def test_create_template_preserves_prebuilt_image_behavior(monkeypatch) -> None:
+    parsed_template = object()
+    template_builder = MagicMock()
+    template_builder.from_image.return_value = parsed_template
+    template_factory = MagicMock(return_value=template_builder)
+    build = AsyncMock()
+    monkeypatch.setattr(e2b_environment.harbor_e2b, "Template", template_factory)
+    monkeypatch.setattr(e2b_environment.harbor_e2b.AsyncTemplate, "build", build)
+
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment.task_env_config = EnvironmentConfig(docker_image="example.invalid/task:1")
+    environment._cpu_resource_mode = ResourceMode.IGNORE
+    environment._memory_resource_mode = ResourceMode.IGNORE
+    environment._template_name = "prebuilt-task__template"
+
+    await environment._create_template()
+
+    template_factory.assert_called_once_with()
+    template_builder.from_image.assert_called_once_with(image="example.invalid/task:1")
+    build.assert_awaited_once_with(
+        template=parsed_template,
+        alias="prebuilt-task__template",
+    )
 
 
 def test_max_lifetime_defaults_to_24_hours_and_accepts_overrides(monkeypatch) -> None:

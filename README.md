@@ -73,6 +73,12 @@ E2B_API_KEY=...
 一次。停止环境时会先停止续租再删除 sandbox；若本地进程异常退出，最后一次续租到期后
 E2B 仍会自动回收。E2B 负责运行任务沙箱，远程 API 模型不要求该沙箱配备 GPU。
 
+E2B SDK 2.x 的 Dockerfile 解析器不接受 Docker 原生支持的绝对路径
+`COPY --from=ghcr.io/astral-sh/uv:<version> /uv /uvx /usr/local/bin/`。自定义 environment
+在构建 Python verifier 模板时会在内存中将该语句转换为相同固定版本的 `uv` 包安装；
+Terminal-Bench 任务文件和 Harbor 缓存不会被修改。转换只匹配这个已知的 Astral uv 模式，
+其他多阶段复制语句保持原样。
+
 `HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC` 是包含所有续租在内的累计硬上限，默认 86400 秒
 （24 小时）。临近上限时 adapter 会缩短最后几次租期，确保不会因最后一次 3600 秒续租
 而额外存活近一小时。也可以用

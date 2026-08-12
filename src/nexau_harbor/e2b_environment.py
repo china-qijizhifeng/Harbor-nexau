@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 from typing import override
 
 from harbor.environments import e2b as harbor_e2b
@@ -12,6 +13,49 @@ E2B_SANDBOX_TIMEOUT_SEC = 3_600
 E2B_KEEPALIVE_INTERVAL_SEC = 60
 E2B_DEFAULT_MAX_LIFETIME_SEC = 24 * 60 * 60
 E2B_MAX_LIFETIME_ENV = "HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC"
+
+_DOCKERFILE_FROM_PATTERN = re.compile(
+    r"^[ \t]*FROM(?:[ \t]+--platform=\S+)?[ \t]+(?P<image>\S+)",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_ASTRAL_UV_COPY_PATTERN = re.compile(
+    r"^(?P<indent>[ \t]*)COPY[ \t]+--from=ghcr\.io/astral-sh/uv:"
+    r"(?P<version>[0-9][0-9A-Za-z.+-]*)[ \t]+/uv[ \t]+/uvx[ \t]+"
+    r"/usr/local/bin/[ \t]*$",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _is_python_image(image: str) -> bool:
+    normalized = image.lower()
+    return normalized == "python" or normalized.startswith(
+        ("python:", "python@", "docker.io/library/python:", "docker.io/library/python@")
+    )
+
+
+def _rewrite_e2b_incompatible_uv_copy(dockerfile: str) -> tuple[str, int]:
+    """Replace the uv image copy form that E2B's Dockerfile parser rejects.
+
+    E2B 2.x rejects absolute sources in ``COPY --from``, even though Docker accepts
+    them. For Python-based stages, installing the same pinned uv package exposes both
+    ``uv`` and ``uvx`` in /usr/local/bin without changing the source task on disk.
+    """
+
+    rewrite_count = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal rewrite_count
+
+        preceding_from = tuple(_DOCKERFILE_FROM_PATTERN.finditer(dockerfile, 0, match.start()))
+        if not preceding_from or not _is_python_image(preceding_from[-1].group("image")):
+            return match.group(0)
+
+        rewrite_count += 1
+        indent = match.group("indent")
+        version = match.group("version")
+        return f"{indent}RUN python -m pip install --no-cache-dir uv=={version}"
+
+    return _ASTRAL_UV_COPY_PATTERN.sub(replace, dockerfile), rewrite_count
 
 
 def _resolve_max_lifetime_sec(configured: int | str | None) -> int:
@@ -107,6 +151,43 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
             self._keepalive_loop(),
             name=f"e2b-keepalive-{self.session_id}",
         )
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    @override
+    async def _create_template(self) -> None:
+        if self.task_env_config.docker_image:
+            template = harbor_e2b.Template().from_image(
+                image=self.task_env_config.docker_image,
+            )
+        else:
+            dockerfile = self._environment_definition_path.read_text(encoding="utf-8")
+            dockerfile, rewrite_count = _rewrite_e2b_incompatible_uv_copy(dockerfile)
+            if rewrite_count:
+                self.logger.info(
+                    "Applied %s E2B compatibility rewrite(s) for Astral uv",
+                    rewrite_count,
+                )
+
+            template = harbor_e2b.Template(
+                file_context_path=str(self.environment_dir),
+            ).from_dockerfile(
+                dockerfile_content_or_path=dockerfile,
+            )
+
+        build_kwargs = {
+            "template": template,
+            "alias": self._template_name,
+        }
+        if self._effective_cpus is not None:
+            build_kwargs["cpu_count"] = self._effective_cpus
+        if self._effective_memory_mb is not None:
+            build_kwargs["memory_mb"] = self._effective_memory_mb
+
+        await harbor_e2b.AsyncTemplate.build(**build_kwargs)
 
     async def _stop_keepalive(self) -> None:
         keepalive_task = getattr(self, "_keepalive_task", None)
