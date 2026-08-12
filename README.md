@@ -65,14 +65,21 @@ HARBOR_NEXAU_MODEL=openai/gpt-5 scripts/smoke_tb3.sh
 HARBOR_NEXAU_ENV=nexau_harbor.e2b_environment:NexAUE2BEnvironment
 HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC=86400
 HARBOR_NEXAU_NO_PROXY_HOSTS=e2b.app,.e2b.app,api.e2b.app,sandbox.e2b.app
+# 自建 E2B 必须将 API URL、domain 和对应 Key 成套配置；官方 E2B 留空前两项。
+E2B_API_URL=
+E2B_DOMAIN=
 E2B_API_KEY=...
 ```
 
 此后仍直接运行 `scripts/smoke_tb3.sh`；命令行显式传入的 `--env`/`-e` 会覆盖
 `HARBOR_NEXAU_ENV`。仓库内的 E2B environment 使用 3600 秒租期，避免 Harbor 0.21.x
-内置 E2B environment 请求 86400 秒而被一小时限额的账户拒绝；运行期间每 60 秒续租
-一次。停止环境时会先停止续租再删除 sandbox；若本地进程异常退出，最后一次续租到期后
-E2B 仍会自动回收。E2B 负责运行任务沙箱，远程 API 模型不要求该沙箱配备 GPU。
+内置 E2B environment 在创建时直接请求 86400 秒而被低额度账户拒绝；运行期间每 60 秒续租
+一次。续租不能突破服务端规定的单个 sandbox 最大连续运行时间：本地将
+`HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC` 设为 86400，并不会把官方 Base/Hobby 账户的一小时
+上限提升到 24 小时。需要长任务时，应使用支持相应时长的官方套餐，或同时配置自建服务的
+`E2B_API_URL`、`E2B_DOMAIN` 和匹配的 `E2B_API_KEY`。只替换 Key 而仍连接默认官方地址会造成
+认证或额度不匹配。停止环境时会先停止续租再删除 sandbox；若本地进程异常退出，最后一次
+续租到期后 E2B 仍会自动回收。E2B 负责运行任务沙箱，远程 API 模型不要求该沙箱配备 GPU。
 
 `HARBOR_NEXAU_NO_PROXY_HOSTS` 会在创建 E2B environment 时合并进宿主进程的
 `NO_PROXY` 和 `no_proxy`，保留原有的 localhost 等排除项。它适用于宿主机已经设置本地
