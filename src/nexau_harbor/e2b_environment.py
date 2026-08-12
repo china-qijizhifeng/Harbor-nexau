@@ -26,6 +26,7 @@ E2B_DETACHED_REQUEST_TIMEOUT_SEC = 30
 E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS = 5
 
 _DETACHED_STATUS_PREFIX = "__HARBOR_NEXAU_STATUS__:"
+_MISSING_DEFAULT_TEMPLATE_TAG = "tag 'default' does not exist for template"
 
 _DOCKERFILE_FROM_PATTERN = re.compile(
     r"^[ \t]*FROM(?:[ \t]+--platform=\S+)?[ \t]+(?P<image>\S+)",
@@ -186,6 +187,13 @@ def _bounded_lease_timeout(remaining_lifetime_sec: float) -> int | None:
     return min(E2B_SANDBOX_TIMEOUT_SEC, remaining_whole_seconds)
 
 
+def _is_missing_default_template_tag(exc: Exception) -> bool:
+    """Identify the E2B response for an alias with no launchable default build."""
+
+    message = str(exc)
+    return message.startswith("404:") and _MISSING_DEFAULT_TEMPLATE_TAG in message
+
+
 class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
     """Use a bounded renewable lease without exceeding the E2B plan limit."""
 
@@ -202,6 +210,20 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_deadline: float | None = None
         super().__init__(*args, **kwargs)
+
+    @override
+    async def start(self, force_build: bool) -> None:
+        try:
+            await super().start(force_build)
+        except Exception as exc:
+            if force_build or not _is_missing_default_template_tag(exc):
+                raise
+
+            self.logger.warning(
+                "E2B template %s exists but has no launchable default build; forcing one rebuild",
+                self._template_name,
+            )
+            await super().start(force_build=True)
 
     async def _read_detached_output(
         self,

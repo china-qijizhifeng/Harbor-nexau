@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from harbor.environments.base import ExecResult, ResourceMode
@@ -35,6 +35,89 @@ def test_custom_environment_import_path_is_loadable() -> None:
     )
 
     assert environment_class is NexAUE2BEnvironment
+
+
+def test_missing_default_template_tag_detection_is_narrow() -> None:
+    assert e2b_environment._is_missing_default_template_tag(
+        RuntimeError(
+            "404: tag 'default' does not exist for template 'e2b-nex/ico-path-patch__2676acce2372'"
+        )
+    )
+    assert not e2b_environment._is_missing_default_template_tag(
+        RuntimeError("404: sandbox not found")
+    )
+    assert not e2b_environment._is_missing_default_template_tag(
+        RuntimeError("500: tag 'default' does not exist for template 'example/task'")
+    )
+
+
+async def test_start_rebuilds_once_when_cached_template_has_no_launchable_default(
+    monkeypatch,
+) -> None:
+    missing_default = RuntimeError(
+        "404: tag 'default' does not exist for template 'e2b-nex/ico-path-patch__2676acce2372'"
+    )
+    upstream_start = AsyncMock(side_effect=[missing_default, None])
+    monkeypatch.setattr(e2b_environment.harbor_e2b.E2BEnvironment, "start", upstream_start)
+
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment._template_name = "ico-path-patch__2676acce2372"
+    environment.logger = MagicMock()
+
+    await environment.start(force_build=False)
+
+    assert upstream_start.await_args_list == [call(False), call(force_build=True)]
+    environment.logger.warning.assert_called_once()
+
+
+async def test_start_propagates_failed_automatic_rebuild_without_looping(monkeypatch) -> None:
+    missing_default = RuntimeError(
+        "404: tag 'default' does not exist for template 'e2b-nex/ico-path-patch__2676acce2372'"
+    )
+    upstream_start = AsyncMock(side_effect=[missing_default, missing_default])
+    monkeypatch.setattr(e2b_environment.harbor_e2b.E2BEnvironment, "start", upstream_start)
+
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment._template_name = "ico-path-patch__2676acce2372"
+    environment.logger = MagicMock()
+
+    with pytest.raises(RuntimeError, match="tag 'default' does not exist"):
+        await environment.start(force_build=False)
+
+    assert upstream_start.await_args_list == [call(False), call(force_build=True)]
+    environment.logger.warning.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("force_build", "error"),
+    [
+        (False, RuntimeError("404: sandbox not found")),
+        (
+            True,
+            RuntimeError(
+                "404: tag 'default' does not exist for template "
+                "'e2b-nex/ico-path-patch__2676acce2372'"
+            ),
+        ),
+    ],
+)
+async def test_start_does_not_rebuild_unrelated_errors_or_loop_after_forced_build(
+    monkeypatch,
+    force_build: bool,
+    error: RuntimeError,
+) -> None:
+    upstream_start = AsyncMock(side_effect=error)
+    monkeypatch.setattr(e2b_environment.harbor_e2b.E2BEnvironment, "start", upstream_start)
+
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment._template_name = "ico-path-patch__2676acce2372"
+    environment.logger = MagicMock()
+
+    with pytest.raises(RuntimeError, match=str(error)):
+        await environment.start(force_build=force_build)
+
+    upstream_start.assert_awaited_once_with(force_build)
+    environment.logger.warning.assert_not_called()
 
 
 async def test_exec_routes_internal_marker_to_detached_mode_without_forwarding_it() -> None:
