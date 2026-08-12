@@ -64,6 +64,7 @@ HARBOR_NEXAU_MODEL=openai/gpt-5 scripts/smoke_tb3.sh
 ```dotenv
 HARBOR_NEXAU_ENV=nexau_harbor.e2b_environment:NexAUE2BEnvironment
 HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC=86400
+HARBOR_NEXAU_NO_PROXY_HOSTS=e2b.app,.e2b.app,api.e2b.app,sandbox.e2b.app
 E2B_API_KEY=...
 ```
 
@@ -72,6 +73,10 @@ E2B_API_KEY=...
 内置 E2B environment 请求 86400 秒而被一小时限额的账户拒绝；运行期间每 60 秒续租
 一次。停止环境时会先停止续租再删除 sandbox；若本地进程异常退出，最后一次续租到期后
 E2B 仍会自动回收。E2B 负责运行任务沙箱，远程 API 模型不要求该沙箱配备 GPU。
+
+`HARBOR_NEXAU_NO_PROXY_HOSTS` 会在创建 E2B environment 时合并进宿主进程的
+`NO_PROXY` 和 `no_proxy`，保留原有的 localhost 等排除项。它适用于宿主机已经设置本地
+HTTP 代理、但 E2B 控制连接需要直连的情况；无需覆盖或清空现有代理变量。
 
 E2B SDK 2.x 的 Dockerfile 解析器不接受 Docker 原生支持的绝对路径
 `COPY --from=ghcr.io/astral-sh/uv:<version> /uv /uvx /usr/local/bin/`。自定义 environment

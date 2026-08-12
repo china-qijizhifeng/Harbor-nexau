@@ -13,6 +13,7 @@ E2B_SANDBOX_TIMEOUT_SEC = 3_600
 E2B_KEEPALIVE_INTERVAL_SEC = 60
 E2B_DEFAULT_MAX_LIFETIME_SEC = 24 * 60 * 60
 E2B_MAX_LIFETIME_ENV = "HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC"
+E2B_NO_PROXY_HOSTS_ENV = "HARBOR_NEXAU_NO_PROXY_HOSTS"
 
 _DOCKERFILE_FROM_PATTERN = re.compile(
     r"^[ \t]*FROM(?:[ \t]+--platform=\S+)?[ \t]+(?P<image>\S+)",
@@ -81,6 +82,28 @@ def _resolve_max_lifetime_sec(configured: int | str | None) -> int:
     return max_lifetime_sec
 
 
+def _merge_configured_no_proxy_hosts() -> None:
+    """Append configured direct-connect hosts to both conventional spellings."""
+
+    configured = [
+        host.strip()
+        for host in os.environ.get(E2B_NO_PROXY_HOSTS_ENV, "").split(",")
+        if host.strip()
+    ]
+    if not configured:
+        return
+
+    for env_name in ("NO_PROXY", "no_proxy"):
+        existing = [
+            host.strip() for host in os.environ.get(env_name, "").split(",") if host.strip()
+        ]
+        merged = list(existing)
+        for host in configured:
+            if host not in merged:
+                merged.append(host)
+        os.environ[env_name] = ",".join(merged)
+
+
 def _bounded_lease_timeout(remaining_lifetime_sec: float) -> int | None:
     remaining_whole_seconds = int(remaining_lifetime_sec)
     if remaining_whole_seconds <= 0:
@@ -97,6 +120,7 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         max_lifetime_sec: int | str | None = None,
         **kwargs,
     ) -> None:
+        _merge_configured_no_proxy_hosts()
         self._max_lifetime_sec = _resolve_max_lifetime_sec(max_lifetime_sec)
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_deadline: float | None = None

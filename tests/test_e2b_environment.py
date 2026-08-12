@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,6 +16,7 @@ from nexau_harbor.e2b_environment import (
     E2B_DEFAULT_MAX_LIFETIME_SEC,
     E2B_KEEPALIVE_INTERVAL_SEC,
     E2B_MAX_LIFETIME_ENV,
+    E2B_NO_PROXY_HOSTS_ENV,
     E2B_SANDBOX_TIMEOUT_SEC,
     NexAUE2BEnvironment,
 )
@@ -150,6 +152,27 @@ def test_environment_kwarg_takes_precedence_over_env(monkeypatch) -> None:
     environment = NexAUE2BEnvironment(max_lifetime_sec="1800")
 
     assert environment._max_lifetime_sec == 1_800
+
+
+def test_environment_merges_configured_hosts_into_both_no_proxy_spellings(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        E2B_NO_PROXY_HOSTS_ENV,
+        "api.e2b.app,.e2b.app,api.e2b.app",
+    )
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,api.e2b.app")
+    monkeypatch.setenv("no_proxy", "localhost")
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b.E2BEnvironment,
+        "__init__",
+        lambda self, *args, **kwargs: None,
+    )
+
+    NexAUE2BEnvironment()
+
+    assert os.environ["NO_PROXY"] == "127.0.0.1,api.e2b.app,.e2b.app"
+    assert os.environ["no_proxy"] == "localhost,api.e2b.app,.e2b.app"
 
 
 @pytest.mark.parametrize("value", [0, -1, "0", "invalid", True, 1.5])
