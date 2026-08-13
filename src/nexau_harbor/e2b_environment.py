@@ -357,10 +357,11 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
     ) -> ExecResult:
         resolved_user = self._resolve_user(user)
         user_string = str(resolved_user) if resolved_user is not None else "root"
+        status_user = self._detached_status_user(user_string)
         merged_env = self._merge_env(env)
         paths = _detached_exec_paths()
         wrapper = _detached_command_wrapper(command, paths)
-        handle = await self._dispatch_command(
+        handle = await self._dispatch_detached_command(
             wrapper,
             cwd=effective_exec_cwd(cwd, self.task_env_config.workdir, self._workdir),
             env=merged_env,
@@ -387,7 +388,7 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
             result = await self._poll_detached_command(
                 pid=pid,
                 paths=paths,
-                user=user_string,
+                user=status_user,
             )
             self.logger.info(
                 "Detached E2B Agent command %s finished with exit code %s",
@@ -396,20 +397,62 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
             )
             return result
         except asyncio.CancelledError:
-            sandbox = self._sandbox
-            if sandbox is not None:
-                try:
-                    await sandbox.commands.kill(
-                        pid,
-                        request_timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
-                    )
-                except Exception as exc:
-                    self.logger.warning(
-                        "Failed to kill detached E2B Agent command %s after cancellation: %s",
-                        pid,
-                        exc,
-                    )
+            await self._cancel_detached_command(pid=pid, paths=paths, user=user_string)
             raise
+
+    def _detached_status_user(self, command_user: str) -> str:
+        """Return the user used to read and poll detached command state."""
+
+        return command_user
+
+    async def _dispatch_detached_command(
+        self,
+        command: str,
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        timeout_sec: int | None,
+        user: str,
+    ):
+        """Dispatch a detached command in the provider's execution target.
+
+        The direct E2B adapter targets the sandbox itself. Compose-capable
+        subclasses override this hook so the wrapped command runs in the main
+        service while the returned handle remains on the DinD host.
+        """
+
+        return await self._dispatch_command(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
+
+    async def _cancel_detached_command(
+        self,
+        *,
+        pid: int,
+        paths: _DetachedExecPaths,
+        user: str,
+    ) -> None:
+        """Best-effort cancellation for a detached command."""
+
+        del paths, user
+        sandbox = self._sandbox
+        if sandbox is None:
+            return
+        try:
+            await sandbox.commands.kill(
+                pid,
+                request_timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to kill detached E2B Agent command %s after cancellation: %s",
+                pid,
+                exc,
+            )
 
     @override
     async def exec(

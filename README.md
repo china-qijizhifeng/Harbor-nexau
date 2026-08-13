@@ -74,7 +74,9 @@ HARBOR_NEXAU_MODEL=openai/gpt-5 scripts/smoke_tb3.sh
 本机没有 Docker 时，可在 `.env` 中选择 E2B 并配置对应凭据：
 
 ```dotenv
-HARBOR_NEXAU_ENV=nexau_harbor.e2b_environment:NexAUE2BEnvironment
+# Frontier Bench/TB3（包括多服务 Compose 题）使用 DinD adapter：
+HARBOR_NEXAU_ENV=nexau_harbor.e2b_dind_environment:NexAUE2BDinDEnvironment
+HARBOR_NEXAU_E2B_DIND_TEMPLATE=harbor-nexau-dind:v1
 HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC=86400
 HARBOR_NEXAU_NO_PROXY_HOSTS=e2b.app,.e2b.app,api.e2b.app,sandbox.e2b.app
 # 自建 E2B 必须将 API URL、domain 和对应 Key 成套配置；官方 E2B 留空前两项。
@@ -82,6 +84,10 @@ E2B_API_URL=
 E2B_DOMAIN=
 E2B_API_KEY=...
 ```
+
+只运行确定不含 Compose sidecar 的单容器题时，也可以改回
+`nexau_harbor.e2b_environment:NexAUE2BEnvironment`。DinD adapter 会把普通单容器题也作为
+仅含 `main` 的 Compose project 运行，因此测试整套混合数据集时无需逐题切换 environment。
 
 此后仍直接运行 `scripts/smoke_tb3.sh`；命令行显式传入的 `--env`/`-e` 会覆盖
 `HARBOR_NEXAU_ENV`。仓库内的 E2B environment 使用 3600 秒租期，避免 Harbor 0.21.x
@@ -134,18 +140,26 @@ uv run scripts/build_e2b_dind_template.py smoke
 sandbox。模板只是可复用的 DinD 主机，不会预先包含各道题的 Dockerfile；Harbor 后续应把
 当前题目的 environment 上传进 sandbox，再在其中 build/up。
 
-注意：当前 `NexAUE2BEnvironment` 仍是 Harbor 的单容器 E2B adapter，不会因为模板存在就
-自动声明 `docker_compose` capability。要让 Compose 题目通过 Harbor 校验，还需要接入一层
-DinD Compose environment。E2B 模板 API 也没有在这里声明磁盘或 GPU 资源，因此 GPU 题和
-超出 sandbox 磁盘容量的题仍需其他 provider。当前 HK E2B API 还会拒绝超过 8 CPU 的模板，
-因此声明 16 CPU 的题也不能由此模板完整满足。
+`NexAUE2BDinDEnvironment` 是接入该模板的 Harbor Compose adapter。它会上传每道题的
+environment，执行 pull/build/up，把 Agent 的 exec/upload/download 路由到 `main`，并支持
+sidecar 的 collect hook、artifact 下载和单服务 stop；独立 verifier 也会在新的 DinD sandbox
+中作为单服务 Compose project 运行。停止时执行 `down -v --remove-orphans` 后删除 sandbox。
+镜像 pull/build 阶段临时使用公网，完成后由 E2B 外层网络策略限制整个 sandbox；这样既保留
+Compose 内部 DNS/bridge 通信，也支持 Harbor 在不同阶段动态切换 public/no-network/allowlist。
+
+默认 adapter 按已发布模板校验上限：8 CPU、32768 MB 内存、41062 MB 总磁盘。超出上限会在
+创建 sandbox 前报错；GPU 题同样会被拒绝。若重新发布了更大模板，需要同时用
+`--environment-kwarg dind_template=<name:tag>` 和对应的 `dind_cpu_capacity`、
+`dind_memory_capacity_mb`、`dind_storage_capacity_mb` 告知 adapter。当前 HK E2B API 会拒绝
+超过 8 CPU 的模板，所以声明 16 CPU 的题不能由当前 `v1` 完整满足；只有明确接受降配时才应
+使用 Harbor 的 `--override-cpus`/`--override-memory-mb`/`--override-storage-mb`。
 
 运行 NexAU 时，自定义 E2B environment 会将远程 Agent 作为独立后台进程启动，保存 PID、
 stdout、stderr 和退出码后立即断开初始事件流，再每 30 秒用短连接检查一次状态。暂时的轮询
 错误不会重新启动或重复执行 Agent；连续失败才中止 trial。这样本机仍可用 `tmux` 保护
 Harbor 进程，同时远程 Agent 不依赖一条贯穿整道题的 HTTP 长连接。
 
-E2B SDK 2.x 的 Dockerfile 解析器不接受 Docker 原生支持的绝对路径
+单容器 `NexAUE2BEnvironment` 使用的 E2B SDK 2.x Dockerfile 解析器不接受 Docker 原生支持的绝对路径
 `COPY --from=ghcr.io/astral-sh/uv:<version> /uv /uvx /usr/local/bin/`。自定义 environment
 在构建 Python verifier 模板时会在内存中将该语句转换为相同固定版本的 `uv` 包安装；
 Terminal-Bench 任务文件和 Harbor 缓存不会被修改。转换只匹配这个已知的 Astral uv 模式，
