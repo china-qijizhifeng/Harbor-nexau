@@ -1,0 +1,70 @@
+type: agent
+name: nexau_terminal_bench_agent
+description: NexAU coding agent profile for Terminal-Bench evaluations.
+
+# The TB reference uses long autonomous runs and keeps 15 recent tool rounds
+# during compaction.
+max_iterations: 500
+max_context_tokens: ${env.LLM_CONTEXT_WINDOW_TOKENS}
+retry_attempts: 20
+
+llm_config:
+  model: ${env.LLM_MODEL}
+  base_url: ${env.LLM_BASE_URL}
+  api_key: ${env.LLM_API_KEY}
+  temperature: 0.6
+  timeout: ${env.LLM_TIMEOUT_SEC}
+  max_retries: 20
+  api_type: ${env.LLM_KIND}
+  stream: false
+  # runner.py converts this neutral setting to each provider's native schema.
+  harbor_reasoning_effort: ${env.LLM_REASONING_EFFORT}
+  # Match the TB reference harness: let the endpoint choose its output limit.
+  # This also drops a per-call override that NexAU may otherwise add.
+  additional_drop_params:
+    - max_tokens
+    - max_output_tokens
+
+system_prompt: ./systemprompt_tb2.md
+system_prompt_type: jinja
+tool_call_mode: structured
+
+tools:
+  - name: read_file
+    yaml_path: ./tools/read_file.tool.yaml
+    binding: nexau.archs.tool.builtin.file_tools:read_file
+  - name: replace
+    yaml_path: ./tools/replace.tool.yaml
+    binding: nexau.archs.tool.builtin.file_tools:replace
+  - name: run_shell_command
+    yaml_path: ./tools/run_shell_command.tool.yaml
+    binding: nexau.archs.tool.builtin.shell_tools:run_shell_command
+  - name: write_todo
+    yaml_path: ./tools/write_todos.tool.yaml
+    binding: nexau.archs.tool.builtin.session_tools:write_todos
+
+skills: []
+stop_tools: []
+
+middlewares:
+  - import: nexau.archs.main_sub.execution.middleware.long_tool_output:LongToolOutputMiddleware
+    params:
+      max_output_chars: 10000
+      head_lines: 50
+      tail_lines: 30
+      head_chars: 5000
+      tail_chars: 5000
+      bypass_tool_names:
+        - run_shell_command
+  - import: nexau.archs.main_sub.execution.middleware.context_compaction:ContextCompactionMiddleware
+    params:
+      max_context_tokens: ${env.LLM_CONTEXT_WINDOW_TOKENS}
+      auto_compact: true
+      threshold: 0.75
+      compaction_strategy: tool_result_compaction
+      keep_iterations: 15
+      retry_attempts: 20
+
+# runner.py injects an InMemoryTracer when this list is empty, preserving Harbor
+# checkpoints and the complete pre-compaction trace.
+tracers: []

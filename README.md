@@ -40,6 +40,7 @@ export LLM_KIND=openai_responses
 uv run harbor run \
   --dataset terminal-bench/terminal-bench-3@sha256:88433fbcecd1a3f81f7a71bff4cc76c394d0edbefb7e028f90d4109b639fefba \
   --agent nexau_harbor.agent:NexAUAgent \
+  --agent-kwarg config_path="$PWD/src/nexau_harbor/configs/terminal_bench/code_agent.yaml" \
   --model openai/gpt-5 \
   --n-tasks 1 \
   --n-concurrent 1
@@ -50,6 +51,14 @@ uv run harbor run \
 ```bash
 scripts/smoke_tb3.sh --job-name nexau-smoke
 ```
+
+`smoke_tb3.sh` 默认显式选择
+[`configs/terminal_bench/code_agent.yaml`](src/nexau_harbor/configs/terminal_bench/code_agent.yaml)，
+不会使用 installed agent 为其他评测保留的 fallback 配置。该 profile 按
+`tb-agent-configs-prompts-20260606` 配置 4 个编码工具、500 次迭代、仅
+`tool_result_compaction` 的上下文压缩，并删除发给模型的 `max_tokens`/
+`max_output_tokens`，避免把 `.env` 中的 32000 当成 TB 输出截断上限。Harbor runner 仍会
+自动加入 `InMemoryTracer`，因此 verifier、周期 checkpoint 和完整 trace 都保持开启。
 
 如果 Harbor Hub 暂时无法解析固定的 TB3 digest，但任务已经缓存到本机，可以直接绕过
 Hub 使用本地任务目录：
@@ -70,6 +79,11 @@ scripts/smoke_tb3.sh \
 ```bash
 HARBOR_NEXAU_MODEL=openai/gpt-5 scripts/smoke_tb3.sh
 ```
+
+切换模型只需修改 `HARBOR_NEXAU_MODEL` 以及对应的 `LLM_KIND`、API 地址和 Key。切换
+harness 时设置 `HARBOR_NEXAU_CONFIG_PATH=/absolute/path/to/code_agent.yaml`；脚本会检查
+文件存在后把它作为 `config_path` 传给 adapter。配置目录会整体上传，因此其中所有相对
+prompt、工具 YAML 和 binding 都应位于同一目录树内。
 
 本机没有 Docker 时，可在 `.env` 中选择 E2B 并配置对应凭据：
 
