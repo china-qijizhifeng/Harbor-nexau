@@ -1,0 +1,24 @@
+{
+  "name": "harbor-nexau-dind",
+  "template_id": "rm6nyjj5mfijqgvhua3i",
+  "build_id": "7dc0451b-c631-4332-89e0-bcf138fda7b1",
+  "tags": [
+    "default",
+    "v1"
+  ],
+  "base": {
+    "template_id": "qusopjo1y7f5s6po0hyl",
+    "build_id": "1ac1ebce-6cc3-43cf-8c30-1483468bbf38"
+  },
+  "resources": {
+    "cpu_count": 8,
+    "memory_mb": 32768,
+    "observed_memory_mb": 32120,
+    "observed_root_disk_mb": 41062
+  },
+  "software": {
+    "docker": "29.2.1",
+    "docker_compose": "5.0.2"
+  },
+  "verified_at": "2026-08-13T04:31:09Z"
+}

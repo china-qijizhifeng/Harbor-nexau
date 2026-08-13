@@ -97,6 +97,49 @@ E2B_API_KEY=...
 `NO_PROXY` 和 `no_proxy`，保留原有的 localhost 等排除项。它适用于宿主机已经设置本地
 HTTP 代理、但 E2B 控制连接需要直连的情况；无需覆盖或清空现有代理变量。
 
+### 构建 E2B DinD 模板
+
+需要在 E2B sandbox 内运行多容器题目时，可以构建本项目维护的
+`harbor-nexau-dind:v1` 模板。它固定继承已验证的 HK E2B `swem-dind` build
+`1ac1ebce-6cc3-43cf-8c30-1483468bbf38`，并固定 Docker 29.2.1、Docker Compose
+5.0.2、Docker Hub 镜像源和启动就绪检查。构建前会再次查询基座的 `default` tag；若它已被
+替换，脚本会停止，避免在未检查的基座上静默重建。当前已验证的模板 ID、build ID、资源和
+软件版本记录在
+[`src/nexau_harbor/e2b_dind/manifest.json`](src/nexau_harbor/e2b_dind/manifest.json)。
+
+`.env` 中配置好成套的 `E2B_API_URL`、`E2B_DOMAIN`、`E2B_API_KEY` 后执行：
+
+```bash
+uv sync --locked --extra cloud
+uv run scripts/build_e2b_dind_template.py build-and-smoke
+```
+
+脚本也通过 `python-dotenv` 加载 `.env`，不需要 `source .env`。首次构建默认分配 8 CPU、
+32768 MB 内存；可用 `--cpu-count` 和 `--memory-mb` 调整。模板已存在时，只有显式加入
+`--replace` 才会发布新 build。构建先使用一次性 `candidate-*` tag，只有构建完整成功后才会
+同时移动 `default`/`v1`，避免失败 build 污染稳定 tag：
+
+```bash
+uv run scripts/build_e2b_dind_template.py build-and-smoke --replace
+```
+
+只复查当前模板而不重建：
+
+```bash
+uv run scripts/build_e2b_dind_template.py smoke
+```
+
+冒烟验证会创建一个临时 sandbox，实际执行镜像 build、Compose 网络和命名卷、
+`compose exec/cp/stop/down -v` 以及 `SYS_PTRACE` 配置检查；无论成功或失败都会删除该
+sandbox。模板只是可复用的 DinD 主机，不会预先包含各道题的 Dockerfile；Harbor 后续应把
+当前题目的 environment 上传进 sandbox，再在其中 build/up。
+
+注意：当前 `NexAUE2BEnvironment` 仍是 Harbor 的单容器 E2B adapter，不会因为模板存在就
+自动声明 `docker_compose` capability。要让 Compose 题目通过 Harbor 校验，还需要接入一层
+DinD Compose environment。E2B 模板 API 也没有在这里声明磁盘或 GPU 资源，因此 GPU 题和
+超出 sandbox 磁盘容量的题仍需其他 provider。当前 HK E2B API 还会拒绝超过 8 CPU 的模板，
+因此声明 16 CPU 的题也不能由此模板完整满足。
+
 运行 NexAU 时，自定义 E2B environment 会将远程 Agent 作为独立后台进程启动，保存 PID、
 stdout、stderr 和退出码后立即断开初始事件流，再每 30 秒用短连接检查一次状态。暂时的轮询
 错误不会重新启动或重复执行 Agent；连续失败才中止 trial。这样本机仍可用 `tmux` 保护

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+timeout_sec="${HARBOR_NEXAU_DOCKER_READY_TIMEOUT_SEC:-120}"
+deadline=$((SECONDS + timeout_sec))
+
+while ! docker info >/dev/null 2>&1; do
+  if ((SECONDS >= deadline)); then
+    echo "Docker daemon did not become ready within ${timeout_sec}s" >&2
+    systemctl --no-pager --full status docker.service >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+
+docker compose version >/dev/null
+
+mirrors_json="$(docker info --format '{{json .RegistryConfig.Mirrors}}')"
+python3 - "$mirrors_json" <<'PY'
+import json
+import sys
+
+expected = [
+    "https://docker.1ms.run",
+]
+actual = [value.rstrip("/") for value in json.loads(sys.argv[1])]
+if actual != expected:
+    raise SystemExit(f"Docker registry mirrors are {actual!r}, expected {expected!r}")
+PY
