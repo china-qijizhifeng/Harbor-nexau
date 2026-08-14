@@ -17,15 +17,22 @@ from nexau_harbor.constants import (
 
 
 class FakeEnvironment:
-    default_user = "agent"
-
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        default_user: str | int | None = "agent",
+        identity_stdout: str = "10001\n10001\n",
+    ) -> None:
+        self.default_user = default_user
+        self.identity_stdout = identity_stdout
         self.exec_calls: list[dict[str, Any]] = []
         self.uploaded_dirs: list[tuple[Path | str, str]] = []
         self.uploaded_files: list[tuple[Path | str, str]] = []
 
     async def exec(self, **kwargs: Any) -> ExecResult:
         self.exec_calls.append(kwargs)
+        if "id -u && id -g" in kwargs["command"]:
+            return ExecResult(stdout=self.identity_stdout, stderr="", return_code=0)
         return ExecResult(stdout="", stderr="", return_code=0)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
@@ -171,7 +178,37 @@ async def test_install_uploads_config_and_pinned_runner(tmp_path: Path) -> None:
     assert environment.uploaded_files[0][1] == "/nexau-workspace/runner.py"
     install_commands = "\n".join(call["command"] for call in environment.exec_calls)
     assert NEXAU_GIT_COMMIT in install_commands
+    assert "chown -R 10001:10001 /nexau-workspace /opt/nexau-venv" in install_commands
     assert "uv venv --clear /opt/nexau-venv" in install_commands
+
+
+@pytest.mark.asyncio
+async def test_install_uses_image_default_user_identity_when_task_user_is_unset(
+    tmp_path: Path,
+) -> None:
+    agent = make_agent(tmp_path)
+    environment = FakeEnvironment(
+        default_user=None,
+        identity_stdout="65534\n65534\n",
+    )
+
+    await agent.install(environment)  # type: ignore[arg-type]
+
+    identity_call = next(
+        call for call in environment.exec_calls if "id -u && id -g" in call["command"]
+    )
+    assert identity_call["user"] is None
+    install_commands = "\n".join(call["command"] for call in environment.exec_calls)
+    assert "chown -R 65534:65534 /nexau-workspace /opt/nexau-venv" in install_commands
+
+
+@pytest.mark.asyncio
+async def test_install_rejects_unparseable_agent_identity(tmp_path: Path) -> None:
+    agent = make_agent(tmp_path)
+    environment = FakeEnvironment(default_user=None, identity_stdout="unknown\n")
+
+    with pytest.raises(RuntimeError, match="effective agent UID/GID"):
+        await agent.install(environment)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

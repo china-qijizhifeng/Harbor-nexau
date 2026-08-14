@@ -53,6 +53,16 @@ def _is_local_only_proxy(value: str) -> bool:
     return address.is_loopback or address.is_unspecified
 
 
+def _parse_posix_identity(stdout: str) -> str:
+    """Return a numeric ``uid:gid`` owner from an ``id`` command response."""
+
+    values = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if len(values) != 2 or any(not value.isdecimal() for value in values):
+        raise RuntimeError(f"Could not determine the effective agent UID/GID: {stdout!r}")
+    uid, gid = (str(int(value)) for value in values)
+    return f"{uid}:{gid}"
+
+
 class NexAUAgent(BaseInstalledAgent):
     """Run a pinned NexAU release inside a Harbor task environment."""
 
@@ -298,6 +308,15 @@ class NexAUAgent(BaseInstalledAgent):
                 return value
         return None
 
+    async def _effective_agent_owner(self, environment: BaseEnvironment) -> str:
+        """Resolve the user selected by an explicit task user or image ``USER``."""
+
+        identity = await self.exec_as_agent(
+            environment,
+            command="id -u && id -g",
+        )
+        return _parse_posix_identity(identity.stdout)
+
     @override
     async def install(self, environment: BaseEnvironment) -> None:
         await self.ensure_system_dependencies(
@@ -305,12 +324,12 @@ class NexAUAgent(BaseInstalledAgent):
             ("curl", "git", "build_tools", "ripgrep", "procps", "ca_certificates"),
         )
 
-        agent_user = shlex.quote(str(environment.default_user or "root"))
+        agent_owner = await self._effective_agent_owner(environment)
         await self.exec_as_root(
             environment,
             command=(
                 f"mkdir -p {REMOTE_WORKSPACE} {REMOTE_VENV} && "
-                f"chown -R {agent_user} {REMOTE_WORKSPACE} {REMOTE_VENV}"
+                f"chown -R {agent_owner} {REMOTE_WORKSPACE} {REMOTE_VENV}"
             ),
         )
 
@@ -325,7 +344,7 @@ class NexAUAgent(BaseInstalledAgent):
         )
         await self.exec_as_root(
             environment,
-            command=f"chown -R {agent_user} {REMOTE_WORKSPACE}",
+            command=f"chown -R {agent_owner} {REMOTE_WORKSPACE}",
         )
 
         source = shlex.quote(self._nexau_source)
