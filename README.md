@@ -60,6 +60,26 @@ scripts/smoke_tb3.sh --job-name nexau-smoke
 `max_output_tokens`，避免把 `.env` 中的 32000 当成 TB 输出截断上限。Harbor runner 仍会
 自动加入 `InMemoryTracer`，因此 verifier、周期 checkpoint 和完整 trace 都保持开启。
 
+如果目标是采集长轨迹而不是遵守题目自带的 Agent 限时，可启用 trace 模式：
+
+```bash
+scripts/smoke_tb3.sh \
+  --trace-mode \
+  --path /root/.cache/harbor/tasks/local-datasets/frontier-bench-cpu68-20260813 \
+  --n-tasks 68 \
+  --n-concurrent 68 \
+  --job-name nexau-n2-pro-frontier-trace
+```
+
+trace 模式通过 Harbor 的 `agent.override_timeout_sec` 覆盖每道题自己的 Agent timeout，
+默认统一为 72000 秒（20 小时）。这不是基础设施层面的无限运行：当前 E2B 最大生命周期仍为
+86400 秒，默认预留的 4 小时用于环境构建、verifier、artifact 和 trace 下载，避免 sandbox
+先被回收而丢失轨迹。可以用 `HARBOR_NEXAU_TRACE_TIMEOUT_SEC` 或
+`--trace-timeout-sec SECONDS` 调整该值；切换模型仍通过 `HARBOR_NEXAU_MODEL`，trace 模式下
+不要另外传 `--agent`、`--model`、`--config`、`--timeout-multiplier` 或
+`--agent-timeout-multiplier`。Terminal-Bench profile 的 500 次迭代上限仍然生效。已经启动的
+job 无法动态切换到 trace 模式。
+
 如果 Harbor Hub 暂时无法解析固定的 TB3 digest，但任务已经缓存到本机，可以直接绕过
 Hub 使用本地任务目录：
 
