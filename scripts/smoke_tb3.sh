@@ -19,6 +19,7 @@ environment="${HARBOR_NEXAU_ENV:-}"
 agent_config="${HARBOR_NEXAU_CONFIG_PATH:-$project_root/src/nexau_harbor/configs/terminal_bench/code_agent.yaml}"
 trace_mode=0
 trace_timeout_sec="${HARBOR_NEXAU_TRACE_TIMEOUT_SEC:-72000}"
+e2b_start_ramp_delay_sec="${HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC:-0}"
 forwarded_args=()
 
 while (($# > 0)); do
@@ -41,6 +42,18 @@ while (($# > 0)); do
       trace_timeout_sec="${1#*=}"
       shift
       ;;
+    --e2b-start-ramp-delay-sec)
+      if (($# < 2)); then
+        printf '%s\n' '--e2b-start-ramp-delay-sec requires a finite non-negative number' >&2
+        exit 2
+      fi
+      e2b_start_ramp_delay_sec="$2"
+      shift 2
+      ;;
+    --e2b-start-ramp-delay-sec=*)
+      e2b_start_ramp_delay_sec="${1#*=}"
+      shift
+      ;;
     *)
       forwarded_args+=("$1")
       shift
@@ -52,6 +65,17 @@ set -- "${forwarded_args[@]}"
 if [[ "$trace_mode" == "1" && ! "$trace_timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
   printf 'Trace timeout must be a positive integer, got: %s\n' "$trace_timeout_sec" >&2
   exit 2
+fi
+
+if [[ ! "$e2b_start_ramp_delay_sec" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
+  printf 'E2B start ramp delay must be a finite non-negative number, got: %s\n' \
+    "$e2b_start_ramp_delay_sec" >&2
+  exit 2
+fi
+export HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC="$e2b_start_ramp_delay_sec"
+if [[ "$e2b_start_ramp_delay_sec" != "0" ]]; then
+  printf 'E2B sandbox starts will be staggered by %s seconds; Harbor concurrency is unchanged.\n' \
+    "$e2b_start_ramp_delay_sec" >&2
 fi
 
 if [[ ! -f "$agent_config" ]]; then

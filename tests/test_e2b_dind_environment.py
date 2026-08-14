@@ -16,6 +16,8 @@ from nexau_harbor.e2b_dind_environment import (
     NexAUE2BDinDEnvironment,
     _compose_env_file_content,
     _compose_project_name,
+    _E2BDinDCompose,
+    _reserve_sandbox_start_delay,
 )
 from nexau_harbor.e2b_environment import NexAUE2BEnvironment
 
@@ -72,6 +74,20 @@ def test_compose_env_file_quotes_interpolation_and_special_characters() -> None:
 def test_compose_env_file_rejects_invalid_variable_names() -> None:
     with pytest.raises(ValueError, match="Invalid Docker Compose environment variable"):
         _compose_env_file_content({"INVALID-NAME": "value"})
+
+
+def test_sandbox_start_slots_are_reserved_at_the_configured_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "nexau_harbor.e2b_dind_environment._next_sandbox_start_at",
+        0.0,
+    )
+    monkeypatch.setattr("nexau_harbor.e2b_dind_environment.time.monotonic", lambda: 100.0)
+
+    assert _reserve_sandbox_start_delay(5) == 0
+    assert _reserve_sandbox_start_delay(5) == 5
+    assert _reserve_sandbox_start_delay(5) == 10
 
 
 def _fake_super_init(
@@ -217,3 +233,66 @@ def test_detached_status_is_polled_as_outer_host_root() -> None:
     environment = object.__new__(NexAUE2BDinDEnvironment)
 
     assert environment._detached_status_user("container-only-user") == "root"
+
+
+async def test_compose_build_retries_only_transient_network_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transient = ExecResult(stdout="", stderr="failed to copy: unexpected EOF", return_code=1)
+    success = ExecResult(stdout="done", stderr="", return_code=0)
+    detached_exec = AsyncMock(side_effect=[transient, success])
+    compose = object.__new__(_E2BDinDCompose)
+    compose._env = SimpleNamespace(
+        _exec_on_host_detached=detached_exec,
+        logger=logging.getLogger("test-e2b-dind"),
+    )
+    compose._compose_env_vars = MagicMock(return_value={"BUILDKIT_PROGRESS": "plain"})
+    compose._compose_cmd = MagicMock(return_value="docker compose build")
+    sleep = AsyncMock()
+    monkeypatch.setattr("nexau_harbor.e2b_dind_environment.asyncio.sleep", sleep)
+
+    result = await compose._compose_build_exec(["build"], phase="build")
+
+    assert result is success
+    assert detached_exec.await_count == 2
+    sleep.assert_awaited_once_with(5)
+
+
+async def test_compose_build_does_not_retry_a_deterministic_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = ExecResult(stdout="", stderr="Dockerfile parse error", return_code=1)
+    detached_exec = AsyncMock(return_value=failure)
+    compose = object.__new__(_E2BDinDCompose)
+    compose._env = SimpleNamespace(
+        _exec_on_host_detached=detached_exec,
+        logger=logging.getLogger("test-e2b-dind"),
+    )
+    compose._compose_env_vars = MagicMock(return_value={})
+    compose._compose_cmd = MagicMock(return_value="docker compose build")
+    sleep = AsyncMock()
+    monkeypatch.setattr("nexau_harbor.e2b_dind_environment.asyncio.sleep", sleep)
+
+    result = await compose._compose_build_exec(["build"], phase="build")
+
+    assert result is failure
+    detached_exec.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
+async def test_detached_host_build_has_no_inner_command_timeout() -> None:
+    expected = ExecResult(stdout="built", stderr="", return_code=0)
+    handle = SimpleNamespace(pid=42, disconnect=AsyncMock())
+    environment = object.__new__(NexAUE2BDinDEnvironment)
+    environment.logger = logging.getLogger("test-e2b-dind")
+    environment._dispatch_command = AsyncMock(return_value=handle)
+    environment._poll_detached_command = AsyncMock(return_value=expected)
+
+    result = await environment._exec_on_host_detached(
+        "docker compose build",
+        env={"BUILDKIT_PROGRESS": "plain"},
+    )
+
+    assert result is expected
+    environment._dispatch_command.assert_awaited_once()
+    assert environment._dispatch_command.await_args.kwargs["timeout_sec"] is None

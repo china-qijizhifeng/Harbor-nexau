@@ -63,6 +63,45 @@ def test_running_checkpoint_is_atomic_and_self_describing(tmp_path: Path) -> Non
     assert not list(tmp_path.glob(".*.tmp"))
 
 
+def test_jsonl_tracer_appends_complete_events_without_retaining_payloads(
+    tmp_path: Path,
+) -> None:
+    trace_path = tmp_path / "nexau_trace_events.jsonl"
+    tracer = runner.JsonlFileTracer(trace_path)
+    span = tracer.start_span(
+        "llm",
+        SpanType.LLM,
+        {"messages": [{"role": "user", "content": "solve it"}]},
+    )
+    tracer.end_span(
+        span,
+        {"usage": {"input_tokens": 10, "output_tokens": 4}},
+    )
+
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert [event["event"] for event in events] == ["start", "end"]
+    assert events[0]["span"]["inputs"]["messages"][0]["content"] == "solve it"
+    assert events[1]["outputs"]["usage"]["output_tokens"] == 4
+    assert span.inputs == {}
+    assert not hasattr(tracer, "spans")
+
+
+def test_file_trace_checkpoint_does_not_reserialize_agent_history(tmp_path: Path) -> None:
+    trace_path = tmp_path / "nexau_trace_events.jsonl"
+    tracer = runner.JsonlFileTracer(trace_path)
+    agent = SimpleNamespace(
+        config=SimpleNamespace(resolved_tracer=tracer),
+        global_storage=None,
+    )
+
+    runner._checkpoint_trace_artifacts(agent, tmp_path, interval_sec=30)
+
+    state = json.loads((tmp_path / "nexau_trace_checkpoint.json").read_text())
+    assert state["written_files"] == ["nexau_trace_events.jsonl"]
+    assert not (tmp_path / "nexau_history.json").exists()
+    assert not (tmp_path / "nexau_full_trace.json").exists()
+
+
 def test_periodic_checkpointer_repeats_until_stopped(
     monkeypatch,
     tmp_path: Path,
@@ -108,7 +147,7 @@ def test_runner_main_persists_full_trace_and_completion_state(
             query="solve it",
         ),
     )
-    monkeypatch.setattr(runner, "_build_agent", lambda _: agent)
+    monkeypatch.setattr(runner, "_build_agent", lambda *_args, **_kwargs: agent)
     monkeypatch.setenv("NEXAU_TRACE_CHECKPOINT_SEC", "0")
 
     assert runner.main() == 0
@@ -138,7 +177,7 @@ def test_runner_failure_keeps_latest_trace_artifacts(
             query="solve it",
         ),
     )
-    monkeypatch.setattr(runner, "_build_agent", lambda _: agent)
+    monkeypatch.setattr(runner, "_build_agent", lambda *_args, **_kwargs: agent)
     monkeypatch.setenv("NEXAU_TRACE_CHECKPOINT_SEC", "0")
 
     assert runner.main() == 1

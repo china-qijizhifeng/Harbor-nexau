@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import os
 import re
 import shlex
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import override
 from uuid import uuid4
@@ -63,13 +66,17 @@ from nexau_harbor.e2b_dind_template import (
     TEMPLATE_VERSION,
 )
 from nexau_harbor.e2b_environment import (
+    E2B_DETACHED_POLL_INTERVAL_SEC,
     E2B_DETACHED_REQUEST_TIMEOUT_SEC,
     E2B_SANDBOX_TIMEOUT_SEC,
     NexAUE2BEnvironment,
+    _detached_command_wrapper,
+    _detached_exec_paths,
     _DetachedExecPaths,
 )
 
 E2B_DIND_TEMPLATE_ENV = "HARBOR_NEXAU_E2B_DIND_TEMPLATE"
+E2B_START_RAMP_DELAY_ENV = "HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC"
 E2B_DIND_DEFAULT_TEMPLATE = f"{TEMPLATE_NAME}:{TEMPLATE_VERSION}"
 E2B_DIND_DEFAULT_STORAGE_CAPACITY_MB = 41_062
 
@@ -81,6 +88,16 @@ _DOCKER_READY_TIMEOUT_SEC = 120
 _MAIN_READY_TIMEOUT_SEC = 120
 _DEFAULT_COMPOSE_UP_TIMEOUT_SEC = 600
 _HOST_TRANSFER_TIMEOUT_SEC = 300
+_COMPOSE_BUILD_MAX_ATTEMPTS = 3
+_COMPOSE_BUILD_RETRY_BASE_DELAY_SEC = 5
+
+_sandbox_start_lock = threading.Lock()
+_next_sandbox_start_at = 0.0
+_TRANSIENT_DOCKER_BUILD_ERROR = re.compile(
+    r"(?:unexpected eof|short read|connection reset|tls handshake timeout|"
+    r"peer closed connection without sending tls close_notify)",
+    flags=re.IGNORECASE,
+)
 
 
 def _positive_int(value: int | str, *, name: str) -> int:
@@ -93,6 +110,37 @@ def _positive_int(value: int | str, *, name: str) -> int:
     if resolved <= 0:
         raise ValueError(f"{name} must be positive, got {resolved}")
     return resolved
+
+
+def _nonnegative_float(value: int | float | str, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise ValueError(f"{name} must be a finite non-negative number")
+    try:
+        resolved = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite non-negative number, got {value!r}") from exc
+    if not math.isfinite(resolved) or resolved < 0:
+        raise ValueError(f"{name} must be a finite non-negative number, got {value!r}")
+    return resolved
+
+
+def _reserve_sandbox_start_delay(ramp_delay_sec: float) -> float:
+    """Reserve one process-wide E2B creation slot and return its wait time."""
+
+    global _next_sandbox_start_at
+
+    if ramp_delay_sec <= 0:
+        return 0.0
+    with _sandbox_start_lock:
+        now = time.monotonic()
+        start_at = max(now, _next_sandbox_start_at)
+        _next_sandbox_start_at = start_at + ramp_delay_sec
+    return max(0.0, start_at - now)
+
+
+def _is_transient_docker_build_error(result: ExecResult) -> bool:
+    output = f"{result.stderr}\n{result.stdout}"
+    return _TRANSIENT_DOCKER_BUILD_ERROR.search(output) is not None
 
 
 def _compose_project_name(session_id: str) -> str:
@@ -310,6 +358,33 @@ class _E2BDinDCompose(DinDComposeOps):
             timeout_sec=timeout_sec,
         )
 
+    async def _compose_build_exec(self, subcommand: list[str], *, phase: str) -> ExecResult:
+        """Run a long Compose build phase detached and retry recoverable network failures."""
+
+        compose_env = self._compose_env_vars()
+        command = self._compose_cmd(subcommand)
+        for attempt in range(1, _COMPOSE_BUILD_MAX_ATTEMPTS + 1):
+            result = await self._env._exec_on_host_detached(command, env=compose_env)
+            if result.return_code == 0:
+                return result
+            if attempt >= _COMPOSE_BUILD_MAX_ATTEMPTS or not _is_transient_docker_build_error(
+                result
+            ):
+                return result
+
+            delay_sec = _COMPOSE_BUILD_RETRY_BASE_DELAY_SEC * (2 ** (attempt - 1))
+            self._env.logger.warning(
+                "docker compose %s hit a transient network error; retrying in %ss "
+                "(attempt %s/%s): %s",
+                phase,
+                delay_sec,
+                attempt + 1,
+                _COMPOSE_BUILD_MAX_ATTEMPTS,
+                (result.stderr or result.stdout or "no output")[-500:],
+            )
+            await asyncio.sleep(delay_sec)
+        raise AssertionError("unreachable")
+
     @staticmethod
     def _service_exec_subcommand(
         command: str,
@@ -497,18 +572,18 @@ class _E2BDinDCompose(DinDComposeOps):
                 f"{configured.stderr or configured.stdout or 'no output'}"
             )
 
-        pulled = await self._compose_exec(
+        pulled = await self._compose_build_exec(
             ["pull", "--ignore-buildable"],
-            timeout_sec=round(self._env.task_env_config.build_timeout_sec),
+            phase="pull",
         )
         if pulled.return_code != 0:
             raise RuntimeError(
                 f"docker compose pull failed: {pulled.stderr or pulled.stdout or 'no output'}"
             )
 
-        built = await self._compose_exec(
+        built = await self._compose_build_exec(
             ["build"],
-            timeout_sec=round(self._env.task_env_config.build_timeout_sec),
+            phase="build",
         )
         if built.return_code != 0:
             raise RuntimeError(
@@ -545,6 +620,7 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
         dind_memory_capacity_mb: int | str | None = None,
         dind_storage_capacity_mb: int | str | None = None,
         compose_up_timeout_sec: int | str = _DEFAULT_COMPOSE_UP_TIMEOUT_SEC,
+        e2b_start_ramp_delay_sec: int | float | str | None = None,
         **kwargs,
     ) -> None:
         template = dind_template or os.environ.get(
@@ -586,6 +662,14 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
         self._compose_up_timeout_sec = _positive_int(
             compose_up_timeout_sec,
             name="compose_up_timeout_sec",
+        )
+        self._e2b_start_ramp_delay_sec = _nonnegative_float(
+            (
+                e2b_start_ramp_delay_sec
+                if e2b_start_ramp_delay_sec is not None
+                else os.environ.get(E2B_START_RAMP_DELAY_ENV, "0")
+            ),
+            name=E2B_START_RAMP_DELAY_ENV,
         )
         self._compose_files_staged = False
 
@@ -666,6 +750,13 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
     )
     @override
     async def _create_sandbox(self) -> None:
+        ramp_wait_sec = _reserve_sandbox_start_delay(self._e2b_start_ramp_delay_sec)
+        if ramp_wait_sec > 0:
+            self.logger.info(
+                "Staggering E2B sandbox creation by %.1f seconds",
+                ramp_wait_sec,
+            )
+            await asyncio.sleep(ramp_wait_sec)
         initial_lease_timeout_sec = min(
             E2B_SANDBOX_TIMEOUT_SEC,
             self._max_lifetime_sec,
@@ -682,6 +773,54 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
             network=None,
         )
         self._start_keepalive()
+
+    async def _exec_on_host_detached(
+        self,
+        command: str,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> ExecResult:
+        """Run a long DinD-host command in the background and poll it briefly."""
+
+        paths = _detached_exec_paths()
+        wrapper = _detached_command_wrapper(command, paths)
+        handle = await self._dispatch_command(
+            wrapper,
+            cwd="/",
+            env=env,
+            timeout_sec=None,
+            user="root",
+        )
+        pid = int(handle.pid)
+        self.logger.info(
+            "Started detached E2B DinD host command as process %s; polling every %s seconds",
+            pid,
+            E2B_DETACHED_POLL_INTERVAL_SEC,
+        )
+        try:
+            try:
+                await handle.disconnect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to close the initial E2B DinD command stream; switching to "
+                    "short polling anyway: %s",
+                    exc,
+                )
+            return await self._poll_detached_command(
+                pid=pid,
+                paths=paths,
+                user="root",
+            )
+        except asyncio.CancelledError:
+            await NexAUE2BEnvironment._cancel_detached_command(
+                self,
+                pid=pid,
+                paths=paths,
+                user="root",
+            )
+            raise
 
     async def _exec_on_host(
         self,

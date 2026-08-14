@@ -89,9 +89,7 @@ def _usage_metrics(usage: Any) -> Metrics | None:
     if is_gemini_usage:
         candidates = usage.get("candidatesTokenCount")
         completion = sum(
-            value
-            for value in (candidates, reasoning_tokens)
-            if isinstance(value, int)
+            value for value in (candidates, reasoning_tokens) if isinstance(value, int)
         )
     else:
         completion = usage.get("completion_tokens", usage.get("output_tokens"))
@@ -108,9 +106,7 @@ def _usage_metrics(usage: Any) -> Metrics | None:
         return None
     return Metrics(
         prompt_tokens=prompt if isinstance(prompt, int) and prompt > 0 else None,
-        completion_tokens=(
-            completion if isinstance(completion, int) and completion > 0 else None
-        ),
+        completion_tokens=(completion if isinstance(completion, int) and completion > 0 else None),
         cached_tokens=cached if isinstance(cached, int) and cached > 0 else None,
         cost_usd=cost if isinstance(cost, (int, float)) and cost > 0 else None,
         extra=(
@@ -128,6 +124,99 @@ def _iter_trace_spans(node: Any) -> list[dict[str, Any]]:
     for child in node.get("children", []):
         spans.extend(_iter_trace_spans(child))
     return spans
+
+
+def rebuild_trace_from_jsonl(
+    event_path: Path,
+    trace_path: Path,
+    logger: logging.Logger,
+) -> bool:
+    """Rebuild the legacy nested trace artifact from append-only span events."""
+
+    if not event_path.exists():
+        return False
+
+    spans: dict[str, dict[str, Any]] = {}
+    ordered_ids: list[str] = []
+    try:
+        with event_path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    logger.warning(
+                        "Skipped incomplete NexAU trace event at %s:%s",
+                        event_path,
+                        line_number,
+                    )
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("event")
+                if event_type == "start" and isinstance(event.get("span"), dict):
+                    raw_span = event["span"]
+                    span_id = str(raw_span.get("id") or "")
+                    if not span_id:
+                        continue
+                    spans[span_id] = {
+                        "id": span_id,
+                        "name": str(raw_span.get("name") or ""),
+                        "type": str(raw_span.get("type") or ""),
+                        "parent_id": raw_span.get("parent_id"),
+                        "start_time": raw_span.get("start_time"),
+                        "end_time": None,
+                        "duration_ms": None,
+                        "inputs": raw_span.get("inputs") or {},
+                        "outputs": {},
+                        "attributes": raw_span.get("attributes") or {},
+                        "error": None,
+                        "children": [],
+                    }
+                    ordered_ids.append(span_id)
+                elif event_type == "end":
+                    span_id = str(event.get("span_id") or "")
+                    span = spans.get(span_id)
+                    if span is None:
+                        continue
+                    span["end_time"] = event.get("end_time")
+                    span["outputs"] = event.get("outputs") or {}
+                    span["error"] = event.get("error")
+                    span["attributes"] = {
+                        **span["attributes"],
+                        **(event.get("attributes") or {}),
+                    }
+                    if isinstance(span["start_time"], (int, float)) and isinstance(
+                        span["end_time"], (int, float)
+                    ):
+                        span["duration_ms"] = (span["end_time"] - span["start_time"]) * 1000
+    except OSError:
+        logger.exception("Failed to read NexAU JSONL trace file: %s", event_path)
+        return False
+
+    roots: list[dict[str, Any]] = []
+    for span_id in ordered_ids:
+        span = spans[span_id]
+        parent = spans.get(str(span["parent_id"])) if span["parent_id"] else None
+        if parent is None:
+            roots.append(span)
+        else:
+            parent["children"].append(span)
+
+    temporary_path = trace_path.with_name(f".{trace_path.name}.tmp")
+    try:
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path.write_text(
+            json.dumps(roots, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary_path.replace(trace_path)
+    except OSError:
+        logger.exception("Failed to write rebuilt NexAU trace file: %s", trace_path)
+        temporary_path.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def collect_metrics(
@@ -251,9 +340,7 @@ def history_to_trajectory(
                     message=_message_text(message),
                     reasoning_content=_message_reasoning(message),
                     tool_calls=tool_calls or None,
-                    observation=(
-                        Observation(results=observations) if observations else None
-                    ),
+                    observation=(Observation(results=observations) if observations else None),
                     llm_call_count=1,
                 )
             )
@@ -302,9 +389,13 @@ def populate_context_from_logs(
     reasoning_effort: str | None,
     logger: logging.Logger,
 ) -> None:
-    metrics, totals = collect_metrics(
-        logs_dir / "nexau_in_memory_tracer.json", logger
+    nested_trace_path = logs_dir / "nexau_in_memory_tracer.json"
+    rebuild_trace_from_jsonl(
+        logs_dir / "nexau_trace_events.jsonl",
+        nested_trace_path,
+        logger,
     )
+    metrics, totals = collect_metrics(nested_trace_path, logger)
     history_candidates = (
         logs_dir / "nexau_full_trace.json",
         logs_dir / "nexau_history.json",

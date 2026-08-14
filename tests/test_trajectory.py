@@ -7,7 +7,11 @@ from pathlib import Path
 from harbor.models.agent.context import AgentContext
 from harbor.models.trajectories import Trajectory
 
-from nexau_harbor.trajectory import collect_metrics, populate_context_from_logs
+from nexau_harbor.trajectory import (
+    collect_metrics,
+    populate_context_from_logs,
+    rebuild_trace_from_jsonl,
+)
 
 
 def test_nexau_history_is_converted_to_valid_atif(tmp_path: Path) -> None:
@@ -96,9 +100,7 @@ def test_nexau_history_is_converted_to_valid_atif(tmp_path: Path) -> None:
         logger=logging.getLogger("test"),
     )
 
-    trajectory = Trajectory.model_validate_json(
-        (logs_dir / "trajectory.json").read_text()
-    )
+    trajectory = Trajectory.model_validate_json((logs_dir / "trajectory.json").read_text())
     assert trajectory.schema_version == "ATIF-v1.7"
     assert [step.source for step in trajectory.steps] == [
         "system",
@@ -167,9 +169,7 @@ def test_uncompacted_full_trace_is_preferred_over_final_history(
         logger=logging.getLogger("test"),
     )
 
-    trajectory = Trajectory.model_validate_json(
-        (logs_dir / "trajectory.json").read_text()
-    )
+    trajectory = Trajectory.model_validate_json((logs_dir / "trajectory.json").read_text())
     assert [step.message for step in trajectory.steps] == [
         "original task",
         "original answer",
@@ -208,3 +208,61 @@ def test_gemini_usage_metadata_is_normalized(tmp_path: Path) -> None:
     assert totals is not None
     assert totals.total_prompt_tokens == 12
     assert totals.total_completion_tokens == 8
+
+
+def test_jsonl_trace_is_rebuilt_with_nesting_and_incomplete_lines(
+    tmp_path: Path,
+) -> None:
+    event_path = tmp_path / "nexau_trace_events.jsonl"
+    trace_path = tmp_path / "nexau_in_memory_tracer.json"
+    events = [
+        {
+            "event": "start",
+            "span": {
+                "id": "root",
+                "name": "agent",
+                "type": "AGENT",
+                "parent_id": None,
+                "start_time": 1.0,
+                "inputs": {"query": "solve"},
+                "attributes": {},
+            },
+        },
+        {
+            "event": "start",
+            "span": {
+                "id": "llm",
+                "name": "llm",
+                "type": "LLM",
+                "parent_id": "root",
+                "start_time": 2.0,
+                "inputs": {"messages": []},
+                "attributes": {},
+            },
+        },
+        {
+            "event": "end",
+            "span_id": "llm",
+            "end_time": 3.0,
+            "outputs": {"usage": {"input_tokens": 12, "output_tokens": 5}},
+            "attributes": {"model": "N2-Pro"},
+            "error": None,
+        },
+    ]
+    event_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events) + '{"event":',
+        encoding="utf-8",
+    )
+
+    assert rebuild_trace_from_jsonl(
+        event_path,
+        trace_path,
+        logging.getLogger("test"),
+    )
+
+    traces = json.loads(trace_path.read_text())
+    assert traces[0]["id"] == "root"
+    assert traces[0]["end_time"] is None
+    assert traces[0]["children"][0]["id"] == "llm"
+    assert traces[0]["children"][0]["duration_ms"] == 1000
+    assert traces[0]["children"][0]["attributes"] == {"model": "N2-Pro"}

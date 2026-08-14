@@ -58,7 +58,8 @@ scripts/smoke_tb3.sh --job-name nexau-smoke
 `tb-agent-configs-prompts-20260606` 配置 4 个编码工具、500 次迭代、仅
 `tool_result_compaction` 的上下文压缩，并删除发给模型的 `max_tokens`/
 `max_output_tokens`，避免把 `.env` 中的 32000 当成 TB 输出截断上限。Harbor runner 仍会
-自动加入 `InMemoryTracer`，因此 verifier、周期 checkpoint 和完整 trace 都保持开启。
+自动加入追加写入的 JSONL tracer，因此 verifier、周期 checkpoint 和完整 trace 都保持开启，
+同时不会在任务容器内累计第二份完整 span 树。
 
 如果目标是采集长轨迹而不是遵守题目自带的 Agent 限时，可启用 trace 模式：
 
@@ -68,8 +69,14 @@ scripts/smoke_tb3.sh \
   --path /root/.cache/harbor/tasks/local-datasets/frontier-bench-cpu68-20260813 \
   --n-tasks 68 \
   --n-concurrent 68 \
+  --e2b-start-ramp-delay-sec 5 \
   --job-name nexau-n2-pro-frontier-trace
 ```
+
+`--e2b-start-ramp-delay-sec 5` 不降低 `--n-concurrent 68`：68 个 trial 会立即进入 Harbor
+调度，但 E2B sandbox 的创建请求每隔 5 秒发出一个，约 335 秒后全部放行，以避免 sandbox
+创建、Docker pull/build 和 keepalive 同时形成尖峰。也可通过
+`HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC` 设置；`0` 表示关闭错峰。
 
 trace 模式通过 Harbor 的 `agent.override_timeout_sec` 覆盖每道题自己的 Agent timeout，
 默认统一为 72000 秒（20 小时）。这不是基础设施层面的无限运行：当前 E2B 最大生命周期仍为
@@ -178,6 +185,10 @@ sandbox。模板只是可复用的 DinD 主机，不会预先包含各道题的 
 environment，执行 pull/build/up，把 Agent 的 exec/upload/download 路由到 `main`，并支持
 sidecar 的 collect hook、artifact 下载和单服务 stop；独立 verifier 也会在新的 DinD sandbox
 中作为单服务 Compose project 运行。停止时执行 `down -v --remove-orphans` 后删除 sandbox。
+耗时的 pull/build 以远端后台进程运行，每 30 秒用短连接轮询；其内部命令不重复应用题目原始
+build timeout，而由 Harbor 外层经 multiplier 计算后的 environment-build deadline 统一取消。
+遇到 `unexpected EOF`、`short read` 或连接重置时，会在同一 sandbox 内指数退避重试最多
+3 次，确定性的 Dockerfile/build 错误不会重试。
 镜像 pull/build 阶段临时使用公网，完成后由 E2B 外层网络策略限制整个 sandbox；这样既保留
 Compose 内部 DNS/bridge 通信，也支持 Harbor 在不同阶段动态切换 public/no-network/allowlist。
 
@@ -250,16 +261,19 @@ Anthropic 模型的 `output_config.effort`，以及 Gemini 3+ 的
 - `nexau.txt`：NexAU 标准输出和错误输出。
 - `nexau_history.json`：NexAU 最终执行历史，可能包含上下文压缩结果。
 - `nexau_full_trace.json`：NexAU 在压缩前保存的完整对话历史。
-- `nexau_in_memory_tracer.json`：完整的 LLM/工具 span、输入、输出和 usage。
+- `nexau_trace_events.jsonl`：运行时逐 span 追加的完整输入、输出、错误和 usage；每个事件写入后
+  立即 flush，异常退出时保留到最后一次成功写入。
+- `nexau_in_memory_tracer.json`：Harbor 下载日志后在宿主机从 JSONL 重建的嵌套 span 树；
+  文件名保持兼容，但不再由任务容器中的 InMemoryTracer 维护。
 - `nexau_result.json`：NexAU 最终响应。
 - `nexau_trace_checkpoint.json`：最近一次 trace checkpoint 的状态和文件清单。
 - `trajectory.json`：适配器生成的 ATIF-v1.7 轨迹。
 
-运行期间默认每 30 秒原子刷新 history 和原始 tracer；可通过
-`NEXAU_TRACE_CHECKPOINT_SEC` 修改间隔，设为 `0` 可关闭周期 checkpoint。正常结束后会
-再次原子写入最终文件，且 ATIF 优先从未压缩的 `nexau_full_trace.json` 生成。若进程被
-强制终止，最近一次 `status=running` 的 checkpoint 仍可用于诊断，但它只代表终止前的
-部分轨迹。
+span 事件不依赖周期 checkpoint，每次 start/end 都会追加。运行期间默认每 30 秒只原子刷新
+轻量的 checkpoint 状态，不再整体序列化 history 和 span 树；可通过
+`NEXAU_TRACE_CHECKPOINT_SEC` 修改状态刷新间隔，设为 `0` 可关闭。正常结束时才写最终 history
+和 full trace，且 ATIF 优先从未压缩的 `nexau_full_trace.json` 生成。若进程被强制终止，
+`nexau_trace_events.jsonl` 仍包含终止前已经落盘的完整 span 事件。
 
 Harbor 0.21.x 负责从本地或云环境统一下载 `/logs/agent`，随后适配器从上述日志回填
 token/cost context 并生成 ATIF 文件。每道题（每个 attempt）的评分、异常、耗时和 token

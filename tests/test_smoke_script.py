@@ -16,6 +16,7 @@ def _run_with_fake_uv(
     *arguments: str,
     config_path: Path | None = None,
     trace_config_capture: Path | None = None,
+    ramp_capture: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -30,6 +31,9 @@ for argument in "$@"; do
   fi
   previous="$argument"
 done
+if [[ -n "${RAMP_CAPTURE:-}" ]]; then
+  printf '%s' "${HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC:-}" > "$RAMP_CAPTURE"
+fi
 printf "%s\\n" "$@"
 """
     )
@@ -52,6 +56,10 @@ printf "%s\\n" "$@"
         env["TRACE_CONFIG_CAPTURE"] = str(trace_config_capture)
     else:
         env.pop("TRACE_CONFIG_CAPTURE", None)
+    if ramp_capture is not None:
+        env["RAMP_CAPTURE"] = str(ramp_capture)
+    else:
+        env.pop("RAMP_CAPTURE", None)
 
     return subprocess.run(
         [str(_SCRIPT), *arguments],
@@ -166,3 +174,31 @@ def test_smoke_script_trace_mode_rejects_timeout_multiplier(tmp_path: Path) -> N
 
     assert result.returncode == 2
     assert "use HARBOR_NEXAU_MODEL and --trace-timeout-sec" in result.stderr
+
+
+def test_smoke_script_exports_and_consumes_start_ramp_delay(tmp_path: Path) -> None:
+    ramp_capture = tmp_path / "ramp.txt"
+
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--e2b-start-ramp-delay-sec",
+        "5",
+        "--path",
+        "/tmp/local-task",
+        ramp_capture=ramp_capture,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert ramp_capture.read_text() == "5"
+    assert "--e2b-start-ramp-delay-sec" not in result.stdout.splitlines()
+    assert "Harbor concurrency is unchanged" in result.stderr
+
+
+def test_smoke_script_rejects_invalid_start_ramp_delay(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--e2b-start-ramp-delay-sec=-1",
+    )
+
+    assert result.returncode == 2
+    assert "finite non-negative number" in result.stderr

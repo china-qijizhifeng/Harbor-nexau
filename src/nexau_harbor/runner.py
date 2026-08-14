@@ -11,9 +11,13 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+
+from nexau.archs.tracer.core import BaseTracer, Span, SpanType
 
 _DEFAULT_TRACE_CHECKPOINT_SEC = 30.0
 _TRACE_CHECKPOINT_ENV = "NEXAU_TRACE_CHECKPOINT_SEC"
+_TRACE_EVENTS_NAME = "nexau_trace_events.jsonl"
 
 
 def _ensure_config_dir_on_sys_path(config_path: Path) -> None:
@@ -30,23 +34,18 @@ def _load_raw_config(config_path: Path) -> dict[str, Any]:
     if not raw_config:
         raise ConfigError(f"Empty or invalid configuration file: {config_path}")
     if not isinstance(raw_config, dict):
-        raise ConfigError(
-            f"Invalid configuration type in {config_path}; expected mapping"
-        )
+        raise ConfigError(f"Invalid configuration type in {config_path}; expected mapping")
     return raw_config
 
 
-def _has_in_memory_tracer(tracer_configs: list[Any]) -> bool:
+def _is_in_memory_tracer_config(entry: Any) -> bool:
     import_paths = {
         "nexau.archs.tracer.adapters.in_memory:InMemoryTracer",
         "gdpval_nexau_tracer:ThreadSafeInMemoryTracer",
     }
-    for entry in tracer_configs:
-        if isinstance(entry, str) and entry.strip() in import_paths:
-            return True
-        if isinstance(entry, dict) and entry.get("import") in import_paths:
-            return True
-    return False
+    if isinstance(entry, str):
+        return entry.strip() in import_paths
+    return isinstance(entry, dict) and entry.get("import") in import_paths
 
 
 _REASONING_EFFORTS = {
@@ -111,8 +110,7 @@ def _normalize_reasoning_config(config: dict[str, Any]) -> dict[str, Any]:
     if effort not in _REASONING_EFFORTS:
         supported = ", ".join(sorted(_REASONING_EFFORTS))
         raise ValueError(
-            f"Unsupported LLM_REASONING_EFFORT {raw_effort!r}; expected one of: "
-            f"{supported}"
+            f"Unsupported LLM_REASONING_EFFORT {raw_effort!r}; expected one of: {supported}"
         )
     if effort == "default":
         return normalized
@@ -148,7 +146,7 @@ def _normalize_reasoning_config(config: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _build_agent(config_path: Path) -> Any:
+def _build_agent(config_path: Path, trace_path: Path | None = None) -> Any:
     from nexau.archs.main_sub.agent import Agent
     from nexau.archs.main_sub.config.config import AgentConfigBuilder
     from nexau.archs.main_sub.config.schema import normalize_agent_config_dict
@@ -158,7 +156,12 @@ def _build_agent(config_path: Path) -> Any:
     normalized_config = _normalize_reasoning_config(normalized_config)
 
     tracer_configs = list(normalized_config.get("tracers") or [])
-    if not _has_in_memory_tracer(tracer_configs):
+    if trace_path is not None:
+        tracer_configs = [
+            entry for entry in tracer_configs if not _is_in_memory_tracer_config(entry)
+        ]
+        tracer_configs.insert(0, JsonlFileTracer(trace_path))
+    elif not any(_is_in_memory_tracer_config(entry) for entry in tracer_configs):
         tracer_configs.insert(
             0,
             {"import": "nexau.archs.tracer.adapters.in_memory:InMemoryTracer"},
@@ -228,9 +231,7 @@ def _write_json(path: Path, payload: Any) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     rendered = json.dumps(_jsonable(payload), ensure_ascii=False, indent=2)
-    temporary_path = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         with temporary_path.open("w", encoding="utf-8") as handle:
             handle.write(rendered)
@@ -239,6 +240,95 @@ def _write_json(path: Path, payload: Any) -> None:
         os.replace(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+class JsonlFileTracer(BaseTracer):
+    """Append span lifecycle events without retaining completed trace payloads."""
+
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.touch(exist_ok=True)
+        self._lock = threading.Lock()
+        self._sequence = 0
+
+    def _append(self, event: dict[str, Any]) -> None:
+        with self._lock:
+            self._sequence += 1
+            payload = {
+                "schema_version": 1,
+                "sequence": self._sequence,
+                **event,
+            }
+            rendered = json.dumps(_jsonable(payload), ensure_ascii=False) + "\n"
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(rendered)
+                handle.flush()
+
+    def start_span(
+        self,
+        name: str,
+        span_type: SpanType,
+        inputs: dict[str, Any] | None = None,
+        parent_span: Span | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> Span:
+        span_id = str(uuid4())
+        parent_id = None
+        if parent_span is not None:
+            parent_id = str(parent_span.vendor_obj) if parent_span.vendor_obj else parent_span.id
+        span = Span(
+            id=span_id,
+            name=name,
+            type=span_type,
+            parent_id=parent_id,
+            inputs={},
+            attributes={},
+            vendor_obj=span_id,
+        )
+        self._append(
+            {
+                "event": "start",
+                "span": {
+                    "id": span.id,
+                    "name": span.name,
+                    "type": span.type.value,
+                    "parent_id": span.parent_id,
+                    "start_time": span.start_time,
+                    "inputs": inputs or {},
+                    "attributes": attributes or {},
+                },
+            }
+        )
+        return span
+
+    def end_span(
+        self,
+        span: Span,
+        outputs: Any = None,
+        error: Exception | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        span_id = str(span.vendor_obj) if span.vendor_obj else span.id
+        normalized_outputs: dict[str, Any] = {}
+        if outputs is not None:
+            normalized_outputs = outputs if isinstance(outputs, dict) else {"result": outputs}
+        self._append(
+            {
+                "event": "end",
+                "span_id": span_id,
+                "end_time": datetime.now().timestamp(),
+                "outputs": normalized_outputs,
+                "error": str(error) if error is not None else None,
+                "attributes": attributes or {},
+            }
+        )
+
+    def flush(self) -> None:
+        return
+
+    def shutdown(self) -> None:
+        return
 
 
 def _dump_history(agent: Any, log_dir: Path) -> None:
@@ -273,6 +363,19 @@ def _dump_in_memory_traces(agent: Any, log_dir: Path) -> bool:
     return True
 
 
+def _get_jsonl_file_tracer(agent: Any) -> JsonlFileTracer | None:
+    tracer = getattr(agent.config, "resolved_tracer", None)
+    if tracer is None and getattr(agent, "global_storage", None) is not None:
+        try:
+            tracer = agent.global_storage.get("tracer")
+        except Exception:
+            tracer = None
+    for candidate in _iter_tracers(tracer):
+        if isinstance(candidate, JsonlFileTracer):
+            return candidate
+    return None
+
+
 def _trace_checkpoint_interval() -> float:
     raw = os.environ.get(
         _TRACE_CHECKPOINT_ENV,
@@ -286,8 +389,7 @@ def _trace_checkpoint_interval() -> float:
         ) from exc
     if not math.isfinite(interval) or interval < 0:
         raise ValueError(
-            f"{_TRACE_CHECKPOINT_ENV} must be a finite non-negative number, "
-            f"got {raw!r}"
+            f"{_TRACE_CHECKPOINT_ENV} must be a finite non-negative number, got {raw!r}"
         )
     return interval
 
@@ -305,9 +407,7 @@ def _write_trace_checkpoint_state(
         {
             "schema_version": 1,
             "status": status,
-            "checkpointed_at": datetime.now().astimezone().isoformat(
-                timespec="seconds"
-            ),
+            "checkpointed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "interval_sec": interval_sec,
             "written_files": written_files or [],
             "errors": errors or [],
@@ -325,11 +425,21 @@ def _checkpoint_trace_artifacts(
 
     written_files: list[str] = []
     errors: list[str] = []
-    dumpers = (
-        ("nexau_history.json", _dump_history),
-        ("nexau_full_trace.json", _dump_full_trace),
-        ("nexau_in_memory_tracer.json", _dump_in_memory_traces),
-    )
+    file_tracer = _get_jsonl_file_tracer(agent)
+    if file_tracer is not None:
+        try:
+            file_tracer.flush()
+            if file_tracer.path.exists():
+                written_files.append(file_tracer.path.name)
+        except Exception as exc:
+            errors.append(f"{file_tracer.path.name}: {type(exc).__name__}: {exc}")
+        dumpers: tuple[tuple[str, Any], ...] = ()
+    else:
+        dumpers = (
+            ("nexau_history.json", _dump_history),
+            ("nexau_full_trace.json", _dump_full_trace),
+            ("nexau_in_memory_tracer.json", _dump_in_memory_traces),
+        )
     for filename, dumper in dumpers:
         try:
             if dumper(agent, log_dir) is not False:
@@ -452,7 +562,7 @@ def main() -> int:
     checkpointer: _PeriodicTraceCheckpointer | None = None
     checkpoint_interval = _trace_checkpoint_interval()
     try:
-        agent = _build_agent(config_path)
+        agent = _build_agent(config_path, log_dir / _TRACE_EVENTS_NAME)
         checkpointer = _PeriodicTraceCheckpointer(
             agent,
             log_dir,
@@ -480,6 +590,7 @@ def main() -> int:
                     log_dir / "nexau_history.json",
                     log_dir / "nexau_full_trace.json",
                     log_dir / "nexau_in_memory_tracer.json",
+                    log_dir / _TRACE_EVENTS_NAME,
                     log_dir / "nexau_result.json",
                 )
                 if path.exists()
@@ -513,6 +624,7 @@ def main() -> int:
                         log_dir / "nexau_history.json",
                         log_dir / "nexau_full_trace.json",
                         log_dir / "nexau_in_memory_tracer.json",
+                        log_dir / _TRACE_EVENTS_NAME,
                     )
                     if path.exists()
                 ],

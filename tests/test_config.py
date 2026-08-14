@@ -6,7 +6,12 @@ import pytest
 import yaml
 
 from nexau_harbor.agent import NexAUAgent
-from nexau_harbor.runner import _build_agent, _normalize_reasoning_config
+from nexau_harbor.runner import (
+    JsonlFileTracer,
+    _build_agent,
+    _iter_tracers,
+    _normalize_reasoning_config,
+)
 
 _CONFIG_ROOT = Path(__file__).parents[1] / "src" / "nexau_harbor" / "configs"
 
@@ -50,9 +55,9 @@ def test_terminal_bench_config_references_only_tb_assets() -> None:
     assert config["middlewares"][1]["params"] == {
         "max_context_tokens": "${env.LLM_CONTEXT_WINDOW_TOKENS}",
         "auto_compact": True,
-        "threshold": 0.75,
+        "threshold": 0.55,
         "compaction_strategy": "tool_result_compaction",
-        "keep_iterations": 15,
+        "keep_iterations": 8,
         "retry_attempts": 20,
     }
     assert "gdpval" not in config_path.read_text().lower()
@@ -106,6 +111,34 @@ def test_nexau_builds_terminal_bench_config_with_full_trace(monkeypatch, tmp_pat
     assert agent.config.llm_config.apply_param_drops(
         {"model": "Nex-N2-Pro", "max_tokens": 32000, "max_output_tokens": 32000}
     ) == {"model": "Nex-N2-Pro"}
+
+
+def test_harbor_run_replaces_in_memory_tracer_with_jsonl(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_path = _CONFIG_ROOT / "terminal_bench" / "code_agent.yaml"
+    integration = NexAUAgent(
+        logs_dir=tmp_path,
+        model_name="openai/nex-agi/Nex-N2-Pro",
+        config_path=config_path,
+        extra_env={
+            "LLM_API_KEY": "test-key",
+            "LLM_BASE_URL": "https://example.test/v1",
+            "LLM_KIND": "openai_responses",
+            "LLM_CONTEXT_WINDOW_TOKENS": "200000",
+        },
+    )
+    for name, value in integration._runtime_env().items():
+        monkeypatch.setenv(name, value)
+
+    event_path = tmp_path / "nexau_trace_events.jsonl"
+    agent = _build_agent(config_path, event_path)
+    tracers = _iter_tracers(agent.config.resolved_tracer)
+
+    assert len(tracers) == 1
+    assert isinstance(tracers[0], JsonlFileTracer)
+    assert event_path.is_file()
 
 
 def test_nexau_builds_migrated_config(monkeypatch, tmp_path: Path) -> None:
