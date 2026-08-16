@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import override
 from uuid import uuid4
 
@@ -49,8 +50,10 @@ class _DetachedExecPaths:
     exit_code: str
 
 
-def _detached_exec_paths() -> _DetachedExecPaths:
-    directory = (REMOTE_LOG_DIR / f"harbor-exec-{uuid4().hex}").as_posix()
+def _detached_exec_paths(
+    root: PurePosixPath = REMOTE_LOG_DIR,
+) -> _DetachedExecPaths:
+    directory = (root / f"harbor-exec-{uuid4().hex}").as_posix()
     return _DetachedExecPaths(
         directory=directory,
         pid=f"{directory}/pid",

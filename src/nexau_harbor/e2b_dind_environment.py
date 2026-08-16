@@ -11,7 +11,8 @@ import shlex
 import tempfile
 import threading
 import time
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import override
 from uuid import uuid4
 
@@ -58,7 +59,7 @@ from harbor.models.trial.config import ResourceMode, ServiceVolumeConfig
 from harbor.utils.env import resolve_env_vars
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV
+from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV, REMOTE_LOG_DIR
 from nexau_harbor.e2b_dind_template import (
     DEFAULT_CPU_COUNT,
     DEFAULT_MEMORY_MB,
@@ -88,16 +89,37 @@ _DOCKER_READY_TIMEOUT_SEC = 120
 _MAIN_READY_TIMEOUT_SEC = 120
 _DEFAULT_COMPOSE_UP_TIMEOUT_SEC = 600
 _HOST_TRANSFER_TIMEOUT_SEC = 300
+_HOST_TRANSFER_MAX_ATTEMPTS = 5
+_AGENT_TRACE_DOWNLOAD_CONCURRENCY = 4
+_AGENT_TRACE_RECOVERY_GRACE_SEC = 15 * 60
+_AGENT_TRACE_EVENTS_NAME = "nexau_trace_events.jsonl"
+_HOST_DETACHED_STATE_ROOT = PurePosixPath("/tmp/harbor-nexau-exec")
 _COMPOSE_BUILD_MAX_ATTEMPTS = 3
 _COMPOSE_BUILD_RETRY_BASE_DELAY_SEC = 5
 
 _sandbox_start_lock = threading.Lock()
 _next_sandbox_start_at = 0.0
+_agent_trace_download_slots = asyncio.Semaphore(_AGENT_TRACE_DOWNLOAD_CONCURRENCY)
 _TRANSIENT_DOCKER_BUILD_ERROR = re.compile(
     r"(?:unexpected eof|short read|connection reset|tls handshake timeout|"
     r"peer closed connection without sending tls close_notify)",
     flags=re.IGNORECASE,
 )
+
+
+class _AgentLogDownloadError(RuntimeError):
+    """Preserve whether a failed Agent-log transfer put an existing trace at risk."""
+
+    def __init__(self, message: str, *, trace_expected: bool) -> None:
+        super().__init__(message)
+        self.trace_expected = trace_expected
+
+
+@dataclass(frozen=True)
+class _PendingAgentLogDownload:
+    source_dir: str
+    target_dir: Path
+    trace_expected: bool
 
 
 def _positive_int(value: int | str, *, name: str) -> int:
@@ -141,6 +163,25 @@ def _reserve_sandbox_start_delay(ramp_delay_sec: float) -> float:
 def _is_transient_docker_build_error(result: ExecResult) -> bool:
     output = f"{result.stderr}\n{result.stdout}"
     return _TRANSIENT_DOCKER_BUILD_ERROR.search(output) is not None
+
+
+def _remote_pack_command_with_exclusions(
+    source_dir: str,
+    archive_path: str,
+    exclude_relative_paths: tuple[str, ...] = (),
+) -> str:
+    exclude_flags = " ".join(
+        f"--exclude={shlex.quote(f'./{relative_path}')}" for relative_path in exclude_relative_paths
+    )
+    parts = (
+        "tar -czf",
+        shlex.quote(archive_path),
+        exclude_flags,
+        "-C",
+        shlex.quote(source_dir),
+        ".",
+    )
+    return " ".join(part for part in parts if part)
 
 
 def _compose_project_name(session_id: str) -> str:
@@ -229,14 +270,30 @@ class _E2BDinDCompose(DinDComposeOps):
         self,
         host_dir: str,
         target_dir: Path | str,
+        *,
+        exclude_relative_paths: tuple[str, ...] = (),
+        detached_pack: bool = False,
     ) -> None:
         remote_archive = f"/tmp/harbor-download-{uuid4().hex}.tar.gz"
         with tempfile.TemporaryDirectory() as temp_dir:
             local_archive = Path(temp_dir) / "payload.tar.gz"
             try:
-                result = await self._host_exec(
-                    remote_pack_command(host_dir, remote_archive),
-                    timeout_sec=_HOST_TRANSFER_TIMEOUT_SEC,
+                pack_command = (
+                    _remote_pack_command_with_exclusions(
+                        host_dir,
+                        remote_archive,
+                        exclude_relative_paths,
+                    )
+                    if exclude_relative_paths
+                    else remote_pack_command(host_dir, remote_archive)
+                )
+                result = (
+                    await self._env._exec_on_host_detached(pack_command)
+                    if detached_pack
+                    else await self._host_exec(
+                        pack_command,
+                        timeout_sec=_HOST_TRANSFER_TIMEOUT_SEC,
+                    )
                 )
                 if result.return_code != 0:
                     raise RuntimeError(
@@ -247,6 +304,111 @@ class _E2BDinDCompose(DinDComposeOps):
                 extract_dir_from_file(local_archive, target_dir)
             finally:
                 await self._env._remove_host_path_best_effort(remote_archive)
+
+    async def download_agent_logs(
+        self,
+        source_dir: str,
+        target_dir: Path | str,
+    ) -> None:
+        """Recover the append-only trace before transferring the remaining logs."""
+
+        target = Path(target_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        trace_source = f"{source_dir.rstrip('/')}/{_AGENT_TRACE_EVENTS_NAME}"
+        trace_target = target / _AGENT_TRACE_EVENTS_NAME
+
+        try:
+            trace_probe = await self._host_exec(
+                f"test -f {shlex.quote(trace_source)}",
+                timeout_sec=30,
+            )
+        except Exception as probe_error:
+            self._env.logger.warning(
+                "Could not determine whether the remote NexAU trace exists; "
+                "falling back to a full log-directory transfer: %s",
+                probe_error,
+            )
+            try:
+                await self._fetch_dir_from_host(
+                    source_dir,
+                    target,
+                    detached_pack=True,
+                )
+            except Exception as transfer_error:
+                raise _AgentLogDownloadError(
+                    "Failed to download Agent logs after the trace existence probe failed",
+                    trace_expected=True,
+                ) from transfer_error
+            return
+
+        if trace_probe.return_code not in (0, 1):
+            self._env.logger.warning(
+                "Remote NexAU trace probe failed with exit code %s; falling back "
+                "to a full log-directory transfer: %s",
+                trace_probe.return_code,
+                trace_probe.stderr or trace_probe.stdout or "no output",
+            )
+            try:
+                await self._fetch_dir_from_host(
+                    source_dir,
+                    target,
+                    detached_pack=True,
+                )
+            except Exception as transfer_error:
+                raise _AgentLogDownloadError(
+                    "Failed to download Agent logs after a failed trace probe",
+                    trace_expected=True,
+                ) from transfer_error
+            return
+
+        if trace_probe.return_code == 1:
+            try:
+                await self._fetch_dir_from_host(source_dir, target)
+            except Exception as transfer_error:
+                raise _AgentLogDownloadError(
+                    "Failed to download Agent logs; no trace file was present when checked",
+                    trace_expected=False,
+                ) from transfer_error
+            return
+
+        try:
+            async with _agent_trace_download_slots:
+                await self._fetch_file_from_host(trace_source, trace_target)
+        except Exception as priority_error:
+            self._env.logger.warning(
+                "Priority NexAU trace download failed; retrying it inside the full "
+                "log-directory archive: %s",
+                priority_error,
+            )
+            try:
+                await self._fetch_dir_from_host(
+                    source_dir,
+                    target,
+                    detached_pack=True,
+                )
+            except Exception as transfer_error:
+                raise _AgentLogDownloadError(
+                    "Both priority trace download and full Agent-log download failed",
+                    trace_expected=True,
+                ) from transfer_error
+            if not trace_target.is_file():
+                raise _AgentLogDownloadError(
+                    "The full Agent-log transfer completed without the expected trace file",
+                    trace_expected=True,
+                )
+            return
+
+        try:
+            await self._fetch_dir_from_host(
+                source_dir,
+                target,
+                exclude_relative_paths=(_AGENT_TRACE_EVENTS_NAME,),
+            )
+        except Exception:
+            self._env.logger.exception(
+                "The critical NexAU JSONL trace was recovered, but the remaining "
+                "Agent logs could not be downloaded"
+            )
 
     def _compose_referenced_env_vars(self) -> dict[str, str]:
         compose_paths = [
@@ -672,6 +834,7 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
             name=E2B_START_RAMP_DELAY_ENV,
         )
         self._compose_files_staged = False
+        self._pending_agent_log_download: _PendingAgentLogDownload | None = None
 
         super().__init__(*args, **kwargs)
         self._template_name = self._dind_template
@@ -782,7 +945,7 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
     ) -> ExecResult:
         """Run a long DinD-host command in the background and poll it briefly."""
 
-        paths = _detached_exec_paths()
+        paths = _detached_exec_paths(_HOST_DETACHED_STATE_ROOT)
         wrapper = _detached_command_wrapper(command, paths)
         handle = await self._dispatch_command(
             wrapper,
@@ -853,12 +1016,7 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
         with Path(source_path).open("rb") as source:
             await self._sandbox.files.write(target_path, source, user="root")
 
-    @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
-    async def _download_file_from_host(
+    async def _stream_file_from_host(
         self,
         source_path: str,
         target_path: Path | str,
@@ -867,14 +1025,36 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
             raise RuntimeError("Sandbox not found. Please start the environment first.")
         target = Path(target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(
-            await self._sandbox.files.read(
+        temporary_path = target.with_name(f".{target.name}.{uuid4().hex}.part")
+        try:
+            stream = await self._sandbox.files.read(
                 source_path,
-                format="bytes",
+                format="stream",
                 user="root",
-                request_timeout=_HOST_TRANSFER_TIMEOUT_SEC,
+                gzip=True,
+                stream_idle_timeout=_HOST_TRANSFER_TIMEOUT_SEC,
             )
-        )
+            async with stream:
+                with temporary_path.open("wb") as output:
+                    async for chunk in stream:
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            temporary_path.replace(target)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    @retry(
+        stop=stop_after_attempt(_HOST_TRANSFER_MAX_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=1, max=30),
+        reraise=True,
+    )
+    async def _download_file_from_host(
+        self,
+        source_path: str,
+        target_path: Path | str,
+    ) -> None:
+        await self._stream_file_from_host(source_path, target_path)
 
     async def _remove_host_path_best_effort(self, path: str) -> None:
         try:
@@ -909,6 +1089,64 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
         await self._create_sandbox()
         await self._compose.start(force_build)
         await self._upload_environment_dir_after_start()
+
+    async def _retry_pending_agent_log_download(self) -> bool:
+        pending = self._pending_agent_log_download
+        if pending is None:
+            return True
+        self.logger.warning(
+            "Retrying Agent-log recovery before stopping E2B sandbox %s",
+            getattr(self._sandbox, "sandbox_id", "unknown"),
+        )
+        try:
+            await self._compose.download_agent_logs(
+                pending.source_dir,
+                pending.target_dir,
+            )
+        except _AgentLogDownloadError as exc:
+            self._pending_agent_log_download = _PendingAgentLogDownload(
+                pending.source_dir,
+                pending.target_dir,
+                trace_expected=pending.trace_expected or exc.trace_expected,
+            )
+            self.logger.exception("Agent-log recovery retry failed")
+            return False
+        except Exception:
+            self.logger.exception("Agent-log recovery retry failed")
+            return False
+        self._pending_agent_log_download = None
+        return True
+
+    async def _preserve_sandbox_for_trace_recovery(self) -> None:
+        sandbox = self._sandbox
+        if sandbox is None:
+            return
+        sandbox_id = sandbox.sandbox_id
+        deadline = getattr(self, "_keepalive_deadline", None)
+        remaining_lifetime_sec = (
+            deadline - asyncio.get_running_loop().time() if deadline is not None else None
+        )
+        grace_sec = _AGENT_TRACE_RECOVERY_GRACE_SEC
+        if remaining_lifetime_sec is not None:
+            grace_sec = min(grace_sec, max(1, round(remaining_lifetime_sec)))
+
+        await self._stop_keepalive()
+        try:
+            await sandbox.set_timeout(grace_sec)
+        except Exception as exc:
+            self.logger.error(
+                "Could not set a recovery grace period on E2B sandbox %s: %s",
+                sandbox_id,
+                exc,
+            )
+        self.logger.error(
+            "E2B sandbox %s was not deleted because its Agent trace could not be "
+            "recovered; it remains available for up to %s seconds for manual recovery",
+            sandbox_id,
+            grace_sec,
+        )
+        self._pending_agent_log_download = None
+        self._sandbox = None
 
     @override
     async def exec(
@@ -953,7 +1191,34 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
 
     @override
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
-        await self._compose.download_dir(source_dir, target_dir)
+        if PurePosixPath(source_dir) != REMOTE_LOG_DIR:
+            await self._compose.download_dir(source_dir, target_dir)
+            return
+
+        target = Path(target_dir)
+        try:
+            await self._compose.download_agent_logs(source_dir, target)
+        except _AgentLogDownloadError as exc:
+            self._pending_agent_log_download = _PendingAgentLogDownload(
+                source_dir,
+                target,
+                trace_expected=exc.trace_expected,
+            )
+            self.logger.exception(
+                "Failed to recover E2B Agent logs; a final retry will run before cleanup"
+            )
+            raise
+        except Exception:
+            self._pending_agent_log_download = _PendingAgentLogDownload(
+                source_dir,
+                target,
+                trace_expected=True,
+            )
+            self.logger.exception(
+                "Failed to recover E2B Agent logs; a final retry will run before cleanup"
+            )
+            raise
+        self._pending_agent_log_download = None
 
     @override
     async def is_dir(self, path: str, user: str | int | None = None) -> bool:
@@ -1027,6 +1292,14 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
 
     @override
     async def stop(self, delete: bool) -> None:
+        pending = self._pending_agent_log_download
+        if pending is not None and self._sandbox is not None:
+            recovered = await self._retry_pending_agent_log_download()
+            pending = self._pending_agent_log_download
+            if not recovered and pending is not None and pending.trace_expected:
+                await self._preserve_sandbox_for_trace_recovery()
+                return
+
         if self._sandbox is not None and self._compose_files_staged:
             try:
                 result = await self._compose._compose_exec(

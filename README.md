@@ -204,6 +204,14 @@ stdout、stderr 和退出码后立即断开初始事件流，再每 30 秒用短
 错误不会重新启动或重复执行 Agent；连续失败才中止 trial。这样本机仍可用 `tmux` 保护
 Harbor 进程，同时远程 Agent 不依赖一条贯穿整道题的 HTTP 长连接。
 
+Agent 结束或超时后，DinD adapter 会先从 self-bind 日志目录单独下载
+`nexau_trace_events.jsonl`，再打包其余日志。大文件通过 E2B 流式接口原子写入宿主机，不再把
+整个归档读入内存，也不再对完整传输应用 300 秒总期限；单文件最多重试 5 次，同时最多下载
+4 份大 trace，避免大量 trial 同时超时时形成下载尖峰。若其余日志下载失败但 JSONL 已保存，
+Harbor 仍会从 JSONL 重建截至终止点的 span 树。若两条下载路径都失败，adapter 会在清理前
+再试一次；仍失败时不会立即删除含 trace 的 sandbox，而是在日志中记录 sandbox ID，并保留
+最长 15 分钟的人工恢复窗口。
+
 单容器 `NexAUE2BEnvironment` 使用的 E2B SDK 2.x Dockerfile 解析器不接受 Docker 原生支持的绝对路径
 `COPY --from=ghcr.io/astral-sh/uv:<version> /uv /uvx /usr/local/bin/`。自定义 environment
 在构建 Python verifier 模板时会在内存中将该语句转换为相同固定版本的 `uv` 包安装；

@@ -14,12 +14,38 @@ from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV
 from nexau_harbor.e2b_dind_environment import (
     E2B_DIND_DEFAULT_TEMPLATE,
     NexAUE2BDinDEnvironment,
+    _AgentLogDownloadError,
     _compose_env_file_content,
     _compose_project_name,
     _E2BDinDCompose,
+    _PendingAgentLogDownload,
+    _remote_pack_command_with_exclusions,
     _reserve_sandbox_start_delay,
 )
 from nexau_harbor.e2b_environment import NexAUE2BEnvironment
+
+
+class _AsyncChunkStream:
+    def __init__(self, chunks: list[bytes | BaseException]) -> None:
+        self._chunks = iter(chunks)
+
+    async def __aenter__(self) -> _AsyncChunkStream:
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:  # noqa: ANN002
+        del exc_info
+
+    def __aiter__(self) -> _AsyncChunkStream:
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            chunk = next(self._chunks)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+        if isinstance(chunk, BaseException):
+            raise chunk
+        return chunk
 
 
 def test_custom_dind_environment_import_path_is_loadable() -> None:
@@ -296,3 +322,156 @@ async def test_detached_host_build_has_no_inner_command_timeout() -> None:
     assert result is expected
     environment._dispatch_command.assert_awaited_once()
     assert environment._dispatch_command.await_args.kwargs["timeout_sec"] is None
+    dispatched_wrapper = environment._dispatch_command.await_args.args[0]
+    assert "/tmp/harbor-nexau-exec/harbor-exec-" in dispatched_wrapper
+    assert "/logs/agent/harbor-exec-" not in dispatched_wrapper
+
+
+def test_remote_log_archive_can_exclude_the_prefetched_trace() -> None:
+    command = _remote_pack_command_with_exclusions(
+        "/logs/agent",
+        "/tmp/agent-logs.tar.gz",
+        ("nexau_trace_events.jsonl",),
+    )
+
+    assert command == (
+        "tar -czf /tmp/agent-logs.tar.gz --exclude=./nexau_trace_events.jsonl -C /logs/agent ."
+    )
+
+
+async def test_host_file_download_streams_to_an_atomic_target(tmp_path: Path) -> None:
+    stream = _AsyncChunkStream([b"first-", b"second"])
+    read = AsyncMock(return_value=stream)
+    environment = object.__new__(NexAUE2BDinDEnvironment)
+    environment._sandbox = SimpleNamespace(files=SimpleNamespace(read=read))
+    target = tmp_path / "nexau_trace_events.jsonl"
+    target.write_bytes(b"old-content")
+
+    await environment._stream_file_from_host("/logs/agent/trace.jsonl", target)
+
+    assert target.read_bytes() == b"first-second"
+    assert list(tmp_path.glob("*.part")) == []
+    read.assert_awaited_once_with(
+        "/logs/agent/trace.jsonl",
+        format="stream",
+        user="root",
+        gzip=True,
+        stream_idle_timeout=300,
+    )
+
+
+async def test_failed_stream_download_keeps_the_previous_atomic_target(tmp_path: Path) -> None:
+    stream = _AsyncChunkStream([b"partial", ConnectionError("stream reset")])
+    environment = object.__new__(NexAUE2BDinDEnvironment)
+    environment._sandbox = SimpleNamespace(
+        files=SimpleNamespace(read=AsyncMock(return_value=stream))
+    )
+    target = tmp_path / "nexau_trace_events.jsonl"
+    target.write_bytes(b"previous-complete-copy")
+
+    with pytest.raises(ConnectionError, match="stream reset"):
+        await environment._stream_file_from_host("/logs/agent/trace.jsonl", target)
+
+    assert target.read_bytes() == b"previous-complete-copy"
+    assert list(tmp_path.glob("*.part")) == []
+
+
+async def test_agent_log_download_keeps_trace_when_remaining_archive_fails(
+    tmp_path: Path,
+) -> None:
+    trace_payload = b'{"event":"start"}\n'
+
+    async def fetch_trace(source: str, target: Path | str) -> None:
+        assert source == "/logs/agent/nexau_trace_events.jsonl"
+        Path(target).write_bytes(trace_payload)
+
+    compose = object.__new__(_E2BDinDCompose)
+    compose._env = SimpleNamespace(
+        logger=MagicMock(),
+        _exec_on_host=AsyncMock(return_value=ExecResult(stdout="", stderr="", return_code=0)),
+    )
+    compose._fetch_file_from_host = AsyncMock(side_effect=fetch_trace)
+    compose._fetch_dir_from_host = AsyncMock(side_effect=ConnectionError("archive reset"))
+
+    await compose.download_agent_logs("/logs/agent", tmp_path)
+
+    assert (tmp_path / "nexau_trace_events.jsonl").read_bytes() == trace_payload
+    compose._fetch_dir_from_host.assert_awaited_once_with(
+        "/logs/agent",
+        tmp_path,
+        exclude_relative_paths=("nexau_trace_events.jsonl",),
+    )
+    compose._env.logger.exception.assert_called_once()
+
+
+async def test_agent_log_download_reports_when_both_trace_paths_fail(
+    tmp_path: Path,
+) -> None:
+    compose = object.__new__(_E2BDinDCompose)
+    compose._env = SimpleNamespace(
+        logger=MagicMock(),
+        _exec_on_host=AsyncMock(return_value=ExecResult(stdout="", stderr="", return_code=0)),
+    )
+    compose._fetch_file_from_host = AsyncMock(side_effect=ConnectionError("trace reset"))
+    compose._fetch_dir_from_host = AsyncMock(side_effect=ConnectionError("archive reset"))
+
+    with pytest.raises(_AgentLogDownloadError) as error:
+        await compose.download_agent_logs("/logs/agent", tmp_path)
+
+    assert error.value.trace_expected
+    assert "Both priority trace download" in str(error.value)
+
+
+async def test_failed_agent_log_download_is_retried_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    environment = object.__new__(NexAUE2BDinDEnvironment)
+    environment._compose = SimpleNamespace(
+        download_agent_logs=AsyncMock(
+            side_effect=_AgentLogDownloadError("unavailable", trace_expected=True)
+        )
+    )
+    environment._pending_agent_log_download = None
+    environment.logger = MagicMock()
+
+    with pytest.raises(_AgentLogDownloadError):
+        await environment.download_dir("/logs/agent", tmp_path)
+
+    pending = environment._pending_agent_log_download
+    assert pending == _PendingAgentLogDownload(
+        "/logs/agent",
+        tmp_path,
+        trace_expected=True,
+    )
+
+
+async def test_unrecovered_trace_preserves_sandbox_for_manual_recovery(
+    tmp_path: Path,
+) -> None:
+    set_timeout = AsyncMock()
+    sandbox = SimpleNamespace(sandbox_id="sandbox-with-trace", set_timeout=set_timeout)
+    environment = object.__new__(NexAUE2BDinDEnvironment)
+    environment._sandbox = sandbox
+    environment._pending_agent_log_download = _PendingAgentLogDownload(
+        "/logs/agent",
+        tmp_path,
+        trace_expected=True,
+    )
+    environment._retry_pending_agent_log_download = AsyncMock(return_value=False)
+    environment._stop_keepalive = AsyncMock()
+    environment._keepalive_deadline = None
+    environment._compose_files_staged = True
+    environment.logger = MagicMock()
+
+    await environment.stop(delete=True)
+
+    environment._stop_keepalive.assert_awaited_once_with()
+    set_timeout.assert_awaited_once_with(900)
+    assert environment._sandbox is None
+    assert environment._pending_agent_log_download is None
+    environment.logger.error.assert_called_once_with(
+        "E2B sandbox %s was not deleted because its Agent trace could not be "
+        "recovered; it remains available for up to %s seconds for manual recovery",
+        "sandbox-with-trace",
+        900,
+    )
