@@ -7,6 +7,7 @@ import re
 import shlex
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import override
@@ -29,6 +30,9 @@ E2B_START_RAMP_DELAY_ENV = "HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC"
 E2B_DETACHED_POLL_INTERVAL_SEC = 30
 E2B_DETACHED_REQUEST_TIMEOUT_SEC = 30
 E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS = 5
+E2B_DEFAULT_TEMPLATE_BUILD_ATTEMPTS = 2
+E2B_TEMPLATE_BUILD_LOG_MAX_ENTRIES = 256
+E2B_TEMPLATE_BUILD_LOG_TAIL_CHARS = 16_384
 
 _DETACHED_STATUS_PREFIX = "__HARBOR_NEXAU_STATUS__:"
 _MISSING_DEFAULT_TEMPLATE_TAG = "tag 'default' does not exist for template"
@@ -54,6 +58,10 @@ class _DetachedExecPaths:
     stdout: str
     stderr: str
     exit_code: str
+
+
+class E2BTemplateBuildTimeoutError(TimeoutError):
+    """A configured local deadline expired while E2B was building a template."""
 
 
 def _detached_exec_paths(
@@ -186,6 +194,41 @@ def _resolve_start_ramp_delay_sec(configured: int | float | str | None) -> float
     return resolved
 
 
+def _resolve_template_build_attempts(configured: int | str | None) -> int:
+    raw_value: object = E2B_DEFAULT_TEMPLATE_BUILD_ATTEMPTS if configured is None else configured
+    if isinstance(raw_value, bool) or not isinstance(raw_value, int | str):
+        raise ValueError("e2b_template_build_attempts must be a positive integer")
+    try:
+        attempts = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"e2b_template_build_attempts must be a positive integer, got {raw_value!r}"
+        ) from exc
+    if attempts <= 0:
+        raise ValueError(f"e2b_template_build_attempts must be positive, got {attempts}")
+    return attempts
+
+
+def _resolve_template_build_timeout_sec(
+    configured: int | float | str | None,
+) -> float | None:
+    if configured is None:
+        return None
+    if isinstance(configured, bool) or not isinstance(configured, int | float | str):
+        raise ValueError("e2b_template_build_timeout_sec must be a finite positive number")
+    try:
+        timeout_sec = float(configured)
+    except ValueError as exc:
+        raise ValueError(
+            f"e2b_template_build_timeout_sec must be a finite positive number, got {configured!r}"
+        ) from exc
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0:
+        raise ValueError(
+            f"e2b_template_build_timeout_sec must be a finite positive number, got {configured!r}"
+        )
+    return timeout_sec
+
+
 def _reserve_sandbox_start_delay(ramp_delay_sec: float) -> float:
     """Reserve one process-wide E2B creation slot and return its wait time."""
 
@@ -246,11 +289,20 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         *args,
         max_lifetime_sec: int | str | None = None,
         e2b_start_ramp_delay_sec: int | float | str | None = None,
+        e2b_template_build_attempts: int | str | None = None,
+        e2b_template_build_timeout_sec: int | float | str | None = None,
         **kwargs,
     ) -> None:
         _merge_configured_no_proxy_hosts()
         self._max_lifetime_sec = _resolve_max_lifetime_sec(max_lifetime_sec)
         self._e2b_start_ramp_delay_sec = _resolve_start_ramp_delay_sec(e2b_start_ramp_delay_sec)
+        self._e2b_template_build_attempts = _resolve_template_build_attempts(
+            e2b_template_build_attempts
+        )
+        self._e2b_template_build_timeout_sec = _resolve_template_build_timeout_sec(
+            e2b_template_build_timeout_sec
+        )
+        self._last_template_build_log_tail = ""
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_deadline: float | None = None
         super().__init__(*args, **kwargs)
@@ -577,13 +629,32 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
             name=f"e2b-keepalive-{self.session_id}",
         )
 
-    @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
     @override
     async def _create_template(self) -> None:
+        attempts = getattr(
+            self,
+            "_e2b_template_build_attempts",
+            E2B_DEFAULT_TEMPLATE_BUILD_ATTEMPTS,
+        )
+        for attempt in range(1, attempts + 1):
+            try:
+                await self._create_template_once()
+                return
+            except Exception as exc:
+                if attempt >= attempts:
+                    raise
+                delay_sec = min(10.0, float(2 ** (attempt - 1)))
+                self.logger.warning(
+                    "E2B template build attempt %s/%s failed for %s: %s; retrying in %.1fs",
+                    attempt,
+                    attempts,
+                    self._template_name,
+                    exc,
+                    delay_sec,
+                )
+                await asyncio.sleep(delay_sec)
+
+    async def _create_template_once(self) -> None:
         if self.task_env_config.docker_image:
             template = harbor_e2b.Template().from_image(
                 image=self.task_env_config.docker_image,
@@ -612,7 +683,39 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         if self._effective_memory_mb is not None:
             build_kwargs["memory_mb"] = self._effective_memory_mb
 
-        await harbor_e2b.AsyncTemplate.build(**build_kwargs)
+        build_log_entries: deque[str] = deque(maxlen=E2B_TEMPLATE_BUILD_LOG_MAX_ENTRIES)
+
+        def capture_build_log(entry: object) -> None:
+            level = str(getattr(entry, "level", "info"))
+            message = str(getattr(entry, "message", entry)).strip()
+            build_log_entries.append(f"[{level}] {message}")
+            self._last_template_build_log_tail = "\n".join(build_log_entries)[
+                -E2B_TEMPLATE_BUILD_LOG_TAIL_CHARS:
+            ]
+
+        build_kwargs["on_build_logs"] = capture_build_log
+        self._last_template_build_log_tail = ""
+        try:
+            build_timeout_sec = getattr(self, "_e2b_template_build_timeout_sec", None)
+            if build_timeout_sec is None:
+                await harbor_e2b.AsyncTemplate.build(**build_kwargs)
+            else:
+                build_timeout = asyncio.timeout(build_timeout_sec)
+                try:
+                    async with build_timeout:
+                        await harbor_e2b.AsyncTemplate.build(**build_kwargs)
+                except TimeoutError as exc:
+                    if not build_timeout.expired():
+                        raise
+                    raise E2BTemplateBuildTimeoutError(
+                        f"E2B template build exceeded {build_timeout_sec:g}s"
+                    ) from exc
+        except Exception as exc:
+            try:
+                setattr(exc, "e2b_build_log_tail", self._last_template_build_log_tail)
+            except Exception:
+                pass
+            raise
 
     async def _stop_keepalive(self) -> None:
         keepalive_task = getattr(self, "_keepalive_task", None)

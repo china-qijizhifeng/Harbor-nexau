@@ -22,7 +22,10 @@ from harbor.environments.definition import environment_content_hash
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import TrialPaths
 
-from nexau_harbor.e2b_environment import NexAUE2BEnvironment
+from nexau_harbor.e2b_environment import (
+    E2BTemplateBuildTimeoutError,
+    NexAUE2BEnvironment,
+)
 
 Route = Literal["plain-e2b", "dind"]
 Probe = Callable[["TaskCandidate", float, float], Awaitable["RouteDecision"]]
@@ -105,6 +108,10 @@ class PreflightUnresolvedError(RuntimeError):
         self.failures = failures
         details = "; ".join(f"{name}: {reason}" for name, reason in failures.items())
         super().__init__(f"E2B preflight left {len(failures)} task(s) unresolved: {details}")
+
+
+class PreflightTaskTimeoutError(RuntimeError):
+    """The plain E2B route could not start within its effective build budget."""
 
 
 def _provider_fingerprint() -> str:
@@ -305,6 +312,19 @@ def _short_exception(exc: BaseException) -> str:
     return message[:500]
 
 
+def _build_log_tail(exc: BaseException) -> str:
+    build_log_tail = getattr(exc, "e2b_build_log_tail", "")
+    return build_log_tail if isinstance(build_log_tail, str) else ""
+
+
+def _last_evidence_line(exc: BaseException, marker: str | None = None) -> str:
+    lines = [line.strip() for line in _build_log_tail(exc).splitlines() if line.strip()]
+    if marker is not None:
+        matching = [line for line in lines if marker in line.lower()]
+        return matching[-1][:500] if matching else ""
+    return lines[-1][:500] if lines else ""
+
+
 def _is_transient_exception(exc: BaseException) -> bool:
     if exc.__class__.__name__ in _TRANSIENT_EXCEPTION_NAMES:
         return True
@@ -313,10 +333,39 @@ def _is_transient_exception(exc: BaseException) -> bool:
 
 
 def _deterministic_incompatibility_reason(exc: BaseException) -> str | None:
+    if isinstance(exc, PreflightTaskTimeoutError):
+        evidence = _last_evidence_line(exc, "[builder ")
+        suffix = f"; last build log: {evidence}" if evidence else ""
+        return (
+            "Plain E2B preflight exceeded its effective build budget: "
+            f"{_short_exception(exc)}{suffix}"
+        )
+
+    exception_name = exc.__class__.__name__
+    if exception_name == "BuildException":
+        build_log = _build_log_tail(exc).lower()
+        deterministic_marker = next(
+            (
+                marker
+                for marker in (
+                    "apt-get: command not found",
+                    "critical libmamba shell not initialized",
+                    "invalid image reference",
+                )
+                if marker in build_log
+            ),
+            None,
+        )
+        if deterministic_marker is not None:
+            evidence = _last_evidence_line(exc, deterministic_marker)
+            return (
+                f"E2B template build rejected the task: {_short_exception(exc)}; "
+                f"build log: {evidence}"
+            )
+
     if _is_transient_exception(exc):
         return None
 
-    exception_name = exc.__class__.__name__
     message = str(exc).lower()
     if exception_name == "ValueError" and any(
         marker in message for marker in _DOCKERFILE_VALUE_ERROR_MARKERS
@@ -343,6 +392,8 @@ async def _probe_once(
     start_ramp_delay_sec: float,
     timeout_sec: float,
 ) -> None:
+    task_build_timeout_sec = float(candidate.task.config.environment.build_timeout_sec)
+    effective_timeout_sec = min(timeout_sec, task_build_timeout_sec)
     with tempfile.TemporaryDirectory(prefix="harbor-nexau-e2b-preflight-") as temporary_dir:
         trial_paths = TrialPaths(Path(temporary_dir) / "trial")
         trial_paths.mkdir()
@@ -354,11 +405,42 @@ async def _probe_once(
             task_env_config=candidate.task.config.environment.model_copy(deep=True),
             network_policy=candidate.task.config.environment.resolve_baseline(),
             e2b_start_ramp_delay_sec=start_ramp_delay_sec,
+            e2b_template_build_attempts=1,
+            e2b_template_build_timeout_sec=effective_timeout_sec,
         )
         start_error: BaseException | None = None
+        start_timeout = asyncio.timeout(timeout_sec)
         try:
-            async with asyncio.timeout(timeout_sec):
+            async with start_timeout:
                 await environment.start(force_build=False)
+        except E2BTemplateBuildTimeoutError as exc:
+            timeout_error = PreflightTaskTimeoutError(
+                f"{candidate.dataset_name} template build exceeded "
+                f"{effective_timeout_sec:g}s (task build_timeout_sec="
+                f"{task_build_timeout_sec:g}s, preflight cap={timeout_sec:g}s)"
+            )
+            setattr(
+                timeout_error,
+                "e2b_build_log_tail",
+                _build_log_tail(exc) or getattr(environment, "_last_template_build_log_tail", ""),
+            )
+            start_error = timeout_error
+            raise timeout_error from exc
+        except TimeoutError as exc:
+            if not start_timeout.expired():
+                start_error = exc
+                raise
+            timeout_error = PreflightTaskTimeoutError(
+                f"{candidate.dataset_name} environment start exceeded the "
+                f"{timeout_sec:g}s preflight cap"
+            )
+            setattr(
+                timeout_error,
+                "e2b_build_log_tail",
+                getattr(environment, "_last_template_build_log_tail", ""),
+            )
+            start_error = timeout_error
+            raise timeout_error from exc
         except BaseException as exc:
             start_error = exc
             raise

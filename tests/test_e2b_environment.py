@@ -408,7 +408,9 @@ async def test_create_template_passes_compatible_dockerfile_without_changing_sou
         alias="ico-path-patch__template",
         cpu_count=2,
         memory_mb=4096,
+        on_build_logs=build.await_args.kwargs["on_build_logs"],
     )
+    assert callable(build.await_args.kwargs["on_build_logs"])
     assert dockerfile_path.read_text() == original_dockerfile
 
 
@@ -434,7 +436,112 @@ async def test_create_template_preserves_prebuilt_image_behavior(monkeypatch) ->
     build.assert_awaited_once_with(
         template=parsed_template,
         alias="prebuilt-task__template",
+        on_build_logs=build.await_args.kwargs["on_build_logs"],
     )
+    assert callable(build.await_args.kwargs["on_build_logs"])
+
+
+async def test_template_build_log_is_attached_to_failure(monkeypatch) -> None:
+    failure = RuntimeError("error waiting for provisioning sandbox: exit status: 1")
+
+    async def build(**kwargs) -> None:
+        kwargs["on_build_logs"](
+            SimpleNamespace(
+                level="debug",
+                message="/usr/local/bin/provision.sh: line 61: apt-get: command not found",
+            )
+        )
+        raise failure
+
+    parsed_template = object()
+    template_builder = MagicMock()
+    template_builder.from_image.return_value = parsed_template
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b,
+        "Template",
+        MagicMock(return_value=template_builder),
+    )
+    monkeypatch.setattr(e2b_environment.harbor_e2b.AsyncTemplate, "build", build)
+
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment.task_env_config = EnvironmentConfig(docker_image="fedora:42")
+    environment._cpu_resource_mode = ResourceMode.IGNORE
+    environment._memory_resource_mode = ResourceMode.IGNORE
+    environment._template_name = "retro-console-soc__template"
+    environment._e2b_template_build_attempts = 1
+    environment._last_template_build_log_tail = ""
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await environment._create_template()
+
+    assert exc_info.value is failure
+    assert "apt-get: command not found" in failure.e2b_build_log_tail
+
+
+async def test_template_build_attempt_count_can_be_reduced_for_preflight(monkeypatch) -> None:
+    parsed_template = object()
+    template_builder = MagicMock()
+    template_builder.from_image.return_value = parsed_template
+    build = AsyncMock(side_effect=RuntimeError("template failed"))
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b,
+        "Template",
+        MagicMock(return_value=template_builder),
+    )
+    monkeypatch.setattr(e2b_environment.harbor_e2b.AsyncTemplate, "build", build)
+
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment.task_env_config = EnvironmentConfig(docker_image="example.invalid/task:1")
+    environment._cpu_resource_mode = ResourceMode.IGNORE
+    environment._memory_resource_mode = ResourceMode.IGNORE
+    environment._template_name = "single-attempt__template"
+    environment._e2b_template_build_attempts = 1
+    environment._last_template_build_log_tail = ""
+
+    with pytest.raises(RuntimeError, match="template failed"):
+        await environment._create_template()
+
+    assert build.await_count == 1
+
+
+async def test_template_build_timeout_wraps_only_the_remote_build(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    class RecordingTimeout:
+        def __init__(self, timeout_sec: float) -> None:
+            observed["timeout_sec"] = timeout_sec
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    parsed_template = object()
+    template_builder = MagicMock()
+    template_builder.from_image.return_value = parsed_template
+    build = AsyncMock()
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b,
+        "Template",
+        MagicMock(return_value=template_builder),
+    )
+    monkeypatch.setattr(e2b_environment.harbor_e2b.AsyncTemplate, "build", build)
+    monkeypatch.setattr(e2b_environment.asyncio, "timeout", RecordingTimeout)
+
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment.task_env_config = EnvironmentConfig(docker_image="example.invalid/task:1")
+    environment._cpu_resource_mode = ResourceMode.IGNORE
+    environment._memory_resource_mode = ResourceMode.IGNORE
+    environment._template_name = "bounded-build__template"
+    environment._e2b_template_build_attempts = 1
+    environment._e2b_template_build_timeout_sec = 17
+    environment._last_template_build_log_tail = ""
+
+    await environment._create_template()
+
+    assert observed["timeout_sec"] == 17
+    assert build.await_count == 1
 
 
 def test_max_lifetime_defaults_to_24_hours_and_accepts_overrides(monkeypatch) -> None:
@@ -473,6 +580,34 @@ def test_start_ramp_delay_defaults_to_env_and_accepts_kwarg(monkeypatch) -> None
 
     assert from_env._e2b_start_ramp_delay_sec == 5
     assert from_kwarg._e2b_start_ramp_delay_sec == 2.5
+
+
+def test_template_build_controls_accept_preflight_overrides(monkeypatch) -> None:
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b.E2BEnvironment,
+        "__init__",
+        lambda self, *args, **kwargs: None,
+    )
+
+    environment = NexAUE2BEnvironment(
+        e2b_template_build_attempts="1",
+        e2b_template_build_timeout_sec="17.5",
+    )
+
+    assert environment._e2b_template_build_attempts == 1
+    assert environment._e2b_template_build_timeout_sec == 17.5
+
+
+@pytest.mark.parametrize("value", [0, -1, "invalid", True, float("inf")])
+def test_template_build_timeout_rejects_invalid_values(value, monkeypatch) -> None:
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b.E2BEnvironment,
+        "__init__",
+        lambda self, *args, **kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match="e2b_template_build_timeout_sec"):
+        NexAUE2BEnvironment(e2b_template_build_timeout_sec=value)
 
 
 @pytest.mark.parametrize("value", [-1, "invalid", True, float("inf")])

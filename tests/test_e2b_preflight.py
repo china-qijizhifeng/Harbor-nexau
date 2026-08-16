@@ -186,6 +186,108 @@ def test_deterministic_build_error_and_transient_control_plane_error_are_separat
     assert e2b_preflight._is_transient_exception(transient)
 
 
+def test_build_log_reveals_deterministic_provisioning_failure() -> None:
+    build_exception = type("BuildException", (RuntimeError,), {})
+    failure = build_exception("error waiting for provisioning sandbox: exit status 1")
+    failure.e2b_build_log_tail = (
+        "[debug] /usr/local/bin/provision.sh: line 61: apt-get: command not found"
+    )
+
+    reason = e2b_preflight._deterministic_incompatibility_reason(failure) or ""
+
+    assert "template build rejected" in reason
+    assert "apt-get: command not found" in reason
+
+
+@pytest.mark.asyncio
+async def test_probe_uses_task_build_timeout_and_one_template_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = _create_dataset(tmp_path)
+    candidate = next(
+        candidate
+        for candidate in e2b_preflight._discover_tasks(dataset)
+        if candidate.dataset_name == "plain-human"
+    )
+    candidate.task.config.environment.build_timeout_sec = 17
+    observed: dict[str, object] = {}
+
+    class FakeEnvironment:
+        def __init__(self, **kwargs) -> None:
+            observed.update(kwargs)
+
+        async def start(self, force_build: bool) -> None:
+            observed["force_build"] = force_build
+
+        async def stop(self, delete: bool) -> None:
+            observed["delete"] = delete
+
+    class RecordingTimeout:
+        def __init__(self, timeout_sec: float) -> None:
+            observed["timeout_sec"] = timeout_sec
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(e2b_preflight, "NexAUE2BEnvironment", FakeEnvironment)
+    monkeypatch.setattr(e2b_preflight.asyncio, "timeout", RecordingTimeout)
+
+    await e2b_preflight._probe_once(candidate, 2.5, 99)
+
+    assert observed["timeout_sec"] == 99
+    assert observed["e2b_template_build_attempts"] == 1
+    assert observed["e2b_template_build_timeout_sec"] == 17
+    assert observed["e2b_start_ramp_delay_sec"] == 2.5
+    assert observed["force_build"] is False
+    assert observed["delete"] is True
+
+
+@pytest.mark.asyncio
+async def test_probe_preserves_non_deadline_timeout_as_transient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = _create_dataset(tmp_path)
+    candidate = next(
+        candidate
+        for candidate in e2b_preflight._discover_tasks(dataset)
+        if candidate.dataset_name == "plain-human"
+    )
+
+    class FakeEnvironment:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def start(self, force_build: bool) -> None:
+            raise TimeoutError("remote control-plane timeout")
+
+        async def stop(self, delete: bool) -> None:
+            pass
+
+    class NonExpiredTimeout:
+        def __init__(self, _timeout_sec: float) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def expired(self) -> bool:
+            return False
+
+    monkeypatch.setattr(e2b_preflight, "NexAUE2BEnvironment", FakeEnvironment)
+    monkeypatch.setattr(e2b_preflight.asyncio, "timeout", NonExpiredTimeout)
+
+    with pytest.raises(TimeoutError, match="control-plane"):
+        await e2b_preflight._probe_once(candidate, 0, 30)
+
+
 @pytest.mark.asyncio
 async def test_plain_e2b_probe_retries_transient_failures(
     tmp_path: Path,
@@ -242,6 +344,33 @@ async def test_plain_e2b_probe_immediately_routes_deterministic_build_failure(
 
     assert calls == 1
     assert decision.route == "dind"
+
+
+@pytest.mark.asyncio
+async def test_plain_e2b_probe_routes_task_budget_timeout_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = _create_dataset(tmp_path)
+    candidate = next(
+        candidate
+        for candidate in e2b_preflight._discover_tasks(dataset)
+        if candidate.dataset_name == "plain-human"
+    )
+    calls = 0
+
+    async def probe_once(_candidate, _ramp_delay, _timeout):
+        nonlocal calls
+        calls += 1
+        raise e2b_preflight.PreflightTaskTimeoutError("task build budget exhausted")
+
+    monkeypatch.setattr(e2b_preflight, "_probe_once", probe_once)
+
+    decision = await e2b_preflight._probe_plain_e2b(candidate, 0, 30, attempts=3)
+
+    assert calls == 1
+    assert decision.route == "dind"
+    assert "effective build budget" in decision.reason
 
 
 def test_selector_file_contains_one_auditable_route_per_task(tmp_path: Path) -> None:
