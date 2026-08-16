@@ -62,7 +62,7 @@ scripts/smoke_tb3.sh --job-name nexau-smoke
 同时不会在任务容器内累计第二份完整 span 树。
 
 如果目标是采集长轨迹而不是遵守题目自带的 Agent 限时，并运行本地 CPU-only 任务集，
-推荐让脚本自动识别 Compose 题：
+推荐让脚本自动预检并选择 E2B provider：
 
 ```bash
 scripts/smoke_tb3.sh \
@@ -73,21 +73,30 @@ scripts/smoke_tb3.sh \
   --job-name nexau-n2-pro-frontier
 ```
 
-`--auto-partition` 会直接检查 `--path` 下每道题的文件结构：包含
-`environment/docker-compose.yaml`、`docker-compose.yml`、`compose.yaml` 或 `compose.yml` 的题目
-进入 Compose 组，其余进入普通组。两组 Harbor 子 job 会并发启动，并自动使用全部组内并发：
+`--auto-partition` 不会只凭“是否有 Compose 文件”猜测兼容性。Compose 题直接进入 DinD；其余题在
+Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbox 预检。预检成功的题进入
+普通 E2B，确定性的 Dockerfile/E2B 构建不兼容进入 DinD；网络、限流或 provisioning 临时错误会
+退避重试，仍无法确认时本次运行中止，不会把它误记成 DinD。预检不安装或运行 NexAU、不请求模型，
+且成功构建的 E2B Template 会被正式 job 复用。
 
-- `<job-name>-non-compose` 使用 `NexAUE2BEnvironment`；
-- `<job-name>-compose` 使用 `NexAUE2BDinDEnvironment`。
+分流完成后两组 Harbor 子 job 并发启动，并自动使用全部组内并发：
 
-例如当前 CPU68 数据集会动态得到 57 道普通题和 11 道 Compose 题。无需手写
-`--n-tasks`/`--n-concurrent`，也不要同时传 `--env` 或题名过滤器。自动模式目前只接受已经解析到
-本机的 `--path` 数据集，因为分类需要读取原题文件；它不修改原题，只生成两个独立的 job 结果目录。
+- `<job-name>-plain-e2b` 使用 `NexAUE2BEnvironment`；
+- `<job-name>-dind` 使用 `NexAUE2BDinDEnvironment`。
+
+无需手写 `--n-tasks`/`--n-concurrent`，也不要同时传 `--env` 或题名过滤器。自动模式目前只接受
+已经解析到本机的 `--path` 数据集；它不修改原题。可信分流结果按 environment hash、E2B SDK 版本
+和 E2B backend 缓存在 `~/.cache/harbor-nexau/e2b-routes.json`，后续运行直接复用；环境内容或 backend
+改变会自动重新预检。需要强制重检时添加 `--refresh-e2b-routing`。预检单题默认最多 7200 秒、3 次
+尝试，可分别通过 `HARBOR_NEXAU_E2B_PREFLIGHT_TIMEOUT_SEC` 和
+`HARBOR_NEXAU_E2B_PREFLIGHT_ATTEMPTS` 调整；缓存路径可通过
+`HARBOR_NEXAU_E2B_ROUTE_CACHE` 覆盖。
 
 `--e2b-start-ramp-delay-sec 5` 不降低组内并发：trial 会立即进入 Harbor 调度，但每个子 job
-内部的 E2B sandbox 创建会按 5 秒错峰。自动模式有普通题和 Compose 题两条独立的创建队列，
-因此同一个间隔最多会各放行一个。也可通过 `HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC` 设置；
-`0` 表示关闭错峰。
+内部的 E2B sandbox 创建会按 5 秒错峰。预检使用一条创建队列；正式运行的普通 E2B 和 DinD
+子 job 各有独立队列。也可通过 `HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC` 设置；`0` 表示关闭
+错峰。自动模式会把两个子 job 放进独立进程组，`Ctrl-C` 会同时通知完整的 Harbor 进程树，并给
+清理流程最多 90 秒后再强制终止。
 
 trace 模式通过 Harbor 的 `agent.override_timeout_sec` 覆盖每道题自己的 Agent timeout，
 默认统一为 72000 秒（20 小时）。这不是基础设施层面的无限运行：当前 E2B 最大生命周期仍为
@@ -101,7 +110,7 @@ job 无法动态切换到 trace 模式。
 如果只想单独重跑或诊断某一组，仍可手工选择固定 CPU68 分组：
 
 ```bash
-# 57 道非 Compose 题：普通 E2B
+# 57 道非 Compose 题：强制普通 E2B（仅用于诊断，不做兼容性预检）
 scripts/smoke_tb3.sh \
   --trace-mode \
   --non-compose-only \
@@ -111,7 +120,7 @@ scripts/smoke_tb3.sh \
   --e2b-start-ramp-delay-sec 5 \
   --job-name nexau-n2-pro-frontier-non-compose
 
-# 11 道 Compose 题：harbor-nexau-dind
+# 11 道 Compose 题：强制 harbor-nexau-dind
 scripts/smoke_tb3.sh \
   --trace-mode \
   --compose-only \

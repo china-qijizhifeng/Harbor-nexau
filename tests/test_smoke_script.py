@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).parents[1]
@@ -18,6 +20,7 @@ def _run_with_fake_uv(
     trace_config_capture: Path | None = None,
     ramp_capture: Path | None = None,
     invocation_capture_dir: Path | None = None,
+    interrupt_when_children_ready: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -25,6 +28,44 @@ def _run_with_fake_uv(
     fake_uv.write_text(
         """#!/usr/bin/env bash
 set -euo pipefail
+is_preflight=0
+for argument in "$@"; do
+  if [[ "$argument" == "nexau_harbor.e2b_preflight" ]]; then
+    is_preflight=1
+    break
+  fi
+done
+if [[ "$is_preflight" == "1" ]]; then
+  dataset=""
+  output=""
+  selectors_output=""
+  previous=""
+  for argument in "$@"; do
+    case "$previous" in
+      --dataset) dataset="$argument" ;;
+      --output) output="$argument" ;;
+      --selectors-output) selectors_output="$argument" ;;
+    esac
+    previous="$argument"
+  done
+  printf '{"tasks": []}\n' > "$output"
+  : > "$selectors_output"
+  for task in "$dataset"/*; do
+    if [[ ! -d "$task" || ! -f "$task/task.toml" ]]; then
+      continue
+    fi
+    resolved="$(realpath -e -- "$task")"
+    route="plain-e2b"
+    if [[ -f "$task/environment/docker-compose.yaml" || \
+      -f "$task/environment/docker-compose.yml" || \
+      -f "$task/environment/compose.yaml" || \
+      -f "$task/environment/compose.yml" ]]; then
+      route="dind"
+    fi
+    printf '%s\t%s\n' "$route" "${resolved##*/}" >> "$selectors_output"
+  done
+  exit 0
+fi
 previous=""
 for argument in "$@"; do
   if [[ "$previous" == "--config" && -n "${TRACE_CONFIG_CAPTURE:-}" ]]; then
@@ -37,6 +78,11 @@ if [[ -n "${RAMP_CAPTURE:-}" ]]; then
 fi
 if [[ -n "${INVOCATION_CAPTURE_DIR:-}" ]]; then
   printf "%s\\n" "$@" > "$INVOCATION_CAPTURE_DIR/$$"
+fi
+if [[ -n "${FORMAL_HOLD_DIR:-}" ]]; then
+  printf '%s\n' "$$" > "$FORMAL_HOLD_DIR/$$"
+  trap 'exit 0' INT TERM
+  while true; do sleep 1; done
 fi
 printf "%s\\n" "$@"
 """
@@ -70,8 +116,35 @@ printf "%s\\n" "$@"
     else:
         env.pop("INVOCATION_CAPTURE_DIR", None)
 
+    command = [str(_SCRIPT), *arguments]
+    if interrupt_when_children_ready:
+        hold_dir = tmp_path / "formal-hold"
+        hold_dir.mkdir()
+        env["FORMAL_HOLD_DIR"] = str(hold_dir)
+        process = subprocess.Popen(
+            command,
+            cwd=_PROJECT_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while len(tuple(hold_dir.iterdir())) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if len(tuple(hold_dir.iterdir())) < 2:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=5)
+            raise AssertionError(f"auto-partition children did not start:\n{stdout}\n{stderr}")
+        child_pids = [int(path.read_text()) for path in hold_dir.iterdir()]
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=5)
+        for child_pid in child_pids:
+            assert not Path(f"/proc/{child_pid}").exists()
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
     return subprocess.run(
-        [str(_SCRIPT), *arguments],
+        command,
         cwd=_PROJECT_ROOT,
         env=env,
         check=False,
@@ -317,24 +390,42 @@ def test_smoke_script_auto_partitions_local_dataset_into_concurrent_jobs(
         for arguments in invocations
         if "nexau_harbor.e2b_environment:NexAUE2BEnvironment" in arguments
     )
-    compose_arguments = next(
+    dind_arguments = next(
         arguments
         for arguments in invocations
         if "nexau_harbor.e2b_dind_environment:NexAUE2BDinDEnvironment" in arguments
     )
 
-    assert _last_option_value(plain_arguments, "--job-name") == "auto-run-non-compose"
+    assert _last_option_value(plain_arguments, "--job-name") == "auto-run-plain-e2b"
     assert _last_option_value(plain_arguments, "--n-tasks") == "2"
     assert _last_option_value(plain_arguments, "--n-concurrent") == "2"
-    assert "--include-task-name" not in plain_arguments
-    assert plain_arguments[plain_arguments.index("--exclude-task-name") + 1] == "compose-digest"
+    assert plain_arguments.count("--include-task-name") == 2
+    assert "plain-digest-a" in plain_arguments
+    assert "plain-digest-b" in plain_arguments
+    assert "--exclude-task-name" not in plain_arguments
 
-    assert _last_option_value(compose_arguments, "--job-name") == "auto-run-compose"
-    assert _last_option_value(compose_arguments, "--n-tasks") == "1"
-    assert _last_option_value(compose_arguments, "--n-concurrent") == "1"
-    assert "--exclude-task-name" not in compose_arguments
-    assert compose_arguments[compose_arguments.index("--include-task-name") + 1] == "compose-digest"
-    assert "Auto partition detected 1 Compose and 2 non-Compose tasks" in result.stderr
+    assert _last_option_value(dind_arguments, "--job-name") == "auto-run-dind"
+    assert _last_option_value(dind_arguments, "--n-tasks") == "1"
+    assert _last_option_value(dind_arguments, "--n-concurrent") == "1"
+    assert "--exclude-task-name" not in dind_arguments
+    assert dind_arguments[dind_arguments.index("--include-task-name") + 1] == "compose-digest"
+    assert "Auto partition selected 2 plain E2B and 1 DinD task(s)" in result.stderr
+
+
+def test_auto_partition_interrupt_stops_both_process_groups(tmp_path: Path) -> None:
+    dataset = _create_auto_partition_dataset(tmp_path)
+
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--auto-partition",
+        "--path",
+        str(dataset),
+        "--job-name",
+        "auto-interrupt",
+        interrupt_when_children_ready=True,
+    )
+
+    assert result.returncode == 130
 
 
 def test_smoke_script_auto_partition_requires_local_dataset_path(tmp_path: Path) -> None:

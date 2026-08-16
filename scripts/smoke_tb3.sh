@@ -20,6 +20,9 @@ agent_config="${HARBOR_NEXAU_CONFIG_PATH:-$project_root/src/nexau_harbor/configs
 trace_mode=0
 trace_timeout_sec="${HARBOR_NEXAU_TRACE_TIMEOUT_SEC:-72000}"
 e2b_start_ramp_delay_sec="${HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC:-0}"
+e2b_preflight_timeout_sec="${HARBOR_NEXAU_E2B_PREFLIGHT_TIMEOUT_SEC:-7200}"
+e2b_preflight_attempts="${HARBOR_NEXAU_E2B_PREFLIGHT_ATTEMPTS:-3}"
+refresh_e2b_routing=0
 task_partition=""
 forwarded_args=()
 
@@ -117,6 +120,10 @@ while (($# > 0)); do
       e2b_start_ramp_delay_sec="${1#*=}"
       shift
       ;;
+    --refresh-e2b-routing)
+      refresh_e2b_routing=1
+      shift
+      ;;
     *)
       forwarded_args+=("$1")
       shift
@@ -177,6 +184,20 @@ fi
 if [[ ! "$e2b_start_ramp_delay_sec" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
   printf 'E2B start ramp delay must be a finite non-negative number, got: %s\n' \
     "$e2b_start_ramp_delay_sec" >&2
+  exit 2
+fi
+if [[ ! "$e2b_preflight_timeout_sec" =~ ^[1-9][0-9]*([.][0-9]*)?$ ]]; then
+  printf 'E2B preflight timeout must be positive, got: %s\n' \
+    "$e2b_preflight_timeout_sec" >&2
+  exit 2
+fi
+if [[ ! "$e2b_preflight_attempts" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'E2B preflight attempts must be a positive integer, got: %s\n' \
+    "$e2b_preflight_attempts" >&2
+  exit 2
+fi
+if [[ "$refresh_e2b_routing" == "1" && "$task_partition" != "auto" ]]; then
+  printf '%s\n' '--refresh-e2b-routing requires --auto-partition' >&2
   exit 2
 fi
 export HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC="$e2b_start_ramp_delay_sec"
@@ -254,7 +275,6 @@ if [[ "$task_partition" == "auto" ]]; then
     auto_job_name="nexau-tb3-auto-$(date '+%Y%m%d-%H%M%S')"
   fi
 
-  compose_selectors=()
   total_task_count=0
   shopt -s nullglob
   for task_dir in "$auto_dataset_path"/*; do
@@ -262,26 +282,72 @@ if [[ "$task_partition" == "auto" ]]; then
       continue
     fi
     ((total_task_count += 1))
-    if [[ -f "$task_dir/environment/docker-compose.yaml" || \
-      -f "$task_dir/environment/docker-compose.yml" || \
-      -f "$task_dir/environment/compose.yaml" || \
-      -f "$task_dir/environment/compose.yml" ]]; then
-      resolved_task_dir="$(realpath -e -- "$task_dir")"
-      compose_selectors+=("${resolved_task_dir##*/}")
-    fi
   done
   shopt -u nullglob
 
-  compose_task_count="${#compose_selectors[@]}"
-  non_compose_task_count=$((total_task_count - compose_task_count))
   if ((total_task_count == 0)); then
     printf 'No Harbor tasks found directly under auto-partition path: %s\n' \
       "$auto_dataset_path" >&2
     exit 2
   fi
 
-  printf 'Auto partition detected %s Compose and %s non-Compose tasks under %s.\n' \
-    "$compose_task_count" "$non_compose_task_count" "$auto_dataset_path" >&2
+  auto_plan_path="$(mktemp "${TMPDIR:-/tmp}/harbor-nexau-route-plan.XXXXXX.json")"
+  auto_selectors_path="$(mktemp "${TMPDIR:-/tmp}/harbor-nexau-route-selectors.XXXXXX.tsv")"
+  cleanup_auto_route_files() {
+    rm -f -- "$auto_plan_path" "$auto_selectors_path"
+  }
+  trap cleanup_auto_route_files EXIT
+
+  preflight_args=(
+    uv run --project "$project_root" python -m nexau_harbor.e2b_preflight
+    --dataset "$auto_dataset_path"
+    --output "$auto_plan_path"
+    --selectors-output "$auto_selectors_path"
+    --concurrency "$total_task_count"
+    --start-ramp-delay-sec "$e2b_start_ramp_delay_sec"
+    --timeout-sec "$e2b_preflight_timeout_sec"
+    --attempts "$e2b_preflight_attempts"
+  )
+  if [[ "$refresh_e2b_routing" == "1" ]]; then
+    preflight_args+=(--refresh)
+  fi
+
+  printf 'Preflighting plain E2B compatibility for %s task(s); no Agent will run.\n' \
+    "$total_task_count" >&2
+  # E2B's Dockerfile parser prints ignored COMMENT instructions to stdout.
+  # Route decisions and actionable diagnostics are logged to stderr instead.
+  "${preflight_args[@]}" >/dev/null
+
+  plain_e2b_selectors=()
+  dind_selectors=()
+  while IFS=$'\t' read -r route selector; do
+    if [[ -z "$route" && -z "$selector" ]]; then
+      continue
+    fi
+    case "$route" in
+      plain-e2b)
+        plain_e2b_selectors+=("$selector")
+        ;;
+      dind)
+        dind_selectors+=("$selector")
+        ;;
+      *)
+        printf 'Invalid route %q in E2B preflight selector file.\n' "$route" >&2
+        exit 2
+        ;;
+    esac
+  done <"$auto_selectors_path"
+
+  plain_e2b_task_count="${#plain_e2b_selectors[@]}"
+  dind_task_count="${#dind_selectors[@]}"
+  if ((plain_e2b_task_count + dind_task_count != total_task_count)); then
+    printf 'E2B preflight returned %s routes for %s tasks.\n' \
+      "$((plain_e2b_task_count + dind_task_count))" "$total_task_count" >&2
+    exit 2
+  fi
+
+  printf 'Auto partition selected %s plain E2B and %s DinD task(s).\n' \
+    "$plain_e2b_task_count" "$dind_task_count" >&2
 
   auto_common_args=()
   if [[ "$trace_mode" == "1" ]]; then
@@ -290,47 +356,82 @@ if [[ "$task_partition" == "auto" ]]; then
   auto_common_args+=(--e2b-start-ramp-delay-sec "$e2b_start_ramp_delay_sec")
   auto_common_args+=("${auto_forwarded_args[@]}")
   auto_child_pids=()
+  auto_child_pgids=()
   auto_child_labels=()
 
-  if ((non_compose_task_count > 0)); then
-    non_compose_args=(
-      "${auto_common_args[@]}"
-      --n-tasks "$non_compose_task_count"
-      --n-concurrent "$non_compose_task_count"
-      --job-name "$auto_job_name-non-compose"
-    )
-    for selector in "${compose_selectors[@]}"; do
-      non_compose_args+=(--exclude-task-name "$selector")
-    done
-    HARBOR_NEXAU_ENV="$single_e2b_environment" \
-      bash "$project_root/scripts/smoke_tb3.sh" "${non_compose_args[@]}" &
-    auto_child_pids+=("$!")
-    auto_child_labels+=("non-compose")
+  if ! command -v setsid >/dev/null 2>&1; then
+    printf '%s\n' 'setsid is required for reliable auto-partition process cleanup' >&2
+    exit 2
   fi
 
-  if ((compose_task_count > 0)); then
-    compose_args=(
+  if ((plain_e2b_task_count > 0)); then
+    plain_e2b_args=(
       "${auto_common_args[@]}"
-      --n-tasks "$compose_task_count"
-      --n-concurrent "$compose_task_count"
-      --job-name "$auto_job_name-compose"
+      --n-tasks "$plain_e2b_task_count"
+      --n-concurrent "$plain_e2b_task_count"
+      --job-name "$auto_job_name-plain-e2b"
     )
-    for selector in "${compose_selectors[@]}"; do
-      compose_args+=(--include-task-name "$selector")
+    for selector in "${plain_e2b_selectors[@]}"; do
+      plain_e2b_args+=(--include-task-name "$selector")
     done
-    HARBOR_NEXAU_ENV="$compose_e2b_environment" \
-      bash "$project_root/scripts/smoke_tb3.sh" "${compose_args[@]}" &
+    setsid env HARBOR_NEXAU_ENV="$single_e2b_environment" \
+      bash "$project_root/scripts/smoke_tb3.sh" "${plain_e2b_args[@]}" &
     auto_child_pids+=("$!")
-    auto_child_labels+=("compose")
+    auto_child_pgids+=("$!")
+    auto_child_labels+=("plain-e2b")
+  fi
+
+  if ((dind_task_count > 0)); then
+    dind_args=(
+      "${auto_common_args[@]}"
+      --n-tasks "$dind_task_count"
+      --n-concurrent "$dind_task_count"
+      --job-name "$auto_job_name-dind"
+    )
+    for selector in "${dind_selectors[@]}"; do
+      dind_args+=(--include-task-name "$selector")
+    done
+    setsid env HARBOR_NEXAU_ENV="$compose_e2b_environment" \
+      bash "$project_root/scripts/smoke_tb3.sh" "${dind_args[@]}" &
+    auto_child_pids+=("$!")
+    auto_child_pgids+=("$!")
+    auto_child_labels+=("dind")
   fi
 
   terminate_auto_children() {
-    local child_pid
-    for child_pid in "${auto_child_pids[@]}"; do
-      kill -TERM "$child_pid" 2>/dev/null || true
+    local exit_code="$1"
+    local child_pid child_pgid any_alive deadline
+    trap - INT TERM
+
+    for child_pgid in "${auto_child_pgids[@]}"; do
+      kill -TERM -- "-$child_pgid" 2>/dev/null || true
     done
+
+    deadline=$((SECONDS + 90))
+    while ((SECONDS < deadline)); do
+      any_alive=0
+      for child_pgid in "${auto_child_pgids[@]}"; do
+        if kill -0 -- "-$child_pgid" 2>/dev/null; then
+          any_alive=1
+          break
+        fi
+      done
+      if ((any_alive == 0)); then
+        break
+      fi
+      sleep 1
+    done
+
+    for child_pgid in "${auto_child_pgids[@]}"; do
+      kill -KILL -- "-$child_pgid" 2>/dev/null || true
+    done
+    for child_pid in "${auto_child_pids[@]}"; do
+      wait "$child_pid" 2>/dev/null || true
+    done
+    exit "$exit_code"
   }
-  trap terminate_auto_children INT TERM
+  trap 'terminate_auto_children 130' INT
+  trap 'terminate_auto_children 143' TERM
 
   auto_exit_code=0
   set +e
