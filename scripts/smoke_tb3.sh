@@ -60,9 +60,19 @@ compose_task_digests=(
 
 while (($# > 0)); do
   case "$1" in
+    --auto-partition)
+      if [[ -n "$task_partition" ]]; then
+        printf '%s\n' \
+          '--auto-partition, --compose-only, and --non-compose-only are mutually exclusive' >&2
+        exit 2
+      fi
+      task_partition="auto"
+      shift
+      ;;
     --compose-only)
       if [[ -n "$task_partition" ]]; then
-        printf '%s\n' '--compose-only and --non-compose-only are mutually exclusive' >&2
+        printf '%s\n' \
+          '--auto-partition, --compose-only, and --non-compose-only are mutually exclusive' >&2
         exit 2
       fi
       task_partition="compose"
@@ -70,7 +80,8 @@ while (($# > 0)); do
       ;;
     --non-compose-only)
       if [[ -n "$task_partition" ]]; then
-        printf '%s\n' '--compose-only and --non-compose-only are mutually exclusive' >&2
+        printf '%s\n' \
+          '--auto-partition, --compose-only, and --non-compose-only are mutually exclusive' >&2
         exit 2
       fi
       task_partition="non-compose"
@@ -121,39 +132,41 @@ if [[ -n "$task_partition" ]]; then
       --env | --env=* | -e | --include-task-name | --include-task-name=* | -i | \
         --exclude-task-name | --exclude-task-name=* | -x)
         printf '%s\n' \
-          'The Compose partition flags own --env and task-name filters; remove the explicit override.' >&2
+          'Task partition modes own --env and task-name filters; remove the explicit override.' >&2
         exit 2
         ;;
     esac
   done
 
-  for task_name in "${compose_task_names[@]}"; do
-    if [[ "$task_partition" == "compose" ]]; then
-      partition_args+=(
-        --include-task-name "$task_name"
-        --include-task-name "*/$task_name"
-      )
-    else
-      partition_args+=(
-        --exclude-task-name "$task_name"
-        --exclude-task-name "*/$task_name"
-      )
-    fi
-  done
-  for task_digest in "${compose_task_digests[@]}"; do
-    if [[ "$task_partition" == "compose" ]]; then
-      partition_args+=(--include-task-name "$task_digest")
-    else
-      partition_args+=(--exclude-task-name "$task_digest")
-    fi
-  done
+  if [[ "$task_partition" != "auto" ]]; then
+    for task_name in "${compose_task_names[@]}"; do
+      if [[ "$task_partition" == "compose" ]]; then
+        partition_args+=(
+          --include-task-name "$task_name"
+          --include-task-name "*/$task_name"
+        )
+      else
+        partition_args+=(
+          --exclude-task-name "$task_name"
+          --exclude-task-name "*/$task_name"
+        )
+      fi
+    done
+    for task_digest in "${compose_task_digests[@]}"; do
+      if [[ "$task_partition" == "compose" ]]; then
+        partition_args+=(--include-task-name "$task_digest")
+      else
+        partition_args+=(--exclude-task-name "$task_digest")
+      fi
+    done
 
-  if [[ "$task_partition" == "compose" ]]; then
-    environment="$compose_e2b_environment"
-  else
-    environment="$single_e2b_environment"
+    if [[ "$task_partition" == "compose" ]]; then
+      environment="$compose_e2b_environment"
+    else
+      environment="$single_e2b_environment"
+    fi
+    printf 'TB3 partition: %s tasks using %s.\n' "$task_partition" "$environment" >&2
   fi
-  printf 'TB3 partition: %s tasks using %s.\n' "$task_partition" "$environment" >&2
 fi
 
 if [[ "$trace_mode" == "1" && ! "$trace_timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
@@ -167,7 +180,7 @@ if [[ ! "$e2b_start_ramp_delay_sec" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
   exit 2
 fi
 export HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC="$e2b_start_ramp_delay_sec"
-if [[ "$e2b_start_ramp_delay_sec" != "0" ]]; then
+if [[ "$e2b_start_ramp_delay_sec" != "0" && "$task_partition" != "auto" ]]; then
   printf 'E2B sandbox starts will be staggered by %s seconds; Harbor concurrency is unchanged.\n' \
     "$e2b_start_ramp_delay_sec" >&2
 fi
@@ -175,6 +188,166 @@ fi
 if [[ ! -f "$agent_config" ]]; then
   printf 'NexAU config file not found: %s\n' "$agent_config" >&2
   exit 2
+fi
+
+if [[ "$task_partition" == "auto" ]]; then
+  auto_dataset_path=""
+  auto_job_name=""
+  auto_forwarded_args=()
+  auto_args=("$@")
+  for ((argument_index = 0; argument_index < ${#auto_args[@]}; argument_index++)); do
+    argument="${auto_args[$argument_index]}"
+    case "$argument" in
+      --path | -p)
+        if ((argument_index + 1 >= ${#auto_args[@]})); then
+          printf '%s\n' "$argument requires a local dataset path" >&2
+          exit 2
+        fi
+        auto_dataset_path="${auto_args[$((argument_index + 1))]}"
+        auto_forwarded_args+=("$argument" "$auto_dataset_path")
+        ((argument_index += 1))
+        ;;
+      --path=*)
+        auto_dataset_path="${argument#*=}"
+        auto_forwarded_args+=("$argument")
+        ;;
+      -p=*)
+        auto_dataset_path="${argument#*=}"
+        auto_forwarded_args+=("$argument")
+        ;;
+      --job-name)
+        if ((argument_index + 1 >= ${#auto_args[@]})); then
+          printf '%s\n' '--job-name requires a value' >&2
+          exit 2
+        fi
+        auto_job_name="${auto_args[$((argument_index + 1))]}"
+        ((argument_index += 1))
+        ;;
+      --job-name=*)
+        auto_job_name="${argument#*=}"
+        ;;
+      --dataset | --dataset=* | -d | -d=*)
+        printf '%s\n' \
+          '--auto-partition currently requires --path to a resolved local dataset' >&2
+        exit 2
+        ;;
+      --n-tasks | --n-tasks=* | -l | -l=* | --n-concurrent | --n-concurrent=* | -n | -n=*)
+        printf '%s\n' \
+          '--auto-partition sets --n-tasks and --n-concurrent from detected group sizes' >&2
+        exit 2
+        ;;
+      *)
+        auto_forwarded_args+=("$argument")
+        ;;
+    esac
+  done
+
+  if [[ -z "$auto_dataset_path" ]]; then
+    printf '%s\n' '--auto-partition requires --path to a resolved local dataset' >&2
+    exit 2
+  fi
+  if [[ ! -d "$auto_dataset_path" ]]; then
+    printf 'Auto-partition dataset directory not found: %s\n' "$auto_dataset_path" >&2
+    exit 2
+  fi
+  if [[ -z "$auto_job_name" ]]; then
+    auto_job_name="nexau-tb3-auto-$(date '+%Y%m%d-%H%M%S')"
+  fi
+
+  compose_selectors=()
+  total_task_count=0
+  shopt -s nullglob
+  for task_dir in "$auto_dataset_path"/*; do
+    if [[ ! -d "$task_dir" || ! -f "$task_dir/task.toml" ]]; then
+      continue
+    fi
+    ((total_task_count += 1))
+    if [[ -f "$task_dir/environment/docker-compose.yaml" || \
+      -f "$task_dir/environment/docker-compose.yml" || \
+      -f "$task_dir/environment/compose.yaml" || \
+      -f "$task_dir/environment/compose.yml" ]]; then
+      resolved_task_dir="$(realpath -e -- "$task_dir")"
+      compose_selectors+=("${resolved_task_dir##*/}")
+    fi
+  done
+  shopt -u nullglob
+
+  compose_task_count="${#compose_selectors[@]}"
+  non_compose_task_count=$((total_task_count - compose_task_count))
+  if ((total_task_count == 0)); then
+    printf 'No Harbor tasks found directly under auto-partition path: %s\n' \
+      "$auto_dataset_path" >&2
+    exit 2
+  fi
+
+  printf 'Auto partition detected %s Compose and %s non-Compose tasks under %s.\n' \
+    "$compose_task_count" "$non_compose_task_count" "$auto_dataset_path" >&2
+
+  auto_common_args=()
+  if [[ "$trace_mode" == "1" ]]; then
+    auto_common_args+=(--trace-timeout-sec "$trace_timeout_sec")
+  fi
+  auto_common_args+=(--e2b-start-ramp-delay-sec "$e2b_start_ramp_delay_sec")
+  auto_common_args+=("${auto_forwarded_args[@]}")
+  auto_child_pids=()
+  auto_child_labels=()
+
+  if ((non_compose_task_count > 0)); then
+    non_compose_args=(
+      "${auto_common_args[@]}"
+      --n-tasks "$non_compose_task_count"
+      --n-concurrent "$non_compose_task_count"
+      --job-name "$auto_job_name-non-compose"
+    )
+    for selector in "${compose_selectors[@]}"; do
+      non_compose_args+=(--exclude-task-name "$selector")
+    done
+    HARBOR_NEXAU_ENV="$single_e2b_environment" \
+      bash "$project_root/scripts/smoke_tb3.sh" "${non_compose_args[@]}" &
+    auto_child_pids+=("$!")
+    auto_child_labels+=("non-compose")
+  fi
+
+  if ((compose_task_count > 0)); then
+    compose_args=(
+      "${auto_common_args[@]}"
+      --n-tasks "$compose_task_count"
+      --n-concurrent "$compose_task_count"
+      --job-name "$auto_job_name-compose"
+    )
+    for selector in "${compose_selectors[@]}"; do
+      compose_args+=(--include-task-name "$selector")
+    done
+    HARBOR_NEXAU_ENV="$compose_e2b_environment" \
+      bash "$project_root/scripts/smoke_tb3.sh" "${compose_args[@]}" &
+    auto_child_pids+=("$!")
+    auto_child_labels+=("compose")
+  fi
+
+  terminate_auto_children() {
+    local child_pid
+    for child_pid in "${auto_child_pids[@]}"; do
+      kill -TERM "$child_pid" 2>/dev/null || true
+    done
+  }
+  trap terminate_auto_children INT TERM
+
+  auto_exit_code=0
+  set +e
+  for ((child_index = 0; child_index < ${#auto_child_pids[@]}; child_index++)); do
+    wait "${auto_child_pids[$child_index]}"
+    child_exit_code=$?
+    if ((child_exit_code != 0)); then
+      printf 'Auto-partition %s job exited with status %s.\n' \
+        "${auto_child_labels[$child_index]}" "$child_exit_code" >&2
+      if ((auto_exit_code == 0)); then
+        auto_exit_code="$child_exit_code"
+      fi
+    fi
+  done
+  set -e
+  trap - INT TERM
+  exit "$auto_exit_code"
 fi
 
 task_source_args=(--dataset "$dataset")

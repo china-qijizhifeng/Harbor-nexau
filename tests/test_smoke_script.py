@@ -17,6 +17,7 @@ def _run_with_fake_uv(
     config_path: Path | None = None,
     trace_config_capture: Path | None = None,
     ramp_capture: Path | None = None,
+    invocation_capture_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -33,6 +34,9 @@ for argument in "$@"; do
 done
 if [[ -n "${RAMP_CAPTURE:-}" ]]; then
   printf '%s' "${HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC:-}" > "$RAMP_CAPTURE"
+fi
+if [[ -n "${INVOCATION_CAPTURE_DIR:-}" ]]; then
+  printf "%s\\n" "$@" > "$INVOCATION_CAPTURE_DIR/$$"
 fi
 printf "%s\\n" "$@"
 """
@@ -60,6 +64,11 @@ printf "%s\\n" "$@"
         env["RAMP_CAPTURE"] = str(ramp_capture)
     else:
         env.pop("RAMP_CAPTURE", None)
+    if invocation_capture_dir is not None:
+        invocation_capture_dir.mkdir()
+        env["INVOCATION_CAPTURE_DIR"] = str(invocation_capture_dir)
+    else:
+        env.pop("INVOCATION_CAPTURE_DIR", None)
 
     return subprocess.run(
         [str(_SCRIPT), *arguments],
@@ -70,6 +79,32 @@ printf "%s\\n" "$@"
         text=True,
         timeout=5,
     )
+
+
+def _create_auto_partition_dataset(tmp_path: Path) -> Path:
+    task_store = tmp_path / "task-store"
+    task_store.mkdir()
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+
+    for task_name in ("plain-digest-a", "plain-digest-b", "compose-digest"):
+        task = task_store / task_name
+        task.mkdir()
+        (task / "task.toml").write_text('version = "1.0"\n')
+
+    compose_environment = task_store / "compose-digest" / "environment"
+    compose_environment.mkdir()
+    (compose_environment / "docker-compose.yaml").write_text("services: {}\n")
+
+    (dataset / "plain-human-a").symlink_to(task_store / "plain-digest-a", target_is_directory=True)
+    (dataset / "plain-human-b").symlink_to(task_store / "plain-digest-b", target_is_directory=True)
+    (dataset / "compose-human").symlink_to(task_store / "compose-digest", target_is_directory=True)
+    return dataset
+
+
+def _last_option_value(arguments: list[str], option: str) -> str:
+    option_index = max(index for index, argument in enumerate(arguments) if argument == option)
+    return arguments[option_index + 1]
 
 
 def test_smoke_script_selects_terminal_bench_config_by_default(
@@ -253,11 +288,83 @@ def test_smoke_script_selects_non_compose_partition_and_plain_e2b_environment(
     assert "TB3 partition: non-compose tasks" in result.stderr
 
 
+def test_smoke_script_auto_partitions_local_dataset_into_concurrent_jobs(
+    tmp_path: Path,
+) -> None:
+    dataset = _create_auto_partition_dataset(tmp_path)
+    invocation_capture_dir = tmp_path / "invocations"
+
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--auto-partition",
+        "--trace-mode",
+        "--path",
+        str(dataset),
+        "--job-name",
+        "auto-run",
+        invocation_capture_dir=invocation_capture_dir,
+    )
+
+    assert result.returncode == 0, result.stderr
+    invocations = [path.read_text().splitlines() for path in invocation_capture_dir.iterdir()]
+    assert len(invocations) == 2
+    assert all("--auto-partition" not in arguments for arguments in invocations)
+    assert all("--config" in arguments for arguments in invocations)
+    assert all(arguments.count("--job-name") == 1 for arguments in invocations)
+
+    plain_arguments = next(
+        arguments
+        for arguments in invocations
+        if "nexau_harbor.e2b_environment:NexAUE2BEnvironment" in arguments
+    )
+    compose_arguments = next(
+        arguments
+        for arguments in invocations
+        if "nexau_harbor.e2b_dind_environment:NexAUE2BDinDEnvironment" in arguments
+    )
+
+    assert _last_option_value(plain_arguments, "--job-name") == "auto-run-non-compose"
+    assert _last_option_value(plain_arguments, "--n-tasks") == "2"
+    assert _last_option_value(plain_arguments, "--n-concurrent") == "2"
+    assert "--include-task-name" not in plain_arguments
+    assert plain_arguments[plain_arguments.index("--exclude-task-name") + 1] == "compose-digest"
+
+    assert _last_option_value(compose_arguments, "--job-name") == "auto-run-compose"
+    assert _last_option_value(compose_arguments, "--n-tasks") == "1"
+    assert _last_option_value(compose_arguments, "--n-concurrent") == "1"
+    assert "--exclude-task-name" not in compose_arguments
+    assert compose_arguments[compose_arguments.index("--include-task-name") + 1] == "compose-digest"
+    assert "Auto partition detected 1 Compose and 2 non-Compose tasks" in result.stderr
+
+
+def test_smoke_script_auto_partition_requires_local_dataset_path(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(tmp_path, "--auto-partition")
+
+    assert result.returncode == 2
+    assert "requires --path to a resolved local dataset" in result.stderr
+
+
+def test_smoke_script_auto_partition_owns_concurrency(tmp_path: Path) -> None:
+    dataset = _create_auto_partition_dataset(tmp_path)
+
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--auto-partition",
+        "--path",
+        str(dataset),
+        "--n-concurrent",
+        "3",
+    )
+
+    assert result.returncode == 2
+    assert "sets --n-tasks and --n-concurrent" in result.stderr
+
+
 def test_smoke_script_rejects_multiple_task_partitions(tmp_path: Path) -> None:
     result = _run_with_fake_uv(
         tmp_path,
+        "--auto-partition",
         "--compose-only",
-        "--non-compose-only",
     )
 
     assert result.returncode == 2
@@ -273,4 +380,4 @@ def test_smoke_script_partition_rejects_explicit_environment(tmp_path: Path) -> 
     )
 
     assert result.returncode == 2
-    assert "partition flags own --env and task-name filters" in result.stderr
+    assert "partition modes own --env and task-name filters" in result.stderr

@@ -61,22 +61,33 @@ scripts/smoke_tb3.sh --job-name nexau-smoke
 自动加入追加写入的 JSONL tracer，因此 verifier、周期 checkpoint 和完整 trace 都保持开启，
 同时不会在任务容器内累计第二份完整 span 树。
 
-如果目标是采集长轨迹而不是遵守题目自带的 Agent 限时，可启用 trace 模式：
+如果目标是采集长轨迹而不是遵守题目自带的 Agent 限时，并运行本地 CPU-only 任务集，
+推荐让脚本自动识别 Compose 题：
 
 ```bash
 scripts/smoke_tb3.sh \
+  --auto-partition \
   --trace-mode \
   --path /root/.cache/harbor/tasks/local-datasets/frontier-bench-cpu68-20260813 \
-  --n-tasks 68 \
-  --n-concurrent 68 \
   --e2b-start-ramp-delay-sec 5 \
-  --job-name nexau-n2-pro-frontier-trace
+  --job-name nexau-n2-pro-frontier
 ```
 
-`--e2b-start-ramp-delay-sec 5` 不降低 `--n-concurrent 68`：68 个 trial 会立即进入 Harbor
-调度，但 E2B sandbox 的创建请求每隔 5 秒发出一个，约 335 秒后全部放行，以避免 sandbox
-创建、Docker pull/build 和 keepalive 同时形成尖峰。也可通过
-`HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC` 设置；`0` 表示关闭错峰。
+`--auto-partition` 会直接检查 `--path` 下每道题的文件结构：包含
+`environment/docker-compose.yaml`、`docker-compose.yml`、`compose.yaml` 或 `compose.yml` 的题目
+进入 Compose 组，其余进入普通组。两组 Harbor 子 job 会并发启动，并自动使用全部组内并发：
+
+- `<job-name>-non-compose` 使用 `NexAUE2BEnvironment`；
+- `<job-name>-compose` 使用 `NexAUE2BDinDEnvironment`。
+
+例如当前 CPU68 数据集会动态得到 57 道普通题和 11 道 Compose 题。无需手写
+`--n-tasks`/`--n-concurrent`，也不要同时传 `--env` 或题名过滤器。自动模式目前只接受已经解析到
+本机的 `--path` 数据集，因为分类需要读取原题文件；它不修改原题，只生成两个独立的 job 结果目录。
+
+`--e2b-start-ramp-delay-sec 5` 不降低组内并发：trial 会立即进入 Harbor 调度，但每个子 job
+内部的 E2B sandbox 创建会按 5 秒错峰。自动模式有普通题和 Compose 题两条独立的创建队列，
+因此同一个间隔最多会各放行一个。也可通过 `HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC` 设置；
+`0` 表示关闭错峰。
 
 trace 模式通过 Harbor 的 `agent.override_timeout_sec` 覆盖每道题自己的 Agent timeout，
 默认统一为 72000 秒（20 小时）。这不是基础设施层面的无限运行：当前 E2B 最大生命周期仍为
@@ -87,7 +98,7 @@ trace 模式通过 Harbor 的 `agent.override_timeout_sec` 覆盖每道题自己
 `--agent-timeout-multiplier`。Terminal-Bench profile 的 500 次迭代上限仍然生效。已经启动的
 job 无法动态切换到 trace 模式。
 
-CPU-only 的 68 题建议拆成两个独立 job，不再让普通单容器题承担 DinD 的额外开销：
+如果只想单独重跑或诊断某一组，仍可手工选择固定 CPU68 分组：
 
 ```bash
 # 57 道非 Compose 题：普通 E2B
@@ -111,11 +122,10 @@ scripts/smoke_tb3.sh \
   --job-name nexau-n2-pro-frontier-compose
 ```
 
-两个模式会自动加入对应的 Harbor 题名过滤器并选择 environment：`--non-compose-only`
+两个手工模式会自动加入对应的 Harbor 题名过滤器并选择 environment：`--non-compose-only`
 使用 `NexAUE2BEnvironment`，`--compose-only` 使用 `NexAUE2BDinDEnvironment`。它们只针对
 固定的 CPU68 任务集合，不修改缓存中的原题；为了避免筛选或路由互相覆盖，启用分组模式时
-不要再显式传 `--env`、`--include-task-name` 或 `--exclude-task-name`。两个 job 相互独立，
-可以分别放在 tmux 窗口中运行。
+不要再显式传 `--env`、`--include-task-name` 或 `--exclude-task-name`。
 
 如果 Harbor Hub 暂时无法解析固定的 TB3 digest，但任务已经缓存到本机，可以直接绕过
 Hub 使用本地任务目录：
@@ -158,7 +168,7 @@ E2B_API_KEY=...
 
 只运行确定不含 Compose sidecar 的单容器题时，也可以改回
 `nexau_harbor.e2b_environment:NexAUE2BEnvironment`。DinD adapter 仍能把普通单容器题包装为
-仅含 `main` 的 Compose project，但整套 CPU68 默认推荐使用上面的两个分组模式，避免普通题
+仅含 `main` 的 Compose project，但整套 CPU68 默认推荐使用上面的自动分组模式，避免普通题
 承担不必要的 DinD 镜像拉取、磁盘和启动开销。
 
 此后仍直接运行 `scripts/smoke_tb3.sh`；命令行显式传入的 `--env`/`-e` 会覆盖
