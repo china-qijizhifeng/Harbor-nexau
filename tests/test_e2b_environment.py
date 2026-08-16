@@ -22,6 +22,7 @@ from nexau_harbor.e2b_environment import (
     E2B_MAX_LIFETIME_ENV,
     E2B_NO_PROXY_HOSTS_ENV,
     E2B_SANDBOX_TIMEOUT_SEC,
+    E2B_START_RAMP_DELAY_ENV,
     NexAUE2BEnvironment,
 )
 
@@ -459,6 +460,33 @@ def test_environment_kwarg_takes_precedence_over_env(monkeypatch) -> None:
     assert environment._max_lifetime_sec == 1_800
 
 
+def test_start_ramp_delay_defaults_to_env_and_accepts_kwarg(monkeypatch) -> None:
+    monkeypatch.setenv(E2B_START_RAMP_DELAY_ENV, "5")
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b.E2BEnvironment,
+        "__init__",
+        lambda self, *args, **kwargs: None,
+    )
+
+    from_env = NexAUE2BEnvironment()
+    from_kwarg = NexAUE2BEnvironment(e2b_start_ramp_delay_sec="2.5")
+
+    assert from_env._e2b_start_ramp_delay_sec == 5
+    assert from_kwarg._e2b_start_ramp_delay_sec == 2.5
+
+
+@pytest.mark.parametrize("value", [-1, "invalid", True, float("inf")])
+def test_start_ramp_delay_rejects_invalid_values(value, monkeypatch) -> None:
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b.E2BEnvironment,
+        "__init__",
+        lambda self, *args, **kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match=E2B_START_RAMP_DELAY_ENV):
+        NexAUE2BEnvironment(e2b_start_ramp_delay_sec=value)
+
+
 def test_environment_merges_configured_hosts_into_both_no_proxy_spellings(
     monkeypatch,
 ) -> None:
@@ -526,6 +554,8 @@ async def test_create_sandbox_uses_and_renews_one_hour_timeout(monkeypatch) -> N
         create,
     )
     monkeypatch.setattr(e2b_environment, "E2B_KEEPALIVE_INTERVAL_SEC", 0.001)
+    reserve_start = MagicMock(return_value=0.0)
+    monkeypatch.setattr(e2b_environment, "_reserve_sandbox_start_delay", reserve_start)
 
     environment = object.__new__(NexAUE2BEnvironment)
     environment.environment_name = "terminal-bench-task"
@@ -535,6 +565,7 @@ async def test_create_sandbox_uses_and_renews_one_hour_timeout(monkeypatch) -> N
     environment._persistent_env = {"TRIAL_ENV": "trial"}
     environment._network_policy = NetworkPolicy(network_mode=NetworkMode.PUBLIC)
     environment._max_lifetime_sec = E2B_DEFAULT_MAX_LIFETIME_SEC
+    environment._e2b_start_ramp_delay_sec = 5
     environment._keepalive_task = None
     environment._keepalive_deadline = None
     environment.logger = logging.getLogger("test-e2b-keepalive")
@@ -556,6 +587,7 @@ async def test_create_sandbox_uses_and_renews_one_hour_timeout(monkeypatch) -> N
             network=None,
         )
         assert sandbox.set_timeout.await_count >= 2
+        reserve_start.assert_called_once_with(5)
         assert E2B_SANDBOX_TIMEOUT_SEC == 3_600
         assert E2B_KEEPALIVE_INTERVAL_SEC == 60
     finally:
@@ -578,6 +610,7 @@ async def test_initial_lease_does_not_exceed_smaller_lifetime_cap(monkeypatch) -
     environment._persistent_env = {}
     environment._network_policy = NetworkPolicy(network_mode=NetworkMode.PUBLIC)
     environment._max_lifetime_sec = 1_800
+    environment._e2b_start_ramp_delay_sec = 0
     environment._keepalive_task = None
     environment._keepalive_deadline = None
     environment.logger = logging.getLogger("test-e2b-short-cap")

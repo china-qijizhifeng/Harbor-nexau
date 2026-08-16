@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import math
 import os
 import re
 import shlex
 import tempfile
-import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import override
@@ -74,10 +71,10 @@ from nexau_harbor.e2b_environment import (
     _detached_command_wrapper,
     _detached_exec_paths,
     _DetachedExecPaths,
+    _reserve_sandbox_start_delay,
 )
 
 E2B_DIND_TEMPLATE_ENV = "HARBOR_NEXAU_E2B_DIND_TEMPLATE"
-E2B_START_RAMP_DELAY_ENV = "HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC"
 E2B_DIND_DEFAULT_TEMPLATE = f"{TEMPLATE_NAME}:{TEMPLATE_VERSION}"
 E2B_DIND_DEFAULT_STORAGE_CAPACITY_MB = 41_062
 
@@ -97,8 +94,6 @@ _HOST_DETACHED_STATE_ROOT = PurePosixPath("/tmp/harbor-nexau-exec")
 _COMPOSE_BUILD_MAX_ATTEMPTS = 3
 _COMPOSE_BUILD_RETRY_BASE_DELAY_SEC = 5
 
-_sandbox_start_lock = threading.Lock()
-_next_sandbox_start_at = 0.0
 _agent_trace_download_slots = asyncio.Semaphore(_AGENT_TRACE_DOWNLOAD_CONCURRENCY)
 _TRANSIENT_DOCKER_BUILD_ERROR = re.compile(
     r"(?:unexpected eof|short read|connection reset|tls handshake timeout|"
@@ -132,32 +127,6 @@ def _positive_int(value: int | str, *, name: str) -> int:
     if resolved <= 0:
         raise ValueError(f"{name} must be positive, got {resolved}")
     return resolved
-
-
-def _nonnegative_float(value: int | float | str, *, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float | str):
-        raise ValueError(f"{name} must be a finite non-negative number")
-    try:
-        resolved = float(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a finite non-negative number, got {value!r}") from exc
-    if not math.isfinite(resolved) or resolved < 0:
-        raise ValueError(f"{name} must be a finite non-negative number, got {value!r}")
-    return resolved
-
-
-def _reserve_sandbox_start_delay(ramp_delay_sec: float) -> float:
-    """Reserve one process-wide E2B creation slot and return its wait time."""
-
-    global _next_sandbox_start_at
-
-    if ramp_delay_sec <= 0:
-        return 0.0
-    with _sandbox_start_lock:
-        now = time.monotonic()
-        start_at = max(now, _next_sandbox_start_at)
-        _next_sandbox_start_at = start_at + ramp_delay_sec
-    return max(0.0, start_at - now)
 
 
 def _is_transient_docker_build_error(result: ExecResult) -> bool:
@@ -825,18 +794,14 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
             compose_up_timeout_sec,
             name="compose_up_timeout_sec",
         )
-        self._e2b_start_ramp_delay_sec = _nonnegative_float(
-            (
-                e2b_start_ramp_delay_sec
-                if e2b_start_ramp_delay_sec is not None
-                else os.environ.get(E2B_START_RAMP_DELAY_ENV, "0")
-            ),
-            name=E2B_START_RAMP_DELAY_ENV,
-        )
         self._compose_files_staged = False
         self._pending_agent_log_download: _PendingAgentLogDownload | None = None
 
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args,
+            e2b_start_ramp_delay_sec=e2b_start_ramp_delay_sec,
+            **kwargs,
+        )
         self._template_name = self._dind_template
         self._workdir = None
         self._compose = _E2BDinDCompose(self)

@@ -202,3 +202,75 @@ def test_smoke_script_rejects_invalid_start_ramp_delay(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "finite non-negative number" in result.stderr
+
+
+def test_smoke_script_selects_compose_partition_and_dind_environment(
+    tmp_path: Path,
+) -> None:
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--compose-only",
+        "--path",
+        "/tmp/frontier-bench-cpu68",
+    )
+
+    assert result.returncode == 0, result.stderr
+    arguments = result.stdout.splitlines()
+    environment_index = arguments.index("--env")
+    assert (
+        arguments[environment_index + 1]
+        == "nexau_harbor.e2b_dind_environment:NexAUE2BDinDEnvironment"
+    )
+    assert arguments.count("--include-task-name") == 33
+    assert "--exclude-task-name" not in arguments
+    assert "ctr-optimization" in arguments
+    assert "*/ctr-optimization" in arguments
+    assert "bc62e2e43cf5c91f63442cd787d82fc4765461c0b4fd06cab76ac4322c13dbff" in arguments
+    assert "--compose-only" not in arguments
+    assert "TB3 partition: compose tasks" in result.stderr
+
+
+def test_smoke_script_selects_non_compose_partition_and_plain_e2b_environment(
+    tmp_path: Path,
+) -> None:
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--non-compose-only",
+        "--path",
+        "/tmp/frontier-bench-cpu68",
+    )
+
+    assert result.returncode == 0, result.stderr
+    arguments = result.stdout.splitlines()
+    environment_index = arguments.index("--env")
+    assert arguments[environment_index + 1] == "nexau_harbor.e2b_environment:NexAUE2BEnvironment"
+    assert arguments.count("--exclude-task-name") == 33
+    assert "--include-task-name" not in arguments
+    assert "nextjs-performance" in arguments
+    assert "*/nextjs-performance" in arguments
+    assert "7bea6536709f9c63cb7917804dfdb4210086bf9a23b26c0afc2b70ba254a4232" in arguments
+    assert "--non-compose-only" not in arguments
+    assert "TB3 partition: non-compose tasks" in result.stderr
+
+
+def test_smoke_script_rejects_multiple_task_partitions(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--compose-only",
+        "--non-compose-only",
+    )
+
+    assert result.returncode == 2
+    assert "mutually exclusive" in result.stderr
+
+
+def test_smoke_script_partition_rejects_explicit_environment(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--non-compose-only",
+        "--env",
+        "docker",
+    )
+
+    assert result.returncode == 2
+    assert "partition flags own --env and task-name filters" in result.stderr

@@ -20,10 +20,62 @@ agent_config="${HARBOR_NEXAU_CONFIG_PATH:-$project_root/src/nexau_harbor/configs
 trace_mode=0
 trace_timeout_sec="${HARBOR_NEXAU_TRACE_TIMEOUT_SEC:-72000}"
 e2b_start_ramp_delay_sec="${HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC:-0}"
+task_partition=""
 forwarded_args=()
+
+single_e2b_environment="nexau_harbor.e2b_environment:NexAUE2BEnvironment"
+compose_e2b_environment="nexau_harbor.e2b_dind_environment:NexAUE2BDinDEnvironment"
+
+# Compose tasks in the pinned 68-task CPU-only Frontier Bench/TB3 dataset.
+# Harbor task-name filters keep the original task directories untouched.
+compose_task_names=(
+  ctr-optimization
+  cumulative-layout-shift
+  erp-procurement-planning
+  freight-dispatch-shift
+  heat-pump-warranty
+  intrastat-meldung
+  kv-live-surgery
+  legacy-utility-triage
+  medical-claims-processing
+  nextjs-performance
+  payments-pipeline-fix
+)
+
+# Harbor resolves symlinked local dataset entries before applying name filters,
+# so the pinned local CPU68 dataset is identified by task digest instead.
+compose_task_digests=(
+  bc62e2e43cf5c91f63442cd787d82fc4765461c0b4fd06cab76ac4322c13dbff
+  486e3bf5f0fee96a841fa70d63ddcb42bca33ca3393541723760666d4b0f501d
+  97bb615dc2dfcaab20c780db1ea07af53367bf48222f61e8dfd2b6fae448ff76
+  aadc8a256b8ed0f9f7d0d2b9ce1aa36cc63ea08b5599848339eab24511b0a5ea
+  2b9d29e4fc9d132fd010d90e62407bea182ac1826849c46932617400471873cd
+  842c2e5b4e5e735f32d85bd8f8b5dde3ea5191cd90ee2ea73792986c7b09590a
+  5aa5d33e15bfe9269c4cb03d8fe950e54132ad0b82bc2d55ad72775a6627e1a2
+  a61381597247d50df44c6f730767308af1be3da462904cb9d6fb17ae83fbf381
+  9f7545eab64bb70b3f787c37040ce6eb537b4dc9c43956a45444dfc43c89c6f3
+  7bea6536709f9c63cb7917804dfdb4210086bf9a23b26c0afc2b70ba254a4232
+  4d3967affa31a3f0f5e146288b74df0532380bdcdff1669df6d10e80c85bd127
+)
 
 while (($# > 0)); do
   case "$1" in
+    --compose-only)
+      if [[ -n "$task_partition" ]]; then
+        printf '%s\n' '--compose-only and --non-compose-only are mutually exclusive' >&2
+        exit 2
+      fi
+      task_partition="compose"
+      shift
+      ;;
+    --non-compose-only)
+      if [[ -n "$task_partition" ]]; then
+        printf '%s\n' '--compose-only and --non-compose-only are mutually exclusive' >&2
+        exit 2
+      fi
+      task_partition="non-compose"
+      shift
+      ;;
     --trace-mode)
       trace_mode=1
       shift
@@ -61,6 +113,48 @@ while (($# > 0)); do
   esac
 done
 set -- "${forwarded_args[@]}"
+
+partition_args=()
+if [[ -n "$task_partition" ]]; then
+  for argument in "$@"; do
+    case "$argument" in
+      --env | --env=* | -e | --include-task-name | --include-task-name=* | -i | \
+        --exclude-task-name | --exclude-task-name=* | -x)
+        printf '%s\n' \
+          'The Compose partition flags own --env and task-name filters; remove the explicit override.' >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  for task_name in "${compose_task_names[@]}"; do
+    if [[ "$task_partition" == "compose" ]]; then
+      partition_args+=(
+        --include-task-name "$task_name"
+        --include-task-name "*/$task_name"
+      )
+    else
+      partition_args+=(
+        --exclude-task-name "$task_name"
+        --exclude-task-name "*/$task_name"
+      )
+    fi
+  done
+  for task_digest in "${compose_task_digests[@]}"; do
+    if [[ "$task_partition" == "compose" ]]; then
+      partition_args+=(--include-task-name "$task_digest")
+    else
+      partition_args+=(--exclude-task-name "$task_digest")
+    fi
+  done
+
+  if [[ "$task_partition" == "compose" ]]; then
+    environment="$compose_e2b_environment"
+  else
+    environment="$single_e2b_environment"
+  fi
+  printf 'TB3 partition: %s tasks using %s.\n' "$task_partition" "$environment" >&2
+fi
 
 if [[ "$trace_mode" == "1" && ! "$trace_timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
   printf 'Trace timeout must be a positive integer, got: %s\n' "$trace_timeout_sec" >&2
@@ -151,6 +245,7 @@ if [[ "$trace_mode" == "1" ]]; then
   "${harbor_command[@]}" run \
     --config "$trace_config" \
     "${task_source_args[@]}" \
+    "${partition_args[@]}" \
     "${environment_args[@]}" \
     --n-tasks "${HARBOR_NEXAU_N_TASKS:-1}" \
     --n-concurrent "${HARBOR_NEXAU_CONCURRENCY:-1}" \
@@ -160,6 +255,7 @@ fi
 
 exec "${harbor_command[@]}" run \
   "${task_source_args[@]}" \
+  "${partition_args[@]}" \
   --agent nexau_harbor.agent:NexAUAgent \
   --agent-kwarg "config_path=$agent_config" \
   --model "$model" \

@@ -1,9 +1,12 @@
 """E2B compatibility environment for Harbor 0.21.x."""
 
 import asyncio
+import math
 import os
 import re
 import shlex
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import override
@@ -22,12 +25,15 @@ E2B_KEEPALIVE_INTERVAL_SEC = 60
 E2B_DEFAULT_MAX_LIFETIME_SEC = 24 * 60 * 60
 E2B_MAX_LIFETIME_ENV = "HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC"
 E2B_NO_PROXY_HOSTS_ENV = "HARBOR_NEXAU_NO_PROXY_HOSTS"
+E2B_START_RAMP_DELAY_ENV = "HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC"
 E2B_DETACHED_POLL_INTERVAL_SEC = 30
 E2B_DETACHED_REQUEST_TIMEOUT_SEC = 30
 E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS = 5
 
 _DETACHED_STATUS_PREFIX = "__HARBOR_NEXAU_STATUS__:"
 _MISSING_DEFAULT_TEMPLATE_TAG = "tag 'default' does not exist for template"
+_sandbox_start_lock = threading.Lock()
+_next_sandbox_start_at = 0.0
 
 _DOCKERFILE_FROM_PATTERN = re.compile(
     r"^[ \t]*FROM(?:[ \t]+--platform=\S+)?[ \t]+(?P<image>\S+)",
@@ -161,6 +167,39 @@ def _resolve_max_lifetime_sec(configured: int | str | None) -> int:
     return max_lifetime_sec
 
 
+def _resolve_start_ramp_delay_sec(configured: int | float | str | None) -> float:
+    raw_value: object = configured
+    if raw_value is None:
+        raw_value = os.environ.get(E2B_START_RAMP_DELAY_ENV, "0")
+    if isinstance(raw_value, bool) or not isinstance(raw_value, int | float | str):
+        raise ValueError(f"{E2B_START_RAMP_DELAY_ENV} must be a finite non-negative number")
+    try:
+        resolved = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{E2B_START_RAMP_DELAY_ENV} must be a finite non-negative number, got {raw_value!r}"
+        ) from exc
+    if not math.isfinite(resolved) or resolved < 0:
+        raise ValueError(
+            f"{E2B_START_RAMP_DELAY_ENV} must be a finite non-negative number, got {raw_value!r}"
+        )
+    return resolved
+
+
+def _reserve_sandbox_start_delay(ramp_delay_sec: float) -> float:
+    """Reserve one process-wide E2B creation slot and return its wait time."""
+
+    global _next_sandbox_start_at
+
+    if ramp_delay_sec <= 0:
+        return 0.0
+    with _sandbox_start_lock:
+        now = time.monotonic()
+        start_at = max(now, _next_sandbox_start_at)
+        _next_sandbox_start_at = start_at + ramp_delay_sec
+    return max(0.0, start_at - now)
+
+
 def _merge_configured_no_proxy_hosts() -> None:
     """Append configured direct-connect hosts to both conventional spellings."""
 
@@ -206,10 +245,12 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         self,
         *args,
         max_lifetime_sec: int | str | None = None,
+        e2b_start_ramp_delay_sec: int | float | str | None = None,
         **kwargs,
     ) -> None:
         _merge_configured_no_proxy_hosts()
         self._max_lifetime_sec = _resolve_max_lifetime_sec(max_lifetime_sec)
+        self._e2b_start_ramp_delay_sec = _resolve_start_ramp_delay_sec(e2b_start_ramp_delay_sec)
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_deadline: float | None = None
         super().__init__(*args, **kwargs)
@@ -594,6 +635,13 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
     )
     @override
     async def _create_sandbox(self) -> None:
+        ramp_wait_sec = _reserve_sandbox_start_delay(self._e2b_start_ramp_delay_sec)
+        if ramp_wait_sec > 0:
+            self.logger.info(
+                "Staggering E2B sandbox creation by %.1f seconds",
+                ramp_wait_sec,
+            )
+            await asyncio.sleep(ramp_wait_sec)
         metadata = {
             "environment_name": self.environment_name,
             "session_id": self.session_id,

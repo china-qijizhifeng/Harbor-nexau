@@ -87,6 +87,36 @@ trace 模式通过 Harbor 的 `agent.override_timeout_sec` 覆盖每道题自己
 `--agent-timeout-multiplier`。Terminal-Bench profile 的 500 次迭代上限仍然生效。已经启动的
 job 无法动态切换到 trace 模式。
 
+CPU-only 的 68 题建议拆成两个独立 job，不再让普通单容器题承担 DinD 的额外开销：
+
+```bash
+# 57 道非 Compose 题：普通 E2B
+scripts/smoke_tb3.sh \
+  --trace-mode \
+  --non-compose-only \
+  --path /root/.cache/harbor/tasks/local-datasets/frontier-bench-cpu68-20260813 \
+  --n-tasks 57 \
+  --n-concurrent 57 \
+  --e2b-start-ramp-delay-sec 5 \
+  --job-name nexau-n2-pro-frontier-non-compose
+
+# 11 道 Compose 题：harbor-nexau-dind
+scripts/smoke_tb3.sh \
+  --trace-mode \
+  --compose-only \
+  --path /root/.cache/harbor/tasks/local-datasets/frontier-bench-cpu68-20260813 \
+  --n-tasks 11 \
+  --n-concurrent 11 \
+  --e2b-start-ramp-delay-sec 5 \
+  --job-name nexau-n2-pro-frontier-compose
+```
+
+两个模式会自动加入对应的 Harbor 题名过滤器并选择 environment：`--non-compose-only`
+使用 `NexAUE2BEnvironment`，`--compose-only` 使用 `NexAUE2BDinDEnvironment`。它们只针对
+固定的 CPU68 任务集合，不修改缓存中的原题；为了避免筛选或路由互相覆盖，启用分组模式时
+不要再显式传 `--env`、`--include-task-name` 或 `--exclude-task-name`。两个 job 相互独立，
+可以分别放在 tmux 窗口中运行。
+
 如果 Harbor Hub 暂时无法解析固定的 TB3 digest，但任务已经缓存到本机，可以直接绕过
 Hub 使用本地任务目录：
 
@@ -127,8 +157,9 @@ E2B_API_KEY=...
 ```
 
 只运行确定不含 Compose sidecar 的单容器题时，也可以改回
-`nexau_harbor.e2b_environment:NexAUE2BEnvironment`。DinD adapter 会把普通单容器题也作为
-仅含 `main` 的 Compose project 运行，因此测试整套混合数据集时无需逐题切换 environment。
+`nexau_harbor.e2b_environment:NexAUE2BEnvironment`。DinD adapter 仍能把普通单容器题包装为
+仅含 `main` 的 Compose project，但整套 CPU68 默认推荐使用上面的两个分组模式，避免普通题
+承担不必要的 DinD 镜像拉取、磁盘和启动开销。
 
 此后仍直接运行 `scripts/smoke_tb3.sh`；命令行显式传入的 `--env`/`-e` 会覆盖
 `HARBOR_NEXAU_ENV`。仓库内的 E2B environment 使用 3600 秒租期，避免 Harbor 0.21.x

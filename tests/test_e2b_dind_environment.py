@@ -106,10 +106,10 @@ def test_sandbox_start_slots_are_reserved_at_the_configured_interval(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "nexau_harbor.e2b_dind_environment._next_sandbox_start_at",
+        "nexau_harbor.e2b_environment._next_sandbox_start_at",
         0.0,
     )
-    monkeypatch.setattr("nexau_harbor.e2b_dind_environment.time.monotonic", lambda: 100.0)
+    monkeypatch.setattr("nexau_harbor.e2b_environment.time.monotonic", lambda: 100.0)
 
     assert _reserve_sandbox_start_delay(5) == 0
     assert _reserve_sandbox_start_delay(5) == 5
