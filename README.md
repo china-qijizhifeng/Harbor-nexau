@@ -7,6 +7,8 @@ Harbor 的 `Task`、`Trial`、Registry 等核心代码：
 - `uv.lock` 固定每次实际运行的完整依赖版本。
 - NexAU 固定为 v0.4.0 对应的 commit
   `114c537dce877c5b521b5c33cc20d6001403ee92`。
+- runner 会为该版本缺少上限的 LLM 指数退避增加 30 秒硬上限和 25% jitter；可用
+  `NEXAU_LLM_RETRY_BACKOFF_MAX_SEC`、`NEXAU_LLM_RETRY_BACKOFF_JITTER_RATIO` 调整。
 - `nexau_harbor.agent:NexAUAgent` 是官方 `BaseInstalledAgent` 的外部实现。
 - 旧 `harbor-LJH` 中的 GDPval/TB system prompt、6 工具配置、上下文压缩和
   NexAU history -> ATIF 轨迹转换被迁移到本包；旧 Harbor 核心未迁移。

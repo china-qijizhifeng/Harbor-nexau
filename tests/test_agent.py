@@ -71,6 +71,8 @@ def test_agent_uses_packaged_config_and_harbor_model_connection(tmp_path: Path) 
     assert runtime_env["LLM_API_KEY"] == "test-key"
     assert runtime_env["LLM_BASE_URL"] == "https://example.test/v1"
     assert runtime_env["NEXAU_TRACE_CHECKPOINT_SEC"] == "30"
+    assert runtime_env["NEXAU_LLM_RETRY_BACKOFF_MAX_SEC"] == "30"
+    assert runtime_env["NEXAU_LLM_RETRY_BACKOFF_JITTER_RATIO"] == "0.25"
     assert runtime_env["GDPVAL_NEXAU_SUMMARY_MODEL"] == "gpt-5"
 
 

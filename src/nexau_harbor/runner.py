@@ -4,11 +4,14 @@ import argparse
 import json
 import math
 import os
+import random
 import re
 import sys
 import threading
 import traceback
+from collections.abc import Callable
 from datetime import datetime
+from inspect import signature
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -18,6 +21,88 @@ from nexau.archs.tracer.core import BaseTracer, Span, SpanType
 _DEFAULT_TRACE_CHECKPOINT_SEC = 30.0
 _TRACE_CHECKPOINT_ENV = "NEXAU_TRACE_CHECKPOINT_SEC"
 _TRACE_EVENTS_NAME = "nexau_trace_events.jsonl"
+_RETRY_BACKOFF_MAX_ENV = "NEXAU_LLM_RETRY_BACKOFF_MAX_SEC"
+_RETRY_BACKOFF_JITTER_ENV = "NEXAU_LLM_RETRY_BACKOFF_JITTER_RATIO"
+_DEFAULT_RETRY_BACKOFF_MAX_SEC = 30.0
+_DEFAULT_RETRY_BACKOFF_JITTER_RATIO = 0.25
+
+
+def _float_env(
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float | None = None,
+) -> float:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+    if not math.isfinite(value) or value < minimum or (maximum is not None and value > maximum):
+        expected = f">= {minimum:g}"
+        if maximum is not None:
+            expected += f" and <= {maximum:g}"
+        raise ValueError(f"{name} must be finite and {expected}, got {raw!r}")
+    return value
+
+
+class _CappedRetryTime:
+    """Proxy NexAU's retry clock without changing process-wide ``time.sleep``."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        max_delay_sec: float,
+        jitter_ratio: float,
+        uniform: Callable[[float, float], float] = random.uniform,
+    ) -> None:
+        self._delegate = delegate
+        self._max_delay_sec = max_delay_sec
+        self._jitter_ratio = jitter_ratio
+        self._uniform = uniform
+
+    def sleep(self, seconds: float) -> None:
+        delay = max(0.0, float(seconds))
+        if delay and self._jitter_ratio:
+            delay *= self._uniform(
+                1.0 - self._jitter_ratio,
+                1.0 + self._jitter_ratio,
+            )
+        self._delegate.sleep(min(delay, self._max_delay_sec))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+
+def _install_legacy_retry_backoff_guard() -> bool:
+    """Cap retry sleeps for pinned NexAU versions without native backoff control."""
+
+    from nexau.archs.main_sub.execution import llm_caller
+
+    if "retry_backoff_max_seconds" in signature(llm_caller.LLMCaller).parameters:
+        return False
+    if isinstance(llm_caller.time, _CappedRetryTime):
+        return False
+
+    max_delay_sec = _float_env(
+        _RETRY_BACKOFF_MAX_ENV,
+        _DEFAULT_RETRY_BACKOFF_MAX_SEC,
+        minimum=0.0,
+    )
+    jitter_ratio = _float_env(
+        _RETRY_BACKOFF_JITTER_ENV,
+        _DEFAULT_RETRY_BACKOFF_JITTER_RATIO,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    llm_caller.time = _CappedRetryTime(
+        llm_caller.time,
+        max_delay_sec=max_delay_sec,
+        jitter_ratio=jitter_ratio,
+    )
+    return True
 
 
 def _ensure_config_dir_on_sys_path(config_path: Path) -> None:
@@ -151,6 +236,7 @@ def _build_agent(config_path: Path, trace_path: Path | None = None) -> Any:
     from nexau.archs.main_sub.config.config import AgentConfigBuilder
     from nexau.archs.main_sub.config.schema import normalize_agent_config_dict
 
+    _install_legacy_retry_backoff_guard()
     _ensure_config_dir_on_sys_path(config_path)
     normalized_config = normalize_agent_config_dict(_load_raw_config(config_path))
     normalized_config = _normalize_reasoning_config(normalized_config)

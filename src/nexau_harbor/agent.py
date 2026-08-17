@@ -84,6 +84,8 @@ class NexAUAgent(BaseInstalledAgent):
     _FORWARDED_EXACT = (
         "HTTP_PROXY",
         "HTTPS_PROXY",
+        "NEXAU_LLM_RETRY_BACKOFF_JITTER_RATIO",
+        "NEXAU_LLM_RETRY_BACKOFF_MAX_SEC",
         "NEXAU_TRACE_CHECKPOINT_SEC",
         "NO_PROXY",
         "SERPER_API_KEY",
@@ -246,6 +248,12 @@ class NexAUAgent(BaseInstalledAgent):
                 "LLM_MAX_TOKENS": env.get("LLM_MAX_TOKENS", "32000"),
                 "LLM_TIMEOUT_SEC": env.get("LLM_TIMEOUT_SEC", "600"),
                 "LLM_MAX_RETRIES": env.get("LLM_MAX_RETRIES", "3"),
+                "NEXAU_LLM_RETRY_BACKOFF_MAX_SEC": env.get(
+                    "NEXAU_LLM_RETRY_BACKOFF_MAX_SEC", "30"
+                ),
+                "NEXAU_LLM_RETRY_BACKOFF_JITTER_RATIO": env.get(
+                    "NEXAU_LLM_RETRY_BACKOFF_JITTER_RATIO", "0.25"
+                ),
                 "NEXAU_TRACE_CHECKPOINT_SEC": env.get(
                     "NEXAU_TRACE_CHECKPOINT_SEC", "30"
                 ),

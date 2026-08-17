@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from nexau.archs.tracer.core import SpanType
 
 from nexau_harbor import runner
@@ -39,6 +40,59 @@ class FakeAgent:
 class FailingAgent(FakeAgent):
     def run(self, *, message: str, context: dict[str, Any]) -> str:
         raise RuntimeError("simulated agent failure")
+
+
+class _FakeTime:
+    def __init__(self) -> None:
+        self.sleeps: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
+    def time(self) -> float:
+        return 123.0
+
+
+def test_retry_time_caps_jittered_delay_without_patching_global_time() -> None:
+    delegate = _FakeTime()
+    retry_time = runner._CappedRetryTime(
+        delegate,
+        max_delay_sec=30,
+        jitter_ratio=0.25,
+        uniform=lambda _start, _end: 1.25,
+    )
+
+    retry_time.sleep(10)
+    retry_time.sleep(600)
+
+    assert delegate.sleeps == [12.5, 30]
+    assert retry_time.time() == 123.0
+
+
+def test_pinned_nexau_installs_retry_backoff_guard(monkeypatch) -> None:
+    from nexau.archs.main_sub.execution import llm_caller
+
+    delegate = _FakeTime()
+    monkeypatch.setattr(llm_caller, "time", delegate)
+    monkeypatch.setenv("NEXAU_LLM_RETRY_BACKOFF_MAX_SEC", "30")
+    monkeypatch.setenv("NEXAU_LLM_RETRY_BACKOFF_JITTER_RATIO", "0")
+
+    assert runner._install_legacy_retry_backoff_guard()
+    assert isinstance(llm_caller.time, runner._CappedRetryTime)
+
+    llm_caller.time.sleep(600)
+
+    assert delegate.sleeps == [30]
+
+
+def test_retry_backoff_guard_rejects_invalid_configuration(monkeypatch) -> None:
+    from nexau.archs.main_sub.execution import llm_caller
+
+    monkeypatch.setattr(llm_caller, "time", _FakeTime())
+    monkeypatch.setenv("NEXAU_LLM_RETRY_BACKOFF_MAX_SEC", "not-a-number")
+
+    with pytest.raises(ValueError, match="NEXAU_LLM_RETRY_BACKOFF_MAX_SEC"):
+        runner._install_legacy_retry_backoff_guard()
 
 
 def test_running_checkpoint_is_atomic_and_self_describing(tmp_path: Path) -> None:
