@@ -56,9 +56,9 @@ def test_terminal_bench_config_references_only_tb_assets() -> None:
         "max_context_tokens": "${env.LLM_CONTEXT_WINDOW_TOKENS}",
         "auto_compact": True,
         "threshold": 0.55,
-        "compaction_strategy": "tool_result_compaction",
-        "keep_iterations": 8,
-        "retry_attempts": 20,
+        "compaction_strategy": "llm_summary",
+        "keep_iterations": 4,
+        "retry_attempts": 3,
     }
     assert "gdpval" not in config_path.read_text().lower()
     for tool in config["tools"]:
@@ -96,6 +96,13 @@ def test_nexau_builds_terminal_bench_config_with_full_trace(monkeypatch, tmp_pat
         "LongToolOutputMiddleware",
         "ContextCompactionMiddleware",
     ]
+    compaction = agent.config.middlewares[1]
+    assert compaction.trigger_strategy.threshold == 0.55
+    assert compaction.compaction_strategy.__class__.__name__ == "SlidingWindowCompaction"
+    assert compaction.compaction_strategy.keep_iterations == 4
+    assert compaction.compaction_strategy.retry_attempts == 3
+    assert compaction.compaction_strategy.summary_llm_config.model == "nex-agi/Nex-N2-Pro"
+    assert compaction.compaction_strategy.summary_llm_config.api_type == "openai_responses"
     assert agent.config.resolved_tracer.__class__.__name__ == "InMemoryTracer"
     assert hasattr(agent, "full_trace")
     assert agent.config.llm_config.stream is False

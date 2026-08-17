@@ -2,8 +2,8 @@ type: agent
 name: nexau_terminal_bench_agent
 description: NexAU coding agent profile for Terminal-Bench evaluations.
 
-# Terminal-Bench uses long autonomous runs. Compact early enough to leave room
-# for a complete model response while retaining the most recent tool context.
+# Terminal-Bench uses long autonomous runs. Summarize older reasoning, tool calls,
+# and tool results while retaining the most recent working context.
 max_iterations: 500
 max_context_tokens: ${env.LLM_CONTEXT_WINDOW_TOKENS}
 retry_attempts: 20
@@ -61,9 +61,9 @@ middlewares:
       max_context_tokens: ${env.LLM_CONTEXT_WINDOW_TOKENS}
       auto_compact: true
       threshold: 0.55
-      compaction_strategy: tool_result_compaction
-      keep_iterations: 8
-      retry_attempts: 20
+      compaction_strategy: llm_summary
+      keep_iterations: 4
+      retry_attempts: 3
 
 # runner.py injects an append-only JSONL tracer for Harbor runs. Direct config
 # construction falls back to NexAU's in-memory tracer for compatibility.
