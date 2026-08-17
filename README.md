@@ -101,8 +101,8 @@ Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbo
 清理流程最多 90 秒后再强制终止。
 
 trace 模式通过 Harbor 的 `agent.override_timeout_sec` 覆盖每道题自己的 Agent timeout，
-默认统一为 72000 秒（20 小时）。这不是基础设施层面的无限运行：当前 E2B 最大生命周期仍为
-86400 秒，默认预留的 4 小时用于环境构建、verifier、artifact 和 trace 下载，避免 sandbox
+默认统一为 36000 秒（10 小时）。这不是基础设施层面的无限运行：当前 E2B 最大生命周期仍为
+86400 秒，默认预留的 14 小时用于环境构建、verifier、artifact 和 trace 下载，避免 sandbox
 先被回收而丢失轨迹。可以用 `HARBOR_NEXAU_TRACE_TIMEOUT_SEC` 或
 `--trace-timeout-sec SECONDS` 调整该值；切换模型仍通过 `HARBOR_NEXAU_MODEL`，trace 模式下
 不要另外传 `--agent`、`--model`、`--config`、`--timeout-multiplier` 或

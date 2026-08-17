@@ -241,11 +241,11 @@ def test_smoke_script_trace_mode_overrides_task_timeout(tmp_path: Path) -> None:
         "agents:\n"
         "  - name: 'nexau_harbor.agent:NexAUAgent'\n"
         "    model_name: 'openai/nex-agi/Nex-N2-Pro'\n"
-        "    override_timeout_sec: 72000\n"
+        "    override_timeout_sec: 36000\n"
         "    kwargs:\n"
         f"      config_path: '{_DEFAULT_TB_CONFIG}'\n"
     )
-    assert "replaced with 72000 seconds" in result.stderr
+    assert "replaced with 36000 seconds" in result.stderr
 
 
 def test_smoke_script_trace_mode_accepts_explicit_timeout(tmp_path: Path) -> None:
