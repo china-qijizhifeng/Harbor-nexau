@@ -423,7 +423,7 @@ def _dump_history(agent: Any, log_dir: Path) -> None:
 
 
 def _dump_full_trace(agent: Any, log_dir: Path) -> bool:
-    """Persist NexAU's append-only, pre-compaction conversation trace."""
+    """Persist the legacy pre-compaction conversation artifact when available."""
 
     full_trace = getattr(agent, "full_trace", None)
     if callable(full_trace):

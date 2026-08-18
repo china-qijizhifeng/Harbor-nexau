@@ -5,8 +5,8 @@ Harbor 的 `Task`、`Trial`、Registry 等核心代码：
 
 - Harbor 是普通 Python 依赖，兼容范围固定为 `>=0.21.0,<0.22.0`。
 - `uv.lock` 固定每次实际运行的完整依赖版本。
-- NexAU 固定为 v0.4.0 对应的 commit
-  `114c537dce877c5b521b5c33cc20d6001403ee92`。
+- NexAU 固定为 v0.4.1 对应的 commit
+  `265805b86d89081e8ec9f026ee7807d2be0ee853`。
 - runner 会为该版本缺少上限的 LLM 指数退避增加 30 秒硬上限和 25% jitter；可用
   `NEXAU_LLM_RETRY_BACKOFF_MAX_SEC`、`NEXAU_LLM_RETRY_BACKOFF_JITTER_RATIO` 调整。
 - `nexau_harbor.agent:NexAUAgent` 是官方 `BaseInstalledAgent` 的外部实现。
@@ -320,8 +320,9 @@ Anthropic 模型的 `output_config.effort`，以及 Gemini 3+ 的
 
 - `nexau.txt`：NexAU 标准输出和错误输出。
 - `nexau_history.json`：NexAU 最终执行历史，可能包含上下文压缩结果。
-- `nexau_full_trace.json`：NexAU 在压缩前保存的完整对话历史。
-- `nexau_trace_events.jsonl`：运行时逐 span 追加的完整输入、输出、错误和 usage；每个事件写入后
+- `nexau_full_trace.json`：仅在兼容旧版或自定义 NexAU 仍暴露 `Agent.full_trace` 时生成的旧格式
+  对话快照；v0.4.1 不再提供该内存属性。
+- `nexau_trace_events.jsonl`：主轨迹来源；运行时逐 span 追加完整输入、输出、错误和 usage，每个事件写入后
   立即 flush，异常退出时保留到最后一次成功写入。
 - `nexau_in_memory_tracer.json`：Harbor 下载日志后在宿主机从 JSONL 重建的嵌套 span 树；
   文件名保持兼容，但不再由任务容器中的 InMemoryTracer 维护。
@@ -332,8 +333,9 @@ Anthropic 模型的 `output_config.effort`，以及 Gemini 3+ 的
 span 事件不依赖周期 checkpoint，每次 start/end 都会追加。运行期间默认每 30 秒只原子刷新
 轻量的 checkpoint 状态，不再整体序列化 history 和 span 树；可通过
 `NEXAU_TRACE_CHECKPOINT_SEC` 修改状态刷新间隔，设为 `0` 可关闭。正常结束时才写最终 history
-和 full trace，且 ATIF 优先从未压缩的 `nexau_full_trace.json` 生成。若进程被强制终止，
-`nexau_trace_events.jsonl` 仍包含终止前已经落盘的完整 span 事件。
+和 result；若存在旧格式 full trace，ATIF 优先使用它，否则使用最终 history。无论正常结束、
+超时还是进程被强制终止，`nexau_trace_events.jsonl` 都保留终止前已经落盘的完整 span 事件，
+Harbor 下载后据此重建嵌套 span 树。
 
 Harbor 0.21.x 负责从本地或云环境统一下载 `/logs/agent`，随后适配器从上述日志回填
 token/cost context 并生成 ATIF 文件。每道题（每个 attempt）的评分、异常、耗时和 token

@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "harbor>=0.21.0,<0.22.0",
-    "nexau @ git+https://github.com/nex-agi/NexAU.git@114c537dce877c5b521b5c33cc20d6001403ee92",
+    "nexau @ git+https://github.com/nex-agi/NexAU.git@265805b86d89081e8ec9f026ee7807d2be0ee853",
     "python-dotenv>=1.2,<2",
 ]
 

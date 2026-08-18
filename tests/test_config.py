@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from nexau.core.messages import Message, Role
 
 from nexau_harbor.agent import NexAUAgent
 from nexau_harbor.runner import (
@@ -65,7 +66,7 @@ def test_terminal_bench_config_references_only_tb_assets() -> None:
         assert (config_path.parent / tool["yaml_path"]).is_file()
 
 
-def test_nexau_builds_terminal_bench_config_with_full_trace(monkeypatch, tmp_path: Path) -> None:
+def test_nexau_builds_terminal_bench_config(monkeypatch, tmp_path: Path) -> None:
     config_path = _CONFIG_ROOT / "terminal_bench" / "code_agent.yaml"
     integration = NexAUAgent(
         logs_dir=tmp_path,
@@ -104,7 +105,6 @@ def test_nexau_builds_terminal_bench_config_with_full_trace(monkeypatch, tmp_pat
     assert compaction.compaction_strategy.summary_llm_config.model == "nex-agi/Nex-N2-Pro"
     assert compaction.compaction_strategy.summary_llm_config.api_type == "openai_responses"
     assert agent.config.resolved_tracer.__class__.__name__ == "InMemoryTracer"
-    assert hasattr(agent, "full_trace")
     assert agent.config.llm_config.stream is False
     assert agent.config.llm_config.temperature == 0.6
     assert agent.config.llm_config.max_retries == 20
@@ -118,6 +118,52 @@ def test_nexau_builds_terminal_bench_config_with_full_trace(monkeypatch, tmp_pat
     assert agent.config.llm_config.apply_param_drops(
         {"model": "Nex-N2-Pro", "max_tokens": 32000, "max_output_tokens": 32000}
     ) == {"model": "Nex-N2-Pro"}
+
+
+def test_llm_summary_keeps_a_user_message_for_single_turn_agents(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_path = _CONFIG_ROOT / "terminal_bench" / "code_agent.yaml"
+    integration = NexAUAgent(
+        logs_dir=tmp_path,
+        model_name="openai/nex-agi/Nex-N2-Pro",
+        config_path=config_path,
+        extra_env={
+            "LLM_API_KEY": "test-key",
+            "LLM_BASE_URL": "https://example.test/v1",
+            "LLM_KIND": "openai_responses",
+            "LLM_CONTEXT_WINDOW_TOKENS": "200000",
+        },
+    )
+    for name, value in integration._runtime_env().items():
+        monkeypatch.setenv(name, value)
+
+    agent = _build_agent(config_path)
+    strategy = agent.config.middlewares[1].compaction_strategy
+    summary_inputs: list[list[Message]] = []
+
+    def summarize(messages: list[Message]) -> str:
+        summary_inputs.append(messages)
+        return "Original request and completed work summary"
+
+    monkeypatch.setattr(strategy, "_generate_summary_safe", summarize)
+    messages = [Message.user("original terminal-bench request")]
+    messages.extend(Message.assistant(f"tool iteration {index}") for index in range(6))
+
+    compacted = strategy.compact(messages)
+
+    assert summary_inputs
+    assert summary_inputs[0][0].role == Role.USER
+    assert summary_inputs[0][0].get_text_content() == "original terminal-bench request"
+    assert compacted[0].role == Role.USER
+    assert "Original request and completed work summary" in compacted[0].get_text_content()
+    assert [message.get_text_content() for message in compacted[1:]] == [
+        "tool iteration 2",
+        "tool iteration 3",
+        "tool iteration 4",
+        "tool iteration 5",
+    ]
 
 
 def test_harbor_run_replaces_in_memory_tracer_with_jsonl(
@@ -169,7 +215,6 @@ def test_nexau_builds_migrated_config(monkeypatch, tmp_path: Path) -> None:
         "summary": "detailed",
     }
     assert agent.config.resolved_tracer.__class__.__name__ == "ThreadSafeInMemoryTracer"
-    assert hasattr(agent, "full_trace")
     assert "harbor_reasoning_effort" not in agent.config.llm_config.extra_params
 
 

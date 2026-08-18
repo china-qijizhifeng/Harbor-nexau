@@ -213,6 +213,41 @@ def test_runner_main_persists_full_trace_and_completion_state(
     assert "nexau_full_trace.json" in state["written_files"]
 
 
+def test_runner_main_uses_jsonl_when_agent_has_no_legacy_full_trace(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "code_agent.yaml"
+    config_path.write_text("type: agent\n")
+    log_dir = tmp_path / "logs"
+    agent = FakeAgent()
+    del agent.full_trace
+    event_path = log_dir / "nexau_trace_events.jsonl"
+    agent.tracer = runner.JsonlFileTracer(event_path)
+    agent.config = SimpleNamespace(resolved_tracer=agent.tracer)
+    monkeypatch.setattr(
+        runner,
+        "_parse_args",
+        lambda: argparse.Namespace(
+            config_path=str(config_path),
+            log_dir_path=str(log_dir),
+            query="solve it",
+        ),
+    )
+    monkeypatch.setattr(runner, "_build_agent", lambda *_args, **_kwargs: agent)
+    monkeypatch.setenv("NEXAU_TRACE_CHECKPOINT_SEC", "0")
+
+    assert runner.main() == 0
+
+    assert event_path.is_file()
+    assert not (log_dir / "nexau_full_trace.json").exists()
+    assert (log_dir / "nexau_history.json").is_file()
+    state = json.loads((log_dir / "nexau_trace_checkpoint.json").read_text())
+    assert state["status"] == "complete"
+    assert "nexau_trace_events.jsonl" in state["written_files"]
+    assert "nexau_full_trace.json" not in state["written_files"]
+
+
 def test_runner_failure_keeps_latest_trace_artifacts(
     monkeypatch,
     tmp_path: Path,
