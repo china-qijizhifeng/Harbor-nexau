@@ -60,7 +60,7 @@ middlewares:
     params:
       max_context_tokens: ${env.LLM_CONTEXT_WINDOW_TOKENS}
       auto_compact: true
-      threshold: 0.55
+      threshold: 0.8
       compaction_strategy: llm_summary
       keep_iterations: 4
       retry_attempts: 3
