@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -27,6 +28,26 @@ from nexau_harbor.e2b_environment import (
 )
 
 UV_COPY = "COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /uvx /usr/local/bin/"
+
+
+class _AsyncChunkStream:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = iter(chunks)
+
+    async def __aenter__(self) -> _AsyncChunkStream:
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:  # noqa: ANN002
+        del exc_info
+
+    def __aiter__(self) -> _AsyncChunkStream:
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return next(self._chunks)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
 
 
 def test_custom_environment_import_path_is_loadable() -> None:
@@ -87,6 +108,125 @@ async def test_start_propagates_failed_automatic_rebuild_without_looping(monkeyp
 
     assert upstream_start.await_args_list == [call(False), call(force_build=True)]
     environment.logger.warning.assert_called_once()
+
+
+async def test_plain_e2b_keeps_codex_trace_when_secondary_download_fails(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    probe = ExecResult(
+        stdout="file\tcodex_events.jsonl\ndir\tsessions\n",
+        stderr="",
+        return_code=0,
+    )
+    upstream_exec = AsyncMock(return_value=probe)
+    upstream_download = AsyncMock(side_effect=ConnectionError("secondary download reset"))
+    monkeypatch.setattr(e2b_environment.harbor_e2b.E2BEnvironment, "exec", upstream_exec)
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b.E2BEnvironment,
+        "download_dir",
+        upstream_download,
+    )
+
+    async def recover_priority(
+        source_dir: str,
+        target: Path,
+        assets,
+    ) -> None:
+        assert source_dir == "/logs/agent"
+        assert assets.files == ("codex_events.jsonl",)
+        assert assets.directories == ("sessions",)
+        (target / "codex_events.jsonl").write_text('{"type":"thread.started"}\n')
+        rollout = target / "sessions/2026/08/19/rollout-test.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text('{"type":"session_meta"}\n')
+
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment.logger = MagicMock()
+    environment._download_priority_trace_assets = AsyncMock(side_effect=recover_priority)
+
+    await environment._download_agent_logs("/logs/agent", tmp_path)
+
+    assert (tmp_path / "codex_events.jsonl").is_file()
+    assert (tmp_path / "sessions/2026/08/19/rollout-test.jsonl").is_file()
+    environment.logger.exception.assert_called_once()
+
+
+async def test_plain_e2b_streams_trace_to_atomic_target(tmp_path: Path) -> None:
+    stream = _AsyncChunkStream([b"first-", b"second"])
+    read = AsyncMock(return_value=stream)
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment._sandbox = SimpleNamespace(files=SimpleNamespace(read=read))
+    target = tmp_path / "codex_events.jsonl"
+    target.write_bytes(b"old-content")
+
+    await environment._stream_trace_file("/logs/agent/codex_events.jsonl", target)
+
+    assert target.read_bytes() == b"first-second"
+    assert list(tmp_path.glob("*.part")) == []
+    read.assert_awaited_once_with(
+        "/logs/agent/codex_events.jsonl",
+        format="stream",
+        user="root",
+        gzip=True,
+        stream_idle_timeout=300,
+    )
+
+
+async def test_plain_e2b_records_failed_trace_download_for_cleanup_retry(
+    tmp_path: Path,
+) -> None:
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment.logger = MagicMock()
+    environment._pending_agent_log_download = None
+    environment._download_agent_logs = AsyncMock(
+        side_effect=e2b_environment._AgentLogDownloadError(
+            "trace unavailable",
+            trace_expected=True,
+        )
+    )
+
+    with pytest.raises(e2b_environment._AgentLogDownloadError):
+        await environment.download_dir("/logs/agent", tmp_path)
+
+    assert environment._pending_agent_log_download == e2b_environment._PendingAgentLogDownload(
+        "/logs/agent",
+        tmp_path,
+        trace_expected=True,
+    )
+
+
+async def test_plain_e2b_preserves_sandbox_when_trace_retry_fails(
+    tmp_path: Path,
+) -> None:
+    set_timeout = AsyncMock()
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment._sandbox = SimpleNamespace(
+        sandbox_id="plain-sandbox-with-trace",
+        set_timeout=set_timeout,
+    )
+    environment._pending_agent_log_download = e2b_environment._PendingAgentLogDownload(
+        "/logs/agent",
+        tmp_path,
+        trace_expected=True,
+    )
+    environment._retry_pending_agent_log_download = AsyncMock(return_value=False)
+    environment._stop_keepalive = AsyncMock()
+    environment._keepalive_deadline = None
+    environment.logger = MagicMock()
+
+    await environment.stop(delete=True)
+
+    environment._stop_keepalive.assert_awaited_once_with()
+    set_timeout.assert_awaited_once_with(900)
+    assert environment._sandbox is None
+    assert environment._pending_agent_log_download is None
+    environment.logger.error.assert_called_once_with(
+        "E2B sandbox %s was not deleted because its Agent trace could not be "
+        "recovered; it remains available for up to %s seconds for manual recovery",
+        "plain-sandbox-with-trace",
+        900,
+    )
 
 
 @pytest.mark.parametrize(

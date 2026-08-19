@@ -17,6 +17,10 @@ model="${HARBOR_NEXAU_MODEL:?Set HARBOR_NEXAU_MODEL, for example openai/gpt-5}"
 dataset="${HARBOR_NEXAU_DATASET:-terminal-bench/terminal-bench-3@sha256:88433fbcecd1a3f81f7a71bff4cc76c394d0edbefb7e028f90d4109b639fefba}"
 environment="${HARBOR_NEXAU_ENV:-}"
 agent_config="${HARBOR_NEXAU_CONFIG_PATH:-$project_root/src/nexau_harbor/configs/terminal_bench/code_agent.yaml}"
+harness="${HARBOR_NEXAU_HARNESS:-nexau}"
+codex_version="${HARBOR_CODEX_VERSION:-0.144.6}"
+codex_reasoning_effort="${HARBOR_CODEX_REASONING_EFFORT:-high}"
+codex_reasoning_summary="${HARBOR_CODEX_REASONING_SUMMARY:-detailed}"
 trace_mode=0
 trace_timeout_sec="${HARBOR_NEXAU_TRACE_TIMEOUT_SEC:-36000}"
 e2b_start_ramp_delay_sec="${HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC:-0}"
@@ -92,6 +96,18 @@ while (($# > 0)); do
       ;;
     --trace-mode)
       trace_mode=1
+      shift
+      ;;
+    --harness)
+      if (($# < 2)); then
+        printf '%s\n' '--harness requires nexau or codex' >&2
+        exit 2
+      fi
+      harness="$2"
+      shift 2
+      ;;
+    --harness=*)
+      harness="${1#*=}"
       shift
       ;;
     --trace-timeout-sec)
@@ -180,6 +196,10 @@ if [[ "$trace_mode" == "1" && ! "$trace_timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
   printf 'Trace timeout must be a positive integer, got: %s\n' "$trace_timeout_sec" >&2
   exit 2
 fi
+if [[ "$harness" != "nexau" && "$harness" != "codex" ]]; then
+  printf 'Harness must be nexau or codex, got: %s\n' "$harness" >&2
+  exit 2
+fi
 
 if [[ ! "$e2b_start_ramp_delay_sec" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]; then
   printf 'E2B start ramp delay must be a finite non-negative number, got: %s\n' \
@@ -206,7 +226,7 @@ if [[ "$e2b_start_ramp_delay_sec" != "0" && "$task_partition" != "auto" ]]; then
     "$e2b_start_ramp_delay_sec" >&2
 fi
 
-if [[ ! -f "$agent_config" ]]; then
+if [[ "$harness" == "nexau" && ! -f "$agent_config" ]]; then
   printf 'NexAU config file not found: %s\n' "$agent_config" >&2
   exit 2
 fi
@@ -353,6 +373,7 @@ if [[ "$task_partition" == "auto" ]]; then
   if [[ "$trace_mode" == "1" ]]; then
     auto_common_args+=(--trace-timeout-sec "$trace_timeout_sec")
   fi
+  auto_common_args+=(--harness "$harness")
   auto_common_args+=(--e2b-start-ramp-delay-sec "$e2b_start_ramp_delay_sec")
   auto_common_args+=("${auto_forwarded_args[@]}")
   auto_child_pids=()
@@ -491,7 +512,7 @@ if [[ "$trace_mode" == "1" ]]; then
         --timeout-multiplier | --timeout-multiplier=* | \
         --agent-timeout-multiplier | --agent-timeout-multiplier=*)
         printf '%s\n' \
-          'Trace mode owns the Harbor agent and timeout config; use HARBOR_NEXAU_MODEL and --trace-timeout-sec instead.' >&2
+          'Trace mode owns the Harbor agent and timeout config; use HARBOR_NEXAU_MODEL, --harness, and --trace-timeout-sec instead.' >&2
         exit 2
         ;;
     esac
@@ -506,15 +527,25 @@ if [[ "$trace_mode" == "1" ]]; then
   trap 'rm -f -- "$trace_config"' EXIT
   {
     printf '%s\n' 'agents:'
-    printf '  - name: %s\n' "$(yaml_quote 'nexau_harbor.agent:NexAUAgent')"
+    if [[ "$harness" == "codex" ]]; then
+      printf '  - name: %s\n' "$(yaml_quote 'nexau_harbor.codex_agent:TraceSafeCodexAgent')"
+    else
+      printf '  - name: %s\n' "$(yaml_quote 'nexau_harbor.agent:NexAUAgent')"
+    fi
     printf '    model_name: %s\n' "$(yaml_quote "$model")"
     printf '    override_timeout_sec: %s\n' "$trace_timeout_sec"
     printf '%s\n' '    kwargs:'
-    printf '      config_path: %s\n' "$(yaml_quote "$agent_config")"
+    if [[ "$harness" == "codex" ]]; then
+      printf '      version: %s\n' "$(yaml_quote "$codex_version")"
+      printf '      reasoning_effort: %s\n' "$(yaml_quote "$codex_reasoning_effort")"
+      printf '      reasoning_summary: %s\n' "$(yaml_quote "$codex_reasoning_summary")"
+    else
+      printf '      config_path: %s\n' "$(yaml_quote "$agent_config")"
+    fi
   } >"$trace_config"
 
-  printf 'Trace mode: Harbor task limits are replaced with %s seconds; E2B still has its configured lifetime cap.\n' \
-    "$trace_timeout_sec" >&2
+  printf 'Trace mode (%s harness): Harbor task limits are replaced with %s seconds; E2B still has its configured lifetime cap.\n' \
+    "$harness" "$trace_timeout_sec" >&2
 
   "${harbor_command[@]}" run \
     --config "$trace_config" \
@@ -527,11 +558,25 @@ if [[ "$trace_mode" == "1" ]]; then
   exit $?
 fi
 
+agent_args=()
+if [[ "$harness" == "codex" ]]; then
+  agent_args=(
+    --agent nexau_harbor.codex_agent:TraceSafeCodexAgent
+    --agent-kwarg "version=$codex_version"
+    --agent-kwarg "reasoning_effort=$codex_reasoning_effort"
+    --agent-kwarg "reasoning_summary=$codex_reasoning_summary"
+  )
+else
+  agent_args=(
+    --agent nexau_harbor.agent:NexAUAgent
+    --agent-kwarg "config_path=$agent_config"
+  )
+fi
+
 exec "${harbor_command[@]}" run \
   "${task_source_args[@]}" \
   "${partition_args[@]}" \
-  --agent nexau_harbor.agent:NexAUAgent \
-  --agent-kwarg "config_path=$agent_config" \
+  "${agent_args[@]}" \
   --model "$model" \
   "${environment_args[@]}" \
   --n-tasks "${HARBOR_NEXAU_N_TASKS:-1}" \

@@ -98,6 +98,13 @@ printf "%s\\n" "$@"
         }
     )
     env.pop("_HARBOR_NEXAU_DOTENV_LOADED", None)
+    for name in (
+        "HARBOR_NEXAU_HARNESS",
+        "HARBOR_CODEX_VERSION",
+        "HARBOR_CODEX_REASONING_EFFORT",
+        "HARBOR_CODEX_REASONING_SUMMARY",
+    ):
+        env.pop(name, None)
     if config_path is not None:
         env["HARBOR_NEXAU_CONFIG_PATH"] = str(config_path)
     else:
@@ -261,6 +268,50 @@ def test_smoke_script_trace_mode_accepts_explicit_timeout(tmp_path: Path) -> Non
     assert "override_timeout_sec: 3600" in trace_config_capture.read_text()
 
 
+def test_smoke_script_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> None:
+    trace_config_capture = tmp_path / "trace-job.yaml"
+
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--trace-mode",
+        "--harness",
+        "codex",
+        trace_config_capture=trace_config_capture,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert trace_config_capture.read_text() == (
+        "agents:\n"
+        "  - name: 'nexau_harbor.codex_agent:TraceSafeCodexAgent'\n"
+        "    model_name: 'openai/nex-agi/Nex-N2-Pro'\n"
+        "    override_timeout_sec: 36000\n"
+        "    kwargs:\n"
+        "      version: '0.144.6'\n"
+        "      reasoning_effort: 'high'\n"
+        "      reasoning_summary: 'detailed'\n"
+    )
+    assert "Trace mode (codex harness)" in result.stderr
+
+
+def test_smoke_script_non_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(tmp_path, "--harness=codex")
+
+    assert result.returncode == 0, result.stderr
+    arguments = result.stdout.splitlines()
+    agent_index = arguments.index("--agent")
+    assert arguments[agent_index + 1] == "nexau_harbor.codex_agent:TraceSafeCodexAgent"
+    assert "version=0.144.6" in arguments
+    assert "reasoning_effort=high" in arguments
+    assert "reasoning_summary=detailed" in arguments
+
+
+def test_smoke_script_rejects_unknown_harness(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(tmp_path, "--harness", "unknown")
+
+    assert result.returncode == 2
+    assert "Harness must be nexau or codex" in result.stderr
+
+
 def test_smoke_script_trace_mode_rejects_agent_override(tmp_path: Path) -> None:
     result = _run_with_fake_uv(
         tmp_path,
@@ -281,7 +332,7 @@ def test_smoke_script_trace_mode_rejects_timeout_multiplier(tmp_path: Path) -> N
     )
 
     assert result.returncode == 2
-    assert "use HARBOR_NEXAU_MODEL and --trace-timeout-sec" in result.stderr
+    assert "use HARBOR_NEXAU_MODEL, --harness, and --trace-timeout-sec" in result.stderr
 
 
 def test_smoke_script_exports_and_consumes_start_ramp_delay(tmp_path: Path) -> None:

@@ -7,8 +7,8 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import override
 from uuid import uuid4
@@ -73,6 +73,16 @@ from nexau_harbor.e2b_environment import (
     _DetachedExecPaths,
     _reserve_sandbox_start_delay,
 )
+from nexau_harbor.trace_artifacts import (
+    AgentLogDownloadError,
+    PendingAgentLogDownload,
+    PriorityTraceAssets,
+    parse_priority_trace_probe,
+    priority_trace_probe_command,
+)
+
+_AgentLogDownloadError = AgentLogDownloadError
+_PendingAgentLogDownload = PendingAgentLogDownload
 
 E2B_DIND_TEMPLATE_ENV = "HARBOR_NEXAU_E2B_DIND_TEMPLATE"
 E2B_DIND_DEFAULT_TEMPLATE = f"{TEMPLATE_NAME}:{TEMPLATE_VERSION}"
@@ -89,7 +99,6 @@ _HOST_TRANSFER_TIMEOUT_SEC = 300
 _HOST_TRANSFER_MAX_ATTEMPTS = 5
 _AGENT_TRACE_DOWNLOAD_CONCURRENCY = 4
 _AGENT_TRACE_RECOVERY_GRACE_SEC = 15 * 60
-_AGENT_TRACE_EVENTS_NAME = "nexau_trace_events.jsonl"
 _HOST_DETACHED_STATE_ROOT = PurePosixPath("/tmp/harbor-nexau-exec")
 _COMPOSE_BUILD_MAX_ATTEMPTS = 3
 _COMPOSE_BUILD_RETRY_BASE_DELAY_SEC = 5
@@ -100,21 +109,6 @@ _TRANSIENT_DOCKER_BUILD_ERROR = re.compile(
     r"peer closed connection without sending tls close_notify)",
     flags=re.IGNORECASE,
 )
-
-
-class _AgentLogDownloadError(RuntimeError):
-    """Preserve whether a failed Agent-log transfer put an existing trace at risk."""
-
-    def __init__(self, message: str, *, trace_expected: bool) -> None:
-        super().__init__(message)
-        self.trace_expected = trace_expected
-
-
-@dataclass(frozen=True)
-class _PendingAgentLogDownload:
-    source_dir: str
-    target_dir: Path
-    trace_expected: bool
 
 
 def _positive_int(value: int | str, *, name: str) -> int:
@@ -279,21 +273,19 @@ class _E2BDinDCompose(DinDComposeOps):
         source_dir: str,
         target_dir: Path | str,
     ) -> None:
-        """Recover the append-only trace before transferring the remaining logs."""
+        """Recover native trace sources before transferring secondary Agent logs."""
 
         target = Path(target_dir)
         target.mkdir(parents=True, exist_ok=True)
-        trace_source = f"{source_dir.rstrip('/')}/{_AGENT_TRACE_EVENTS_NAME}"
-        trace_target = target / _AGENT_TRACE_EVENTS_NAME
 
         try:
             trace_probe = await self._host_exec(
-                f"test -f {shlex.quote(trace_source)}",
+                priority_trace_probe_command(source_dir),
                 timeout_sec=30,
             )
         except Exception as probe_error:
             self._env.logger.warning(
-                "Could not determine whether the remote NexAU trace exists; "
+                "Could not determine which remote Agent trace assets exist; "
                 "falling back to a full log-directory transfer: %s",
                 probe_error,
             )
@@ -312,7 +304,7 @@ class _E2BDinDCompose(DinDComposeOps):
 
         if trace_probe.return_code not in (0, 1):
             self._env.logger.warning(
-                "Remote NexAU trace probe failed with exit code %s; falling back "
+                "Remote Agent trace probe failed with exit code %s; falling back "
                 "to a full log-directory transfer: %s",
                 trace_probe.return_code,
                 trace_probe.stderr or trace_probe.stdout or "no output",
@@ -330,7 +322,8 @@ class _E2BDinDCompose(DinDComposeOps):
                 ) from transfer_error
             return
 
-        if trace_probe.return_code == 1:
+        assets = parse_priority_trace_probe(trace_probe.stdout or "")
+        if not assets.present:
             try:
                 await self._fetch_dir_from_host(source_dir, target)
             except Exception as transfer_error:
@@ -341,11 +334,10 @@ class _E2BDinDCompose(DinDComposeOps):
             return
 
         try:
-            async with _agent_trace_download_slots:
-                await self._fetch_file_from_host(trace_source, trace_target)
+            await self._fetch_priority_trace_assets(source_dir, target, assets)
         except Exception as priority_error:
             self._env.logger.warning(
-                "Priority NexAU trace download failed; retrying it inside the full "
+                "Priority Agent trace download failed; retrying it inside the full "
                 "log-directory archive: %s",
                 priority_error,
             )
@@ -360,9 +352,11 @@ class _E2BDinDCompose(DinDComposeOps):
                     "Both priority trace download and full Agent-log download failed",
                     trace_expected=True,
                 ) from transfer_error
-            if not trace_target.is_file():
+            missing = self._missing_priority_trace_assets(target, assets)
+            if missing:
                 raise _AgentLogDownloadError(
-                    "The full Agent-log transfer completed without the expected trace file",
+                    "The full Agent-log transfer completed without expected trace assets: "
+                    + ", ".join(missing),
                     trace_expected=True,
                 )
             return
@@ -371,13 +365,51 @@ class _E2BDinDCompose(DinDComposeOps):
             await self._fetch_dir_from_host(
                 source_dir,
                 target,
-                exclude_relative_paths=(_AGENT_TRACE_EVENTS_NAME,),
+                exclude_relative_paths=assets.exclusions,
             )
         except Exception:
             self._env.logger.exception(
-                "The critical NexAU JSONL trace was recovered, but the remaining "
+                "The critical Agent trace sources were recovered, but the remaining "
                 "Agent logs could not be downloaded"
             )
+
+    async def _fetch_priority_trace_assets(
+        self,
+        source_dir: str,
+        target: Path,
+        assets: PriorityTraceAssets,
+    ) -> None:
+        source = source_dir.rstrip("/")
+        for name in assets.files:
+            async with _agent_trace_download_slots:
+                await self._fetch_file_from_host(f"{source}/{name}", target / name)
+
+        for name in assets.directories:
+            destination = target / name
+            temporary = target / f".{name}.{uuid4().hex}.part"
+            try:
+                async with _agent_trace_download_slots:
+                    await self._fetch_dir_from_host(
+                        f"{source}/{name}",
+                        temporary,
+                        detached_pack=True,
+                    )
+                if destination.exists():
+                    shutil.rmtree(destination)
+                temporary.replace(destination)
+            finally:
+                shutil.rmtree(temporary, ignore_errors=True)
+
+    @staticmethod
+    def _missing_priority_trace_assets(
+        target: Path,
+        assets: PriorityTraceAssets,
+    ) -> list[str]:
+        missing = [name for name in assets.files if not (target / name).is_file()]
+        missing.extend(
+            name for name in assets.directories if not (target / name).is_dir()
+        )
+        return missing
 
     def _compose_referenced_env_vars(self) -> dict[str, str]:
         compose_paths = [

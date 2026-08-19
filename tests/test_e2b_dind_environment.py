@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -388,7 +388,13 @@ async def test_agent_log_download_keeps_trace_when_remaining_archive_fails(
     compose = object.__new__(_E2BDinDCompose)
     compose._env = SimpleNamespace(
         logger=MagicMock(),
-        _exec_on_host=AsyncMock(return_value=ExecResult(stdout="", stderr="", return_code=0)),
+        _exec_on_host=AsyncMock(
+            return_value=ExecResult(
+                stdout="file\tnexau_trace_events.jsonl\n",
+                stderr="",
+                return_code=0,
+            )
+        ),
     )
     compose._fetch_file_from_host = AsyncMock(side_effect=fetch_trace)
     compose._fetch_dir_from_host = AsyncMock(side_effect=ConnectionError("archive reset"))
@@ -410,7 +416,13 @@ async def test_agent_log_download_reports_when_both_trace_paths_fail(
     compose = object.__new__(_E2BDinDCompose)
     compose._env = SimpleNamespace(
         logger=MagicMock(),
-        _exec_on_host=AsyncMock(return_value=ExecResult(stdout="", stderr="", return_code=0)),
+        _exec_on_host=AsyncMock(
+            return_value=ExecResult(
+                stdout="file\tnexau_trace_events.jsonl\n",
+                stderr="",
+                return_code=0,
+            )
+        ),
     )
     compose._fetch_file_from_host = AsyncMock(side_effect=ConnectionError("trace reset"))
     compose._fetch_dir_from_host = AsyncMock(side_effect=ConnectionError("archive reset"))
@@ -420,6 +432,78 @@ async def test_agent_log_download_reports_when_both_trace_paths_fail(
 
     assert error.value.trace_expected
     assert "Both priority trace download" in str(error.value)
+
+
+async def test_agent_log_download_prioritizes_codex_events_and_rollouts(
+    tmp_path: Path,
+) -> None:
+    payloads = {
+        "codex_events.jsonl": b'{"type":"thread.started"}\n',
+        "codex_stderr.log": b"warning\n",
+        "codex_result.json": b'{"status":"running"}\n',
+        "codex_history.jsonl": b'{"session_id":"thread"}\n',
+    }
+
+    async def fetch_file(source: str, target: Path | str) -> None:
+        Path(target).write_bytes(payloads[PurePath(source).name])
+
+    async def fetch_dir(
+        source: str,
+        target: Path | str,
+        *,
+        exclude_relative_paths: tuple[str, ...] = (),
+        detached_pack: bool = False,
+    ) -> None:
+        if source == "/logs/agent/sessions":
+            assert detached_pack
+            rollout = Path(target) / "2026/08/19/rollout-test.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text('{"type":"session_meta"}\n')
+            return
+        assert source == "/logs/agent"
+        assert exclude_relative_paths == (
+            "codex_events.jsonl",
+            "codex_stderr.log",
+            "codex_result.json",
+            "codex_history.jsonl",
+            "sessions",
+        )
+        raise ConnectionError("secondary archive reset")
+
+    compose = object.__new__(_E2BDinDCompose)
+    compose._env = SimpleNamespace(
+        logger=MagicMock(),
+        _exec_on_host=AsyncMock(
+            return_value=ExecResult(
+                stdout=(
+                    "file\tcodex_events.jsonl\n"
+                    "file\tcodex_stderr.log\n"
+                    "file\tcodex_result.json\n"
+                    "file\tcodex_history.jsonl\n"
+                    "dir\tsessions\n"
+                ),
+                stderr="",
+                return_code=0,
+            )
+        ),
+    )
+    compose._fetch_file_from_host = AsyncMock(side_effect=fetch_file)
+    compose._fetch_dir_from_host = AsyncMock(side_effect=fetch_dir)
+
+    await compose.download_agent_logs("/logs/agent", tmp_path)
+
+    assert (tmp_path / "codex_events.jsonl").read_bytes() == payloads[
+        "codex_events.jsonl"
+    ]
+    assert (tmp_path / "codex_stderr.log").read_bytes() == payloads["codex_stderr.log"]
+    assert (tmp_path / "codex_result.json").read_bytes() == payloads[
+        "codex_result.json"
+    ]
+    assert (tmp_path / "codex_history.jsonl").read_bytes() == payloads[
+        "codex_history.jsonl"
+    ]
+    assert (tmp_path / "sessions/2026/08/19/rollout-test.jsonl").is_file()
+    compose._env.logger.exception.assert_called_once()
 
 
 async def test_failed_agent_log_download_is_retried_before_cleanup(

@@ -75,6 +75,25 @@ scripts/smoke_tb3.sh \
   --job-name nexau-n2-pro-frontier
 ```
 
+要保持模型和任务不变、仅将 NexAU harness 替换为 Codex，可以增加
+`--harness codex`：
+
+```bash
+scripts/smoke_tb3.sh \
+  --auto-partition \
+  --trace-mode \
+  --harness codex \
+  --path /root/.cache/harbor/tasks/local-datasets/frontier-bench-cpu68-20260813 \
+  --e2b-start-ramp-delay-sec 5 \
+  --job-name codex-harness-n2-pro-frontier
+```
+
+该模式使用仓库内的 `TraceSafeCodexAgent`，不会修改 Harbor site-packages，也不会生成
+Harbor `trajectory.json`。它保留 `openai/` 之后的完整模型标识，因此
+`openai/nex-agi/Nex-N2-Pro` 会传给 Codex CLI 为 `nex-agi/Nex-N2-Pro`，不会被缩短为
+`Nex-N2-Pro`。Codex CLI 版本和 reasoning 设置可分别通过 `HARBOR_CODEX_VERSION`、
+`HARBOR_CODEX_REASONING_EFFORT`、`HARBOR_CODEX_REASONING_SUMMARY` 固定。
+
 `--auto-partition` 不会只凭“是否有 Compose 文件”猜测兼容性。Compose 题直接进入 DinD；其余题在
 Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbox 预检。预检成功的题进入
 普通 E2B，确定性的 Dockerfile/E2B 构建不兼容进入 DinD；网络、限流或 provisioning 临时错误会
@@ -257,10 +276,11 @@ stdout、stderr 和退出码后立即断开初始事件流，再每 30 秒用短
 Harbor 进程，同时远程 Agent 不依赖一条贯穿整道题的 HTTP 长连接。
 
 Agent 结束或超时后，DinD adapter 会先从 self-bind 日志目录单独下载
-`nexau_trace_events.jsonl`，再打包其余日志。大文件通过 E2B 流式接口原子写入宿主机，不再把
+NexAU JSONL，或 Codex events、stderr、result 和完整 native sessions，再打包其余日志。
+普通 E2B 同样会先流式恢复这些原始 trace source。大文件通过 E2B 流式接口原子写入宿主机，不再把
 整个归档读入内存，也不再对完整传输应用 300 秒总期限；单文件最多重试 5 次，同时最多下载
 4 份大 trace，避免大量 trial 同时超时时形成下载尖峰。若其余日志下载失败但 JSONL 已保存，
-Harbor 仍会从 JSONL 重建截至终止点的 span 树。若两条下载路径都失败，adapter 会在清理前
+原始事件和 rollout 仍可独立分析。若两条下载路径都失败，adapter 会在清理前
 再试一次；仍失败时不会立即删除含 trace 的 sandbox，而是在日志中记录 sandbox ID，并保留
 最长 15 分钟的人工恢复窗口。
 
@@ -341,6 +361,20 @@ Harbor 0.21.x 负责从本地或云环境统一下载 `/logs/agent`，随后适�
 token/cost context 并生成 ATIF 文件。每道题（每个 attempt）的评分、异常、耗时和 token
 统计位于 `jobs/<job-name>/<trial-name>/result.json`，verifier 原始输出位于同目录的
 `verifier/`；`jobs/<job-name>/result.json` 保存整项 job 的聚合统计。
+
+使用 `--harness codex` 时，每个 trial 的 `agent/` 目录使用另一套原始证据：
+
+- `codex_events.jsonl`：`codex exec --json` 的追加式公开事件流；stdout 不与 stderr 混合。
+- `codex_stderr.log`：Codex CLI 自身诊断输出。
+- `codex_history.jsonl`：Codex 的持久化历史；运行时直接链接到日志目录。
+- `sessions/**/rollout-*.jsonl`：全部 Codex native rollout。`CODEX_HOME/sessions` 在运行开始前
+  直接链接到 `/logs/agent/sessions`，不是结束后才复制，所以 timeout 时也保留已落盘内容。
+- `codex_result.json`：进程状态、trace 完整性、最终公开消息和 usage；硬中断显示为
+  `incomplete`，不会伪装成正常完成。
+- `trace_manifest.json`：上述文件的大小、SHA-256、JSONL 完整性和事件计数。
+
+Codex 模式的可信分析源是 `codex_events.jsonl` 与所有 native rollout；按当前约定不生成
+`trajectory.json`。reasoning 仅包含 Codex 公开发出的 summary/event，不包含模型内部隐藏思维链。
 
 可以按题输出结果摘要：
 

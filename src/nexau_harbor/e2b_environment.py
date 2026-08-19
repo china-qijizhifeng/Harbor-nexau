@@ -9,7 +9,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import override
 from uuid import uuid4
 
@@ -20,6 +20,16 @@ from harbor.models.task.config import NetworkMode
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV, REMOTE_LOG_DIR
+from nexau_harbor.trace_artifacts import (
+    AgentLogDownloadError,
+    PendingAgentLogDownload,
+    PriorityTraceAssets,
+    parse_priority_trace_probe,
+    priority_trace_probe_command,
+)
+
+_AgentLogDownloadError = AgentLogDownloadError
+_PendingAgentLogDownload = PendingAgentLogDownload
 
 E2B_SANDBOX_TIMEOUT_SEC = 3_600
 E2B_KEEPALIVE_INTERVAL_SEC = 60
@@ -33,6 +43,7 @@ E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS = 5
 E2B_DEFAULT_TEMPLATE_BUILD_ATTEMPTS = 2
 E2B_TEMPLATE_BUILD_LOG_MAX_ENTRIES = 256
 E2B_TEMPLATE_BUILD_LOG_TAIL_CHARS = 16_384
+E2B_AGENT_TRACE_RECOVERY_GRACE_SEC = 15 * 60
 
 _DETACHED_STATUS_PREFIX = "__HARBOR_NEXAU_STATUS__:"
 _MISSING_DEFAULT_TEMPLATE_TAG = "tag 'default' does not exist for template"
@@ -305,6 +316,7 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         self._last_template_build_log_tail = ""
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_deadline: float | None = None
+        self._pending_agent_log_download: _PendingAgentLogDownload | None = None
         super().__init__(*args, **kwargs)
 
     @override
@@ -764,8 +776,232 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         )
         self._start_keepalive()
 
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=1, max=30),
+        reraise=True,
+    )
+    async def _stream_trace_file(
+        self,
+        source_path: str,
+        target_path: Path,
+    ) -> None:
+        if self._sandbox is None:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target_path.with_name(f".{target_path.name}.{uuid4().hex}.part")
+        try:
+            stream = await self._sandbox.files.read(
+                source_path,
+                format="stream",
+                user="root",
+                gzip=True,
+                stream_idle_timeout=300,
+            )
+            async with stream:
+                with temporary.open("wb") as output:
+                    async for chunk in stream:
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            temporary.replace(target_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    async def _download_priority_trace_assets(
+        self,
+        source_dir: str,
+        target: Path,
+        assets: PriorityTraceAssets,
+    ) -> None:
+        source = source_dir.rstrip("/")
+        for name in assets.files:
+            await self._stream_trace_file(f"{source}/{name}", target / name)
+        for name in assets.directories:
+            await super().download_dir(f"{source}/{name}", target / name)
+
+    @staticmethod
+    def _missing_priority_trace_assets(
+        target: Path,
+        assets: PriorityTraceAssets,
+    ) -> list[str]:
+        missing = [name for name in assets.files if not (target / name).is_file()]
+        missing.extend(
+            name for name in assets.directories if not (target / name).is_dir()
+        )
+        return missing
+
+    async def _download_agent_logs(
+        self,
+        source_dir: str,
+        target: Path,
+    ) -> None:
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            probe = await super().exec(
+                priority_trace_probe_command(source_dir),
+                timeout_sec=30,
+                user="root",
+            )
+        except Exception as probe_error:
+            self.logger.warning(
+                "Could not determine which remote Agent trace assets exist; "
+                "falling back to a full log-directory transfer: %s",
+                probe_error,
+            )
+            try:
+                await super().download_dir(source_dir, target)
+            except Exception as transfer_error:
+                raise _AgentLogDownloadError(
+                    "Failed to download Agent logs after the trace existence probe failed",
+                    trace_expected=True,
+                ) from transfer_error
+            return
+
+        if probe.return_code != 0:
+            self.logger.warning(
+                "Remote Agent trace probe failed with exit code %s; falling back "
+                "to a full log-directory transfer: %s",
+                probe.return_code,
+                probe.stderr or probe.stdout or "no output",
+            )
+            try:
+                await super().download_dir(source_dir, target)
+            except Exception as transfer_error:
+                raise _AgentLogDownloadError(
+                    "Failed to download Agent logs after a failed trace probe",
+                    trace_expected=True,
+                ) from transfer_error
+            return
+
+        assets = parse_priority_trace_probe(probe.stdout or "")
+        if not assets.present:
+            try:
+                await super().download_dir(source_dir, target)
+            except Exception as transfer_error:
+                raise _AgentLogDownloadError(
+                    "Failed to download Agent logs; no trace assets were present when checked",
+                    trace_expected=False,
+                ) from transfer_error
+            return
+
+        try:
+            await self._download_priority_trace_assets(source_dir, target, assets)
+        except Exception as priority_error:
+            self.logger.warning(
+                "Priority Agent trace download failed; retrying it inside the full "
+                "log-directory transfer: %s",
+                priority_error,
+            )
+            try:
+                await super().download_dir(source_dir, target)
+            except Exception as transfer_error:
+                raise _AgentLogDownloadError(
+                    "Both priority trace download and full Agent-log download failed",
+                    trace_expected=True,
+                ) from transfer_error
+            missing = self._missing_priority_trace_assets(target, assets)
+            if missing:
+                raise _AgentLogDownloadError(
+                    "The full Agent-log transfer completed without expected trace assets: "
+                    + ", ".join(missing),
+                    trace_expected=True,
+                )
+            return
+
+        try:
+            await super().download_dir(source_dir, target)
+        except Exception:
+            self.logger.exception(
+                "The critical Agent trace sources were recovered, but the remaining "
+                "Agent logs could not be downloaded"
+            )
+
+    @override
+    async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
+        if PurePosixPath(source_dir) != REMOTE_LOG_DIR:
+            await super().download_dir(source_dir, target_dir)
+            return
+
+        target = Path(target_dir)
+        try:
+            await self._download_agent_logs(source_dir, target)
+        except _AgentLogDownloadError as exc:
+            self._pending_agent_log_download = _PendingAgentLogDownload(
+                source_dir,
+                target,
+                trace_expected=exc.trace_expected,
+            )
+            self.logger.exception(
+                "Failed to recover E2B Agent logs; a final retry will run before cleanup"
+            )
+            raise
+        self._pending_agent_log_download = None
+
+    async def _retry_pending_agent_log_download(self) -> bool:
+        pending = self._pending_agent_log_download
+        if pending is None:
+            return True
+        self.logger.warning(
+            "Retrying Agent-log recovery before stopping E2B sandbox %s",
+            getattr(self._sandbox, "sandbox_id", "unknown"),
+        )
+        try:
+            await self._download_agent_logs(pending.source_dir, pending.target_dir)
+        except _AgentLogDownloadError as exc:
+            self._pending_agent_log_download = _PendingAgentLogDownload(
+                pending.source_dir,
+                pending.target_dir,
+                trace_expected=pending.trace_expected or exc.trace_expected,
+            )
+            self.logger.exception("Agent-log recovery retry failed")
+            return False
+        except Exception:
+            self.logger.exception("Agent-log recovery retry failed")
+            return False
+        self._pending_agent_log_download = None
+        return True
+
+    async def _preserve_sandbox_for_trace_recovery(self) -> None:
+        sandbox = self._sandbox
+        if sandbox is None:
+            return
+        sandbox_id = sandbox.sandbox_id
+        deadline = self._keepalive_deadline
+        remaining_lifetime_sec = (
+            deadline - asyncio.get_running_loop().time() if deadline is not None else None
+        )
+        grace_sec = E2B_AGENT_TRACE_RECOVERY_GRACE_SEC
+        if remaining_lifetime_sec is not None:
+            grace_sec = min(grace_sec, max(1, round(remaining_lifetime_sec)))
+
+        await self._stop_keepalive()
+        try:
+            await sandbox.set_timeout(grace_sec)
+        except Exception as exc:
+            self.logger.error(
+                "Could not set a recovery grace period on E2B sandbox %s: %s",
+                sandbox_id,
+                exc,
+            )
+        self.logger.error(
+            "E2B sandbox %s was not deleted because its Agent trace could not be "
+            "recovered; it remains available for up to %s seconds for manual recovery",
+            sandbox_id,
+            grace_sec,
+        )
+        self._pending_agent_log_download = None
+        self._sandbox = None
+
     @override
     async def stop(self, delete: bool) -> None:
+        pending = getattr(self, "_pending_agent_log_download", None)
+        if pending is not None and self._sandbox is not None:
+            recovered = await self._retry_pending_agent_log_download()
+            pending = self._pending_agent_log_download
+            if not recovered and pending is not None and pending.trace_expected:
+                await self._preserve_sandbox_for_trace_recovery()
+                return
         try:
             await self._stop_keepalive()
         finally:
