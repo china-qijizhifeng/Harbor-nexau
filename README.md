@@ -57,8 +57,9 @@ scripts/smoke_tb3.sh --job-name nexau-smoke
 `smoke_tb3.sh` 默认显式选择
 [`configs/terminal_bench/code_agent.yaml`](src/nexau_harbor/configs/terminal_bench/code_agent.yaml)，
 不会使用 installed agent 为其他评测保留的 fallback 配置。该 profile 按
-`tb-agent-configs-prompts-20260606` 配置 4 个编码工具、500 次迭代、仅
-`tool_result_compaction` 的上下文压缩，并删除发给模型的 `max_tokens`/
+`tb-agent-configs-prompts-20260606` 配置 4 个编码工具、500 次迭代和两级上下文压缩：
+达到 70% 时先压缩旧工具结果并保留最近 8 轮，达到 85% 时再生成历史 summary 并保留
+最近 4 轮。同时删除发给模型的 `max_tokens`/
 `max_output_tokens`，避免把 `.env` 中的 32000 当成 TB 输出截断上限。Harbor runner 仍会
 自动加入追加写入的 JSONL tracer，因此 verifier、周期 checkpoint 和完整 trace 都保持开启，
 同时不会在任务容器内累计第二份完整 span 树。

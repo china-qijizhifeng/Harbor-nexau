@@ -52,11 +52,18 @@ def test_terminal_bench_config_references_only_tb_assets() -> None:
         "max_tokens",
         "max_output_tokens",
     ]
-    assert len(config["middlewares"]) == 2
+    assert len(config["middlewares"]) == 3
     assert config["middlewares"][1]["params"] == {
         "max_context_tokens": "${env.LLM_CONTEXT_WINDOW_TOKENS}",
         "auto_compact": True,
-        "threshold": 0.8,
+        "threshold": 0.7,
+        "compaction_strategy": "tool_result_compaction",
+        "keep_iterations": 8,
+    }
+    assert config["middlewares"][2]["params"] == {
+        "max_context_tokens": "${env.LLM_CONTEXT_WINDOW_TOKENS}",
+        "auto_compact": True,
+        "threshold": 0.85,
         "compaction_strategy": "llm_summary",
         "keep_iterations": 4,
         "retry_attempts": 3,
@@ -96,14 +103,19 @@ def test_nexau_builds_terminal_bench_config(monkeypatch, tmp_path: Path) -> None
     assert [type(item).__name__ for item in agent.config.middlewares] == [
         "LongToolOutputMiddleware",
         "ContextCompactionMiddleware",
+        "ContextCompactionMiddleware",
     ]
-    compaction = agent.config.middlewares[1]
-    assert compaction.trigger_strategy.threshold == 0.8
-    assert compaction.compaction_strategy.__class__.__name__ == "SlidingWindowCompaction"
-    assert compaction.compaction_strategy.keep_iterations == 4
-    assert compaction.compaction_strategy.retry_attempts == 3
-    assert compaction.compaction_strategy.summary_llm_config.model == "nex-agi/Nex-N2-Pro"
-    assert compaction.compaction_strategy.summary_llm_config.api_type == "openai_responses"
+    tool_compaction = agent.config.middlewares[1]
+    assert tool_compaction.trigger_strategy.threshold == 0.7
+    assert tool_compaction.compaction_strategy.__class__.__name__ == "ToolResultCompaction"
+    assert tool_compaction.compaction_strategy.keep_iterations == 8
+    summary_compaction = agent.config.middlewares[2]
+    assert summary_compaction.trigger_strategy.threshold == 0.85
+    assert summary_compaction.compaction_strategy.__class__.__name__ == "SlidingWindowCompaction"
+    assert summary_compaction.compaction_strategy.keep_iterations == 4
+    assert summary_compaction.compaction_strategy.retry_attempts == 3
+    assert summary_compaction.compaction_strategy.summary_llm_config.model == "nex-agi/Nex-N2-Pro"
+    assert summary_compaction.compaction_strategy.summary_llm_config.api_type == "openai_responses"
     assert agent.config.resolved_tracer.__class__.__name__ == "InMemoryTracer"
     assert agent.config.llm_config.stream is False
     assert agent.config.llm_config.temperature == 0.6
@@ -140,7 +152,7 @@ def test_llm_summary_keeps_a_user_message_for_single_turn_agents(
         monkeypatch.setenv(name, value)
 
     agent = _build_agent(config_path)
-    strategy = agent.config.middlewares[1].compaction_strategy
+    strategy = agent.config.middlewares[2].compaction_strategy
     summary_inputs: list[list[Message]] = []
 
     def summarize(messages: list[Message]) -> str:
