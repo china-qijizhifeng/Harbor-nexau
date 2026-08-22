@@ -9,6 +9,7 @@ from pathlib import Path
 NEXAU_TRACE_EVENTS_NAME = "nexau_trace_events.jsonl"
 CODEX_EVENTS_NAME = "codex_events.jsonl"
 CODEX_STDERR_NAME = "codex_stderr.log"
+CODEX_BRIDGE_LOG_NAME = "northgate-responses-bridge.log"
 CODEX_RESULT_NAME = "codex_result.json"
 CODEX_HISTORY_NAME = "codex_history.jsonl"
 CODEX_SESSIONS_DIR_NAME = "sessions"
@@ -18,6 +19,7 @@ PRIORITY_TRACE_FILES = (
     NEXAU_TRACE_EVENTS_NAME,
     CODEX_EVENTS_NAME,
     CODEX_STDERR_NAME,
+    CODEX_BRIDGE_LOG_NAME,
     CODEX_RESULT_NAME,
     CODEX_HISTORY_NAME,
 )

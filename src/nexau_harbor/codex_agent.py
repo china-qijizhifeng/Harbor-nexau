@@ -6,7 +6,7 @@ import hashlib
 import json
 import shlex
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, override
 
 from harbor.agents.installed.base import with_prompt_template
@@ -16,6 +16,7 @@ from harbor.models.agent.context import AgentContext
 
 from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV, REMOTE_LOG_DIR
 from nexau_harbor.trace_artifacts import (
+    CODEX_BRIDGE_LOG_NAME,
     CODEX_EVENTS_NAME,
     CODEX_HISTORY_NAME,
     CODEX_RESULT_NAME,
@@ -126,7 +127,7 @@ def _event_stream_summary(path: Path) -> dict[str, Any]:
                 candidate_usage = event.get("usage")
                 if isinstance(candidate_usage, dict):
                     usage = candidate_usage
-            elif event_type in {"turn.failed", "error"}:
+            elif event_type == "turn.failed":
                 trace_status = "failed"
             elif event_type == "item.completed":
                 item = event.get("item")
@@ -186,13 +187,135 @@ def _rollout_usage(session_files: list[Path]) -> dict[str, int] | None:
 class TraceSafeCodexAgent(Codex):
     """Run Codex while making every public trace event durable during execution."""
 
+    DEFAULT_CODEX_VERSION = "0.148.0"
+    DEFAULT_BRIDGE_PORT = 48123
+    _BRIDGE_SOURCE = Path(__file__).with_name("codex_responses_bridge.js")
+    _REMOTE_BRIDGE_DIR = PurePosixPath("/tmp/northgate-codex-bridge")
+    _REMOTE_BRIDGE_SCRIPT = _REMOTE_BRIDGE_DIR / "bridge.js"
+    _REMOTE_BRIDGE_PID = _REMOTE_BRIDGE_DIR / "bridge.pid"
+    _REMOTE_BRIDGE_LOG = REMOTE_LOG_DIR / CODEX_BRIDGE_LOG_NAME
+
     SUPPORTS_ATIF = False
     SUPPORTS_LOAD_ATIF_TRAJECTORY = False
+
+    def __init__(
+        self,
+        *args: Any,
+        unified_exec: bool = True,
+        code_mode: bool = True,
+        code_mode_only: bool = True,
+        multi_agent: bool = False,
+        responses_bridge: bool = True,
+        bridge_port: int = DEFAULT_BRIDGE_PORT,
+        provider_name: str = "northgate",
+        context_window: int = 262144,
+        version: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        normalized_provider = provider_name.strip()
+        if not normalized_provider:
+            raise ValueError("provider_name must not be empty")
+        if context_window < 1:
+            raise ValueError("context_window must be positive")
+        if bridge_port < 1 or bridge_port > 65535:
+            raise ValueError("bridge_port must be between 1 and 65535")
+        if code_mode_only and not code_mode:
+            raise ValueError("code_mode_only requires code_mode")
+        if responses_bridge and not code_mode:
+            raise ValueError("responses_bridge requires code_mode")
+        if responses_bridge and multi_agent:
+            raise ValueError("responses_bridge does not support namespace multi-agent tools")
+
+        extra_env = dict(kwargs.pop("extra_env", None) or {})
+        for env_name in ("NO_PROXY", "no_proxy"):
+            entries = [
+                item.strip()
+                for item in extra_env.get(env_name, "").split(",")
+                if item.strip()
+            ]
+            for host in ("127.0.0.1", "localhost"):
+                if host not in entries:
+                    entries.append(host)
+            extra_env[env_name] = ",".join(entries)
+
+        self._northgate_provider_name = normalized_provider
+        self._northgate_context_window = int(context_window)
+        self._northgate_unified_exec = bool(unified_exec)
+        self._northgate_code_mode = bool(code_mode)
+        self._northgate_code_mode_only = bool(code_mode_only)
+        self._northgate_multi_agent = bool(multi_agent)
+        self._northgate_responses_bridge = bool(responses_bridge)
+        self._northgate_bridge_port = int(bridge_port)
+        self._northgate_detached_install = False
+
+        kwargs.setdefault("reasoning_effort", "high")
+        kwargs.setdefault("reasoning_summary", "detailed")
+        kwargs.setdefault("web_search", "disabled")
+        super().__init__(
+            *args,
+            version=version or self.DEFAULT_CODEX_VERSION,
+            extra_env=extra_env,
+            **kwargs,
+        )
 
     @staticmethod
     @override
     def name() -> str:
         return "codex"
+
+    @override
+    async def exec_as_agent(
+        self,
+        environment: BaseEnvironment,
+        command: str,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        timeout_sec: int | None = None,
+    ) -> Any:
+        runtime_env = dict(env or {})
+        if getattr(environment, "SUPPORTS_DETACHED_AGENT_EXEC", False) and (
+            self._northgate_detached_install or "codex exec " in command
+        ):
+            runtime_env[NEXAU_DETACHED_EXEC_ENV] = "1"
+        return await super().exec_as_agent(
+            environment,
+            command,
+            env=runtime_env or None,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+        )
+
+    @override
+    async def install(self, environment: BaseEnvironment) -> None:
+        self._northgate_detached_install = True
+        try:
+            await super().install(environment)
+        finally:
+            self._northgate_detached_install = False
+
+    @override
+    def build_cli_flags(self) -> str:
+        flags = super().build_cli_flags()
+        feature_flags = [
+            (
+                "--enable unified_exec"
+                if self._northgate_unified_exec
+                else "--disable unified_exec"
+            )
+        ]
+        if self._northgate_code_mode:
+            feature_flags.append("--enable code_mode")
+        if self._northgate_code_mode_only:
+            feature_flags.append("--enable code_mode_only")
+        if self._northgate_multi_agent:
+            feature_flags.append("--enable multi_agent")
+        else:
+            feature_flags.extend(("--disable multi_agent", "--disable multi_agent_v2"))
+        return " ".join(part for part in (flags, *feature_flags) if part)
+
+    @property
+    def _bridge_base_url(self) -> str:
+        return f"http://127.0.0.1:{self._northgate_bridge_port}/v1"
 
     def _runtime_model_name(self) -> str:
         model = self.model_name
@@ -204,6 +327,53 @@ class TraceSafeCodexAgent(Codex):
             return remainder
         return model
 
+    @override
+    def _build_effective_config(
+        self,
+        openai_base_url: str | None = None,
+    ) -> dict[str, Any]:
+        if not openai_base_url:
+            raise ValueError(
+                "NorthGate Codex requires OPENAI_BASE_URL, for example "
+                "https://northgate.xiaobei.top/v1"
+            )
+
+        config = super()._build_effective_config(openai_base_url)
+        config.pop("openai_base_url", None)
+        config["model_provider"] = self._northgate_provider_name
+        config["model_context_window"] = self._northgate_context_window
+        config["web_search"] = "disabled"
+
+        providers = config.setdefault("model_providers", {})
+        if not isinstance(providers, dict):
+            raise ValueError("Codex model_providers config must be a table")
+        existing = providers.get(self._northgate_provider_name, {})
+        if not isinstance(existing, dict):
+            raise ValueError(
+                f"Codex provider {self._northgate_provider_name!r} must be a table"
+            )
+        provider = dict(existing)
+        provider.update(
+            {
+                "name": (
+                    "NorthGate via Responses bridge"
+                    if self._northgate_responses_bridge
+                    else "NorthGate"
+                ),
+                "base_url": (
+                    self._bridge_base_url
+                    if self._northgate_responses_bridge
+                    else openai_base_url.rstrip("/")
+                ),
+                "env_key": "OPENAI_API_KEY",
+                "wire_api": "responses",
+                "supports_websockets": False,
+                "supports_standalone_web_search": False,
+            }
+        )
+        providers[self._northgate_provider_name] = provider
+        return config
+
     def _build_trace_config(self, openai_base_url: str | None) -> dict[str, Any]:
         config = self._build_effective_config(openai_base_url)
         history = config.setdefault("history", {})
@@ -213,6 +383,83 @@ class TraceSafeCodexAgent(Codex):
         history.pop("max_bytes", None)
         config["hide_agent_reasoning"] = False
         return config
+
+    async def _start_responses_bridge(
+        self,
+        environment: BaseEnvironment,
+        upstream_base_url: str,
+    ) -> None:
+        if not self._BRIDGE_SOURCE.is_file():
+            raise RuntimeError(f"NorthGate bridge source is missing: {self._BRIDGE_SOURCE}")
+
+        bridge_dir = shlex.quote(self._REMOTE_BRIDGE_DIR.as_posix())
+        agent_dir = shlex.quote(REMOTE_LOG_DIR.as_posix())
+        await self.exec_as_agent(
+            environment,
+            command=f"mkdir -p {bridge_dir} {agent_dir}",
+        )
+        await self._stop_responses_bridge(environment)
+        await environment.upload_file(
+            self._BRIDGE_SOURCE,
+            self._REMOTE_BRIDGE_SCRIPT.as_posix(),
+        )
+        if environment.default_user is not None:
+            owner = shlex.quote(str(environment.default_user))
+            script = shlex.quote(self._REMOTE_BRIDGE_SCRIPT.as_posix())
+            await self.exec_as_root(
+                environment,
+                command=f"chown {owner} {script} && chmod 700 {script}",
+            )
+
+        script = shlex.quote(self._REMOTE_BRIDGE_SCRIPT.as_posix())
+        pid_file = shlex.quote(self._REMOTE_BRIDGE_PID.as_posix())
+        log_file = shlex.quote(self._REMOTE_BRIDGE_LOG.as_posix())
+        health_url = shlex.quote(f"http://127.0.0.1:{self._northgate_bridge_port}/health")
+        command = "\n".join(
+            (
+                "set -euo pipefail",
+                f"mkdir -p {bridge_dir} {agent_dir}",
+                f"nohup node {script} > {log_file} 2>&1 </dev/null &",
+                "bridge_pid=$!",
+                f"printf '%s\\n' \"$bridge_pid\" > {pid_file}",
+                "for attempt in $(seq 1 100); do",
+                f"  if curl --silent --show-error --fail {health_url} "
+                "| grep -Fq '\"status\":\"ok\"'; then",
+                "    exit 0",
+                "  fi",
+                "  if ! kill -0 \"$bridge_pid\" 2>/dev/null; then",
+                "    break",
+                "  fi",
+                "  sleep 0.1",
+                "done",
+                f"tail -n 50 {log_file} >&2 || true",
+                "exit 1",
+            )
+        )
+        await self.exec_as_agent(
+            environment,
+            command=command,
+            env={
+                "NORTHGATE_UPSTREAM_BASE_URL": upstream_base_url.rstrip("/"),
+                "NORTHGATE_BRIDGE_PORT": str(self._northgate_bridge_port),
+            },
+        )
+
+    async def _stop_responses_bridge(self, environment: BaseEnvironment) -> None:
+        pid_file = shlex.quote(self._REMOTE_BRIDGE_PID.as_posix())
+        await self.exec_as_agent(
+            environment,
+            command=" ".join(
+                (
+                    f"if test -s {pid_file}; then",
+                    f"bridge_pid=$(tr -d '\\r\\n' < {pid_file});",
+                    "if printf '%s' \"$bridge_pid\" | grep -Eq '^[0-9]+$'; then",
+                    "kill \"$bridge_pid\" 2>/dev/null || true;",
+                    "fi;",
+                    "fi",
+                )
+            ),
+        )
 
     @with_prompt_template
     @override
@@ -297,7 +544,6 @@ class TraceSafeCodexAgent(Codex):
             "--skip-git-repo-check "
             f"--model {shlex.quote(model)} "
             "--json "
-            "--enable unified_exec "
             f"{cli_flags_arg}"
             f"-- {escaped_instruction}"
         )
@@ -323,16 +569,27 @@ class TraceSafeCodexAgent(Codex):
             'exit "$codex_status"'
         )
 
-        execution_env = dict(env)
-        if getattr(environment, "SUPPORTS_DETACHED_AGENT_EXEC", False):
-            execution_env[NEXAU_DETACHED_EXEC_ENV] = "1"
+        bridge_started = False
         try:
+            if self._northgate_responses_bridge:
+                if not openai_base_url:
+                    raise ValueError("NorthGate Codex requires OPENAI_BASE_URL")
+                await self._start_responses_bridge(environment, openai_base_url)
+                bridge_started = True
             await self.exec_as_agent(
                 environment,
                 command=run_command,
-                env=execution_env,
+                env=env,
             )
         finally:
+            if bridge_started:
+                try:
+                    await self._stop_responses_bridge(environment)
+                except Exception:
+                    self.logger.warning(
+                        "Failed to stop NorthGate Responses bridge",
+                        exc_info=True,
+                    )
             try:
                 await self.exec_as_agent(
                     environment,
@@ -349,10 +606,18 @@ class TraceSafeCodexAgent(Codex):
         result_path = self.logs_dir / CODEX_RESULT_NAME
         stderr_path = self.logs_dir / CODEX_STDERR_NAME
         history_path = self.logs_dir / CODEX_HISTORY_NAME
+        bridge_log_path = self.logs_dir / CODEX_BRIDGE_LOG_NAME
 
         if not any(
             path.exists()
-            for path in (events_path, sessions_dir, result_path, stderr_path, history_path)
+            for path in (
+                events_path,
+                sessions_dir,
+                result_path,
+                stderr_path,
+                history_path,
+                bridge_log_path,
+            )
         ):
             self.logger.warning("No Codex trace artifacts were downloaded")
             return
@@ -425,6 +690,7 @@ class TraceSafeCodexAgent(Codex):
                     else None
                 ),
                 "stderr": _file_record(stderr_path, self.logs_dir),
+                "bridge_log": _file_record(bridge_log_path, self.logs_dir),
                 "result": _file_record(result_path, self.logs_dir),
                 "rollouts": rollout_records,
             },

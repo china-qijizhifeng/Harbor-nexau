@@ -95,6 +95,12 @@ Harbor `trajectory.json`。它保留 `openai/` 之后的完整模型标识，因
 `Nex-N2-Pro`。Codex CLI 版本和 reasoning 设置可分别通过 `HARBOR_CODEX_VERSION`、
 `HARBOR_CODEX_REASONING_EFFORT`、`HARBOR_CODEX_REASONING_SUMMARY` 固定。
 
+Codex harness 默认使用 CLI `0.148.0` 的 `code_mode`/`code_mode_only`。由于 Codex 向该模式
+暴露 raw-input custom `exec`，而 NorthGate 接受标准 function tools，每个 sandbox 内会启动
+一个仅监听 `127.0.0.1` 的 Responses bridge：请求侧将 custom tool 转成
+`function exec(input)`，响应侧再恢复 Codex 需要的 custom-tool JSON/SSE 事件。该 provider
+关闭 WebSocket、web search 和 multi-agent namespace tools，并显式设置 262144-token context。
+
 `--auto-partition` 不会只凭“是否有 Compose 文件”猜测兼容性。Compose 题直接进入 DinD；其余题在
 Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbox 预检。预检成功的题进入
 普通 E2B，确定性的 Dockerfile/E2B 构建不兼容进入 DinD；网络、限流或 provisioning 临时错误会
@@ -367,6 +373,7 @@ token/cost context 并生成 ATIF 文件。每道题（每个 attempt）的评�
 
 - `codex_events.jsonl`：`codex exec --json` 的追加式公开事件流；stdout 不与 stderr 混合。
 - `codex_stderr.log`：Codex CLI 自身诊断输出。
+- `northgate-responses-bridge.log`：sandbox 内 Responses 工具协议 bridge 的启动/错误日志。
 - `codex_history.jsonl`：Codex 的持久化历史；运行时直接链接到日志目录。
 - `sessions/**/rollout-*.jsonl`：全部 Codex native rollout。`CODEX_HOME/sessions` 在运行开始前
   直接链接到 `/logs/agent/sessions`，不是结束后才复制，所以 timeout 时也保留已落盘内容。

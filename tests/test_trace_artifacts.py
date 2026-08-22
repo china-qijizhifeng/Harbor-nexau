@@ -11,6 +11,7 @@ def test_priority_trace_probe_covers_nexau_and_codex_sources() -> None:
     assert "/logs/agent/nexau_trace_events.jsonl" in command
     assert "/logs/agent/codex_events.jsonl" in command
     assert "/logs/agent/codex_stderr.log" in command
+    assert "/logs/agent/northgate-responses-bridge.log" in command
     assert "/logs/agent/codex_result.json" in command
     assert "/logs/agent/codex_history.jsonl" in command
     assert "/logs/agent/sessions" in command

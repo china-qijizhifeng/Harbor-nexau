@@ -25,6 +25,7 @@ class FakeEnvironment:
         self.default_user = "agent"
         self.exec_calls: list[dict[str, Any]] = []
         self.uploaded_files: list[tuple[Path | str, str]] = []
+        self.uploaded_payloads: dict[str, bytes] = {}
 
     async def exec(self, **kwargs: Any) -> ExecResult:
         self.exec_calls.append(kwargs)
@@ -32,6 +33,7 @@ class FakeEnvironment:
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         self.uploaded_files.append((source_path, target_path))
+        self.uploaded_payloads[target_path] = Path(source_path).read_bytes()
 
 
 def make_agent(
@@ -41,7 +43,7 @@ def make_agent(
     return TraceSafeCodexAgent(
         logs_dir=tmp_path,
         model_name=model_name,
-        version="0.144.6",
+        version="0.148.0",
         reasoning_effort="high",
         reasoning_summary="detailed",
         extra_env={
@@ -65,7 +67,7 @@ def test_harbor_factory_constructs_trace_safe_codex(tmp_path: Path) -> None:
         "nexau_harbor.codex_agent:TraceSafeCodexAgent",
         logs_dir=tmp_path,
         model_name="openai/nex-agi/Nex-N2-Pro",
-        version="0.144.6",
+        version="0.148.0",
         extra_env={
             "OPENAI_API_KEY": "test-key",
             "OPENAI_BASE_URL": "https://example.test/v1",
@@ -81,10 +83,29 @@ def test_codex_agent_preserves_namespaced_model_and_forces_trace_config(tmp_path
 
     assert agent._runtime_model_name() == "nex-agi/Nex-N2-Pro"
     assert agent._build_trace_config("https://example.test/v1") == {
-        "openai_base_url": "https://example.test/v1",
+        "model_provider": "northgate",
+        "model_context_window": 262144,
+        "web_search": "disabled",
+        "model_providers": {
+            "northgate": {
+                "name": "NorthGate via Responses bridge",
+                "base_url": "http://127.0.0.1:48123/v1",
+                "env_key": "OPENAI_API_KEY",
+                "wire_api": "responses",
+                "supports_websockets": False,
+                "supports_standalone_web_search": False,
+            }
+        },
         "history": {"persistence": "save-all"},
         "hide_agent_reasoning": False,
     }
+    assert agent.version() == "0.148.0"
+    assert agent.build_cli_flags().endswith(
+        "--enable unified_exec --enable code_mode --enable code_mode_only "
+        "--disable multi_agent --disable multi_agent_v2"
+    )
+    assert agent.extra_env["NO_PROXY"] == "127.0.0.1,localhost"
+    assert agent.extra_env["no_proxy"] == "127.0.0.1,localhost"
     assert not agent.SUPPORTS_ATIF
     assert not agent.SUPPORTS_LOAD_ATIF_TRAJECTORY
 
@@ -103,6 +124,11 @@ async def test_codex_agent_writes_raw_streams_and_sessions_during_run(tmp_path: 
     assert "ln -s /logs/agent/sessions" in setup_command
     assert "ln -s /logs/agent/codex_history.jsonl" in setup_command
     assert "--model nex-agi/Nex-N2-Pro" in run_command
+    assert run_command.count("--enable unified_exec") == 1
+    assert "--enable code_mode" in run_command
+    assert "--enable code_mode_only" in run_command
+    assert "--disable multi_agent" in run_command
+    assert "--disable multi_agent_v2" in run_command
     assert "set -o pipefail" in run_command
     assert "2>/logs/agent/codex_stderr.log" in run_command
     assert "| tee /logs/agent/codex_events.jsonl >/dev/null" in run_command
@@ -110,6 +136,11 @@ async def test_codex_agent_writes_raw_streams_and_sessions_during_run(tmp_path: 
     assert 'codex_status="${PIPESTATUS[0]}"' in run_command
     assert "/logs/agent/codex_result.json" in run_command
     assert run_call["env"][NEXAU_DETACHED_EXEC_ENV] == "1"
+    assert any("nohup node" in command for command in commands)
+    assert any('kill "$bridge_pid"' in command for command in commands)
+    bridge_path = "/tmp/northgate-codex-bridge/bridge.js"
+    assert bridge_path in environment.uploaded_payloads
+    assert b"customToolToFunction" in environment.uploaded_payloads[bridge_path]
     syntax = subprocess.run(
         ["bash", "-n"],
         input=run_command,
@@ -118,6 +149,20 @@ async def test_codex_agent_writes_raw_streams_and_sessions_during_run(tmp_path: 
         check=False,
     )
     assert syntax.returncode == 0, syntax.stderr
+
+
+async def test_codex_install_uses_detached_e2b_execution(tmp_path: Path) -> None:
+    agent = make_agent(tmp_path)
+    environment = FakeEnvironment()
+
+    await agent.install(environment)
+
+    install_call = next(
+        call
+        for call in environment.exec_calls
+        if "npm install -g @openai/codex" in call["command"]
+    )
+    assert install_call["env"][NEXAU_DETACHED_EXEC_ENV] == "1"
 
 
 async def test_codex_shell_pipeline_keeps_jsonl_clean_and_propagates_exit(
@@ -260,6 +305,10 @@ def test_post_run_writes_manifest_and_metrics_without_trajectory(tmp_path: Path)
         encoding="utf-8",
     )
     (tmp_path / "codex_stderr.log").write_text("", encoding="utf-8")
+    (tmp_path / "northgate-responses-bridge.log").write_text(
+        "NorthGate Responses bridge listening\n",
+        encoding="utf-8",
+    )
     (tmp_path / "codex_history.jsonl").write_text(
         json.dumps({"session_id": "thread-1", "text": "fix the task"}) + "\n",
         encoding="utf-8",
@@ -288,6 +337,7 @@ def test_post_run_writes_manifest_and_metrics_without_trajectory(tmp_path: Path)
     assert manifest["trace_complete"] is True
     assert manifest["artifacts"]["events"]["invalid_json_lines"] == 0
     assert manifest["artifacts"]["history"]["invalid_json_lines"] == 0
+    assert manifest["artifacts"]["bridge_log"]["size_bytes"] > 0
     assert manifest["artifacts"]["rollouts"][0]["path"].endswith("rollout-test.jsonl")
     assert context.n_input_tokens == 120
     assert context.n_cache_tokens == 80
@@ -340,6 +390,39 @@ def test_incomplete_stream_uses_rollout_usage_and_stays_incomplete(tmp_path: Pat
     assert context.n_input_tokens == 41
     assert context.n_cache_tokens == 17
     assert context.n_output_tokens == 13
+
+
+def test_recoverable_error_event_does_not_mark_trace_complete(tmp_path: Path) -> None:
+    agent = make_agent(tmp_path)
+    events = [
+        {"type": "thread.started", "thread_id": "thread-retry"},
+        {"type": "turn.started"},
+        {"type": "error", "message": "Reconnecting... 1/5 (request timed out)"},
+    ]
+    (tmp_path / "codex_events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    (tmp_path / "codex_result.json").write_text(
+        json.dumps({"schema_version": 1, "status": "running", "exit_code": None}),
+        encoding="utf-8",
+    )
+    rollout = tmp_path / "sessions/2026/08/23/rollout-retry.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "thread-retry"}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    agent.populate_context_post_run(AgentContext())
+
+    result = json.loads((tmp_path / "codex_result.json").read_text())
+    manifest = json.loads((tmp_path / "trace_manifest.json").read_text())
+    assert result["status"] == "incomplete"
+    assert result["trace_status"] == "running"
+    assert result["trace_complete"] is False
+    assert manifest["event_summary"]["event_type_counts"]["error"] == 1
 
 
 def test_post_run_does_not_invent_artifacts_when_download_failed(tmp_path: Path) -> None:

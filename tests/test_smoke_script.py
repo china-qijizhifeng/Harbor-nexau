@@ -286,7 +286,15 @@ def test_smoke_script_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> Non
         "    model_name: 'openai/nex-agi/Nex-N2-Pro'\n"
         "    override_timeout_sec: 36000\n"
         "    kwargs:\n"
-        "      version: '0.144.6'\n"
+        "      version: '0.148.0'\n"
+        "      unified_exec: true\n"
+        "      code_mode: true\n"
+        "      code_mode_only: true\n"
+        "      multi_agent: false\n"
+        "      responses_bridge: true\n"
+        "      bridge_port: 48123\n"
+        "      provider_name: 'northgate'\n"
+        "      context_window: 262144\n"
         "      reasoning_effort: 'high'\n"
         "      reasoning_summary: 'detailed'\n"
     )
@@ -300,7 +308,15 @@ def test_smoke_script_non_trace_mode_selects_trace_safe_codex(tmp_path: Path) ->
     arguments = result.stdout.splitlines()
     agent_index = arguments.index("--agent")
     assert arguments[agent_index + 1] == "nexau_harbor.codex_agent:TraceSafeCodexAgent"
-    assert "version=0.144.6" in arguments
+    assert "version=0.148.0" in arguments
+    assert "unified_exec=true" in arguments
+    assert "code_mode=true" in arguments
+    assert "code_mode_only=true" in arguments
+    assert "multi_agent=false" in arguments
+    assert "responses_bridge=true" in arguments
+    assert "bridge_port=48123" in arguments
+    assert "provider_name=northgate" in arguments
+    assert "context_window=262144" in arguments
     assert "reasoning_effort=high" in arguments
     assert "reasoning_summary=detailed" in arguments
 

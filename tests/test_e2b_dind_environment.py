@@ -440,6 +440,7 @@ async def test_agent_log_download_prioritizes_codex_events_and_rollouts(
     payloads = {
         "codex_events.jsonl": b'{"type":"thread.started"}\n',
         "codex_stderr.log": b"warning\n",
+        "northgate-responses-bridge.log": b"bridge ready\n",
         "codex_result.json": b'{"status":"running"}\n',
         "codex_history.jsonl": b'{"session_id":"thread"}\n',
     }
@@ -464,6 +465,7 @@ async def test_agent_log_download_prioritizes_codex_events_and_rollouts(
         assert exclude_relative_paths == (
             "codex_events.jsonl",
             "codex_stderr.log",
+            "northgate-responses-bridge.log",
             "codex_result.json",
             "codex_history.jsonl",
             "sessions",
@@ -478,6 +480,7 @@ async def test_agent_log_download_prioritizes_codex_events_and_rollouts(
                 stdout=(
                     "file\tcodex_events.jsonl\n"
                     "file\tcodex_stderr.log\n"
+                    "file\tnorthgate-responses-bridge.log\n"
                     "file\tcodex_result.json\n"
                     "file\tcodex_history.jsonl\n"
                     "dir\tsessions\n"
@@ -496,6 +499,9 @@ async def test_agent_log_download_prioritizes_codex_events_and_rollouts(
         "codex_events.jsonl"
     ]
     assert (tmp_path / "codex_stderr.log").read_bytes() == payloads["codex_stderr.log"]
+    assert (tmp_path / "northgate-responses-bridge.log").read_bytes() == payloads[
+        "northgate-responses-bridge.log"
+    ]
     assert (tmp_path / "codex_result.json").read_bytes() == payloads[
         "codex_result.json"
     ]

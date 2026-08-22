@@ -18,7 +18,7 @@ dataset="${HARBOR_NEXAU_DATASET:-terminal-bench/terminal-bench-3@sha256:88433fbc
 environment="${HARBOR_NEXAU_ENV:-}"
 agent_config="${HARBOR_NEXAU_CONFIG_PATH:-$project_root/src/nexau_harbor/configs/terminal_bench/code_agent.yaml}"
 harness="${HARBOR_NEXAU_HARNESS:-nexau}"
-codex_version="${HARBOR_CODEX_VERSION:-0.144.6}"
+codex_version="${HARBOR_CODEX_VERSION:-0.148.0}"
 codex_reasoning_effort="${HARBOR_CODEX_REASONING_EFFORT:-high}"
 codex_reasoning_summary="${HARBOR_CODEX_REASONING_SUMMARY:-detailed}"
 trace_mode=0
@@ -537,6 +537,14 @@ if [[ "$trace_mode" == "1" ]]; then
     printf '%s\n' '    kwargs:'
     if [[ "$harness" == "codex" ]]; then
       printf '      version: %s\n' "$(yaml_quote "$codex_version")"
+      printf '%s\n' '      unified_exec: true'
+      printf '%s\n' '      code_mode: true'
+      printf '%s\n' '      code_mode_only: true'
+      printf '%s\n' '      multi_agent: false'
+      printf '%s\n' '      responses_bridge: true'
+      printf '%s\n' '      bridge_port: 48123'
+      printf '      provider_name: %s\n' "$(yaml_quote 'northgate')"
+      printf '%s\n' '      context_window: 262144'
       printf '      reasoning_effort: %s\n' "$(yaml_quote "$codex_reasoning_effort")"
       printf '      reasoning_summary: %s\n' "$(yaml_quote "$codex_reasoning_summary")"
     else
@@ -563,6 +571,14 @@ if [[ "$harness" == "codex" ]]; then
   agent_args=(
     --agent nexau_harbor.codex_agent:TraceSafeCodexAgent
     --agent-kwarg "version=$codex_version"
+    --agent-kwarg "unified_exec=true"
+    --agent-kwarg "code_mode=true"
+    --agent-kwarg "code_mode_only=true"
+    --agent-kwarg "multi_agent=false"
+    --agent-kwarg "responses_bridge=true"
+    --agent-kwarg "bridge_port=48123"
+    --agent-kwarg "provider_name=northgate"
+    --agent-kwarg "context_window=262144"
     --agent-kwarg "reasoning_effort=$codex_reasoning_effort"
     --agent-kwarg "reasoning_summary=$codex_reasoning_summary"
   )
