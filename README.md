@@ -43,7 +43,7 @@ uv run harbor run \
   --dataset terminal-bench/terminal-bench-3@sha256:88433fbcecd1a3f81f7a71bff4cc76c394d0edbefb7e028f90d4109b639fefba \
   --agent nexau_harbor.agent:NexAUAgent \
   --agent-kwarg config_path="$PWD/src/nexau_harbor/configs/terminal_bench/code_agent.yaml" \
-  --model openai/gpt-5 \
+  --model gpt-5.5 \
   --n-tasks 1 \
   --n-concurrent 1
 ```
@@ -73,7 +73,7 @@ scripts/smoke_tb3.sh \
   --trace-mode \
   --path /root/.cache/harbor/tasks/local-datasets/frontier-bench-cpu68-20260813 \
   --e2b-start-ramp-delay-sec 5 \
-  --job-name nexau-n2-pro-frontier
+  --job-name nexau-gpt-5-5-frontier
 ```
 
 要保持模型和任务不变、仅将 NexAU harness 替换为 Codex，可以增加
@@ -86,20 +86,21 @@ scripts/smoke_tb3.sh \
   --harness codex \
   --path /root/.cache/harbor/tasks/local-datasets/frontier-bench-cpu68-20260813 \
   --e2b-start-ramp-delay-sec 5 \
-  --job-name codex-harness-n2-pro-frontier
+  --job-name codex-harness-gpt-5-5-frontier
 ```
 
 该模式使用仓库内的 `TraceSafeCodexAgent`，不会修改 Harbor site-packages，也不会生成
-Harbor `trajectory.json`。它保留 `openai/` 之后的完整模型标识，因此
-`openai/nex-agi/Nex-N2-Pro` 会传给 Codex CLI 为 `nex-agi/Nex-N2-Pro`，不会被缩短为
-`Nex-N2-Pro`。Codex CLI 版本和 reasoning 设置可分别通过 `HARBOR_CODEX_VERSION`、
+Harbor `trajectory.json`。当前 Distill 对齐配置使用裸模型标识 `gpt-5.5`，因此脚本也会将
+`gpt-5.5` 原样传给 Codex CLI。带 provider 前缀的模型仍只会在前缀与 Harbor provider 一致时
+去掉第一段。Codex CLI 版本和 reasoning 设置可分别通过 `HARBOR_CODEX_VERSION`、
 `HARBOR_CODEX_REASONING_EFFORT`、`HARBOR_CODEX_REASONING_SUMMARY` 固定。
 
-Codex harness 默认使用 CLI `0.148.0` 的 `code_mode`/`code_mode_only`。由于 Codex 向该模式
-暴露 raw-input custom `exec`，而 NorthGate 接受标准 function tools，每个 sandbox 内会启动
-一个仅监听 `127.0.0.1` 的 Responses bridge：请求侧将 custom tool 转成
-`function exec(input)`，响应侧再恢复 Codex 需要的 custom-tool JSON/SSE 事件。该 provider
-关闭 WebSocket、web search 和 multi-agent namespace tools，并显式设置 262144-token context。
+Codex harness 默认使用 CLI `0.148.0` 的标准 function-tool 模式：启用稳定的 `unified_exec`，
+显式关闭实验性的 `code_mode`/`code_mode_only` 和 multi-agent namespace tools。这样
+`exec_command`、`write_stdin`、`update_plan`、`view_image` 会携带正式 JSON schema 发送给模型，
+符合 `gpt-5.5` 的 Distill 配置。标准模式仍会把 `apply_patch` 暴露为 Responses custom tool，
+因此每个 sandbox 保留 loopback bridge，仅转换 custom/function 协议，不再引入 code-mode custom
+`exec`。provider 同时关闭 WebSocket 和 web search，并显式设置 272000-token context。
 
 `--auto-partition` 不会只凭“是否有 Compose 文件”猜测兼容性。Compose 题直接进入 DinD；其余题在
 Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbox 预检。预检成功的题进入
@@ -373,7 +374,8 @@ token/cost context 并生成 ATIF 文件。每道题（每个 attempt）的评�
 
 - `codex_events.jsonl`：`codex exec --json` 的追加式公开事件流；stdout 不与 stderr 混合。
 - `codex_stderr.log`：Codex CLI 自身诊断输出。
-- `northgate-responses-bridge.log`：sandbox 内 Responses 工具协议 bridge 的启动/错误日志。
+- `northgate-responses-bridge.log`：标准 `unified_exec` 模式下用于转换 `apply_patch` custom tool
+  的 loopback bridge 启动/错误日志。
 - `codex_history.jsonl`：Codex 的持久化历史；运行时直接链接到日志目录。
 - `sessions/**/rollout-*.jsonl`：全部 Codex native rollout。`CODEX_HOME/sessions` 在运行开始前
   直接链接到 `/logs/agent/sessions`，不是结束后才复制，所以 timeout 时也保留已落盘内容。

@@ -538,13 +538,13 @@ if [[ "$trace_mode" == "1" ]]; then
     if [[ "$harness" == "codex" ]]; then
       printf '      version: %s\n' "$(yaml_quote "$codex_version")"
       printf '%s\n' '      unified_exec: true'
-      printf '%s\n' '      code_mode: true'
-      printf '%s\n' '      code_mode_only: true'
+      printf '%s\n' '      code_mode: false'
+      printf '%s\n' '      code_mode_only: false'
       printf '%s\n' '      multi_agent: false'
       printf '%s\n' '      responses_bridge: true'
       printf '%s\n' '      bridge_port: 48123'
       printf '      provider_name: %s\n' "$(yaml_quote 'northgate')"
-      printf '%s\n' '      context_window: 262144'
+      printf '%s\n' '      context_window: 272000'
       printf '      reasoning_effort: %s\n' "$(yaml_quote "$codex_reasoning_effort")"
       printf '      reasoning_summary: %s\n' "$(yaml_quote "$codex_reasoning_summary")"
     else
@@ -572,13 +572,13 @@ if [[ "$harness" == "codex" ]]; then
     --agent nexau_harbor.codex_agent:TraceSafeCodexAgent
     --agent-kwarg "version=$codex_version"
     --agent-kwarg "unified_exec=true"
-    --agent-kwarg "code_mode=true"
-    --agent-kwarg "code_mode_only=true"
+    --agent-kwarg "code_mode=false"
+    --agent-kwarg "code_mode_only=false"
     --agent-kwarg "multi_agent=false"
     --agent-kwarg "responses_bridge=true"
     --agent-kwarg "bridge_port=48123"
     --agent-kwarg "provider_name=northgate"
-    --agent-kwarg "context_window=262144"
+    --agent-kwarg "context_window=272000"
     --agent-kwarg "reasoning_effort=$codex_reasoning_effort"
     --agent-kwarg "reasoning_summary=$codex_reasoning_summary"
   )

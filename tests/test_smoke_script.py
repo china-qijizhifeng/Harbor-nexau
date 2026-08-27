@@ -93,7 +93,7 @@ printf "%s\\n" "$@"
     env.update(
         {
             "HARBOR_NEXAU_ENV_FILE": str(tmp_path / "missing.env"),
-            "HARBOR_NEXAU_MODEL": "openai/nex-agi/Nex-N2-Pro",
+            "HARBOR_NEXAU_MODEL": "gpt-5.5",
             "PATH": f"{bin_dir}:{env['PATH']}",
         }
     )
@@ -247,7 +247,7 @@ def test_smoke_script_trace_mode_overrides_task_timeout(tmp_path: Path) -> None:
     assert trace_config_capture.read_text() == (
         "agents:\n"
         "  - name: 'nexau_harbor.agent:NexAUAgent'\n"
-        "    model_name: 'openai/nex-agi/Nex-N2-Pro'\n"
+        "    model_name: 'gpt-5.5'\n"
         "    override_timeout_sec: 36000\n"
         "    kwargs:\n"
         f"      config_path: '{_DEFAULT_TB_CONFIG}'\n"
@@ -283,18 +283,18 @@ def test_smoke_script_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> Non
     assert trace_config_capture.read_text() == (
         "agents:\n"
         "  - name: 'nexau_harbor.codex_agent:TraceSafeCodexAgent'\n"
-        "    model_name: 'openai/nex-agi/Nex-N2-Pro'\n"
+        "    model_name: 'gpt-5.5'\n"
         "    override_timeout_sec: 36000\n"
         "    kwargs:\n"
         "      version: '0.148.0'\n"
         "      unified_exec: true\n"
-        "      code_mode: true\n"
-        "      code_mode_only: true\n"
+        "      code_mode: false\n"
+        "      code_mode_only: false\n"
         "      multi_agent: false\n"
         "      responses_bridge: true\n"
         "      bridge_port: 48123\n"
         "      provider_name: 'northgate'\n"
-        "      context_window: 262144\n"
+        "      context_window: 272000\n"
         "      reasoning_effort: 'high'\n"
         "      reasoning_summary: 'detailed'\n"
     )
@@ -310,13 +310,13 @@ def test_smoke_script_non_trace_mode_selects_trace_safe_codex(tmp_path: Path) ->
     assert arguments[agent_index + 1] == "nexau_harbor.codex_agent:TraceSafeCodexAgent"
     assert "version=0.148.0" in arguments
     assert "unified_exec=true" in arguments
-    assert "code_mode=true" in arguments
-    assert "code_mode_only=true" in arguments
+    assert "code_mode=false" in arguments
+    assert "code_mode_only=false" in arguments
     assert "multi_agent=false" in arguments
     assert "responses_bridge=true" in arguments
     assert "bridge_port=48123" in arguments
     assert "provider_name=northgate" in arguments
-    assert "context_window=262144" in arguments
+    assert "context_window=272000" in arguments
     assert "reasoning_effort=high" in arguments
     assert "reasoning_summary=detailed" in arguments
 

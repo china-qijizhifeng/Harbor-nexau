@@ -202,13 +202,13 @@ class TraceSafeCodexAgent(Codex):
         self,
         *args: Any,
         unified_exec: bool = True,
-        code_mode: bool = True,
-        code_mode_only: bool = True,
+        code_mode: bool = False,
+        code_mode_only: bool = False,
         multi_agent: bool = False,
         responses_bridge: bool = True,
         bridge_port: int = DEFAULT_BRIDGE_PORT,
         provider_name: str = "northgate",
-        context_window: int = 262144,
+        context_window: int = 272000,
         version: str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -221,8 +221,6 @@ class TraceSafeCodexAgent(Codex):
             raise ValueError("bridge_port must be between 1 and 65535")
         if code_mode_only and not code_mode:
             raise ValueError("code_mode_only requires code_mode")
-        if responses_bridge and not code_mode:
-            raise ValueError("responses_bridge requires code_mode")
         if responses_bridge and multi_agent:
             raise ValueError("responses_bridge does not support namespace multi-agent tools")
 
@@ -303,10 +301,16 @@ class TraceSafeCodexAgent(Codex):
                 else "--disable unified_exec"
             )
         ]
-        if self._northgate_code_mode:
-            feature_flags.append("--enable code_mode")
-        if self._northgate_code_mode_only:
-            feature_flags.append("--enable code_mode_only")
+        feature_flags.append(
+            "--enable code_mode"
+            if self._northgate_code_mode
+            else "--disable code_mode"
+        )
+        feature_flags.append(
+            "--enable code_mode_only"
+            if self._northgate_code_mode_only
+            else "--disable code_mode_only"
+        )
         if self._northgate_multi_agent:
             feature_flags.append("--enable multi_agent")
         else:

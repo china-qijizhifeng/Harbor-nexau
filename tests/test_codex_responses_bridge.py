@@ -144,6 +144,67 @@ def _custom_exec_tool() -> dict[str, Any]:
     }
 
 
+def _custom_apply_patch_tool() -> dict[str, Any]:
+    return {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Apply a patch to files.",
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": "start: SOURCE\nSOURCE: /[\\s\\S]+/\n",
+        },
+    }
+
+
+def test_bridge_converts_standard_mode_apply_patch_custom_tool() -> None:
+    patch = "*** Begin Patch\n*** Add File: probe.txt\n+ok\n*** End Patch"
+
+    def responder(handler: BaseHTTPRequestHandler, payload: dict[str, Any]) -> None:
+        assert payload["tools"][0]["type"] == "function"
+        assert payload["tools"][0]["name"] == "apply_patch"
+        body = json.dumps(
+            {
+                "id": "resp_patch",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "fc_patch",
+                        "type": "function_call",
+                        "call_id": "call_patch",
+                        "name": "apply_patch",
+                        "arguments": json.dumps({"input": patch}),
+                        "status": "completed",
+                    }
+                ],
+            }
+        ).encode()
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    with _upstream_server(responder) as (_state, upstream_port):
+        with _bridge_process(upstream_port) as bridge_port:
+            status, _content_type, body = _post_json(
+                bridge_port,
+                {
+                    "model": "gpt-5.5",
+                    "input": "patch the file",
+                    "tools": [_custom_apply_patch_tool()],
+                    "stream": False,
+                },
+            )
+
+    assert status == 200
+    response = json.loads(body)
+    assert response["output"][0]["type"] == "custom_tool_call"
+    assert response["output"][0]["name"] == "apply_patch"
+    assert response["output"][0]["input"] == patch
+
+
 def test_bridge_converts_custom_exec_request_and_nonstreaming_response() -> None:
     def responder(handler: BaseHTTPRequestHandler, _payload: dict[str, Any]) -> None:
         body = json.dumps(

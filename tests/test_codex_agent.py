@@ -38,7 +38,8 @@ class FakeEnvironment:
 
 def make_agent(
     tmp_path: Path,
-    model_name: str = "openai/nex-agi/Nex-N2-Pro",
+    model_name: str = "gpt-5.5",
+    **agent_kwargs: Any,
 ) -> TraceSafeCodexAgent:
     return TraceSafeCodexAgent(
         logs_dir=tmp_path,
@@ -50,6 +51,7 @@ def make_agent(
             "OPENAI_API_KEY": "test-key",
             "OPENAI_BASE_URL": "https://example.test/v1",
         },
+        **agent_kwargs,
     )
 
 
@@ -66,7 +68,7 @@ def test_harbor_factory_constructs_trace_safe_codex(tmp_path: Path) -> None:
     agent = AgentFactory.create_agent_from_import_path(
         "nexau_harbor.codex_agent:TraceSafeCodexAgent",
         logs_dir=tmp_path,
-        model_name="openai/nex-agi/Nex-N2-Pro",
+        model_name="gpt-5.5",
         version="0.148.0",
         extra_env={
             "OPENAI_API_KEY": "test-key",
@@ -75,16 +77,16 @@ def test_harbor_factory_constructs_trace_safe_codex(tmp_path: Path) -> None:
     )
 
     assert isinstance(agent, TraceSafeCodexAgent)
-    assert agent._runtime_model_name() == "nex-agi/Nex-N2-Pro"
+    assert agent._runtime_model_name() == "gpt-5.5"
 
 
-def test_codex_agent_preserves_namespaced_model_and_forces_trace_config(tmp_path: Path) -> None:
+def test_codex_agent_uses_standard_function_tools_with_bridge_provider(tmp_path: Path) -> None:
     agent = make_agent(tmp_path)
 
-    assert agent._runtime_model_name() == "nex-agi/Nex-N2-Pro"
+    assert agent._runtime_model_name() == "gpt-5.5"
     assert agent._build_trace_config("https://example.test/v1") == {
         "model_provider": "northgate",
-        "model_context_window": 262144,
+        "model_context_window": 272000,
         "web_search": "disabled",
         "model_providers": {
             "northgate": {
@@ -101,13 +103,19 @@ def test_codex_agent_preserves_namespaced_model_and_forces_trace_config(tmp_path
     }
     assert agent.version() == "0.148.0"
     assert agent.build_cli_flags().endswith(
-        "--enable unified_exec --enable code_mode --enable code_mode_only "
+        "--enable unified_exec --disable code_mode --disable code_mode_only "
         "--disable multi_agent --disable multi_agent_v2"
     )
     assert agent.extra_env["NO_PROXY"] == "127.0.0.1,localhost"
     assert agent.extra_env["no_proxy"] == "127.0.0.1,localhost"
     assert not agent.SUPPORTS_ATIF
     assert not agent.SUPPORTS_LOAD_ATIF_TRAJECTORY
+
+
+def test_codex_agent_preserves_namespaced_model_for_matching_provider(tmp_path: Path) -> None:
+    agent = make_agent(tmp_path, model_name="openai/nex-agi/Nex-N2-Pro")
+
+    assert agent._runtime_model_name() == "nex-agi/Nex-N2-Pro"
 
 
 async def test_codex_agent_writes_raw_streams_and_sessions_during_run(tmp_path: Path) -> None:
@@ -123,10 +131,10 @@ async def test_codex_agent_writes_raw_streams_and_sessions_during_run(tmp_path: 
 
     assert "ln -s /logs/agent/sessions" in setup_command
     assert "ln -s /logs/agent/codex_history.jsonl" in setup_command
-    assert "--model nex-agi/Nex-N2-Pro" in run_command
+    assert "--model gpt-5.5" in run_command
     assert run_command.count("--enable unified_exec") == 1
-    assert "--enable code_mode" in run_command
-    assert "--enable code_mode_only" in run_command
+    assert "--disable code_mode" in run_command
+    assert "--disable code_mode_only" in run_command
     assert "--disable multi_agent" in run_command
     assert "--disable multi_agent_v2" in run_command
     assert "set -o pipefail" in run_command
@@ -149,6 +157,25 @@ async def test_codex_agent_writes_raw_streams_and_sessions_during_run(tmp_path: 
         check=False,
     )
     assert syntax.returncode == 0, syntax.stderr
+
+
+async def test_codex_agent_can_disable_optional_responses_bridge(tmp_path: Path) -> None:
+    agent = make_agent(
+        tmp_path,
+        responses_bridge=False,
+    )
+    environment = FakeEnvironment()
+
+    await agent.run("fix the task", environment, AgentContext())
+
+    commands = [call["command"] for call in environment.exec_calls]
+    run_command = next(command for command in commands if "codex exec" in command)
+    assert "--disable code_mode" in run_command
+    assert "--disable code_mode_only" in run_command
+    assert not any("nohup node" in command for command in commands)
+    assert not any('kill "$bridge_pid"' in command for command in commands)
+    bridge_path = "/tmp/northgate-codex-bridge/bridge.js"
+    assert bridge_path not in environment.uploaded_payloads
 
 
 async def test_codex_install_uses_detached_e2b_execution(tmp_path: Path) -> None:
