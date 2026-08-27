@@ -100,7 +100,10 @@ Codex harness 默认使用 CLI `0.148.0` 的标准 function-tool 模式：启用
 `exec_command`、`write_stdin`、`update_plan`、`view_image` 会携带正式 JSON schema 发送给模型，
 符合 `gpt-5.5` 的 Distill 配置。标准模式仍会把 `apply_patch` 暴露为 Responses custom tool，
 因此每个 sandbox 保留 loopback bridge，仅转换 custom/function 协议，不再引入 code-mode custom
-`exec`。provider 同时关闭 WebSocket 和 web search，并显式设置 272000-token context。
+`exec`。bridge 同时将 Codex 侧 advertised model `gpt-5.5` 重写为 NorthGate 实际提供的
+`nex-agi/Nex-N2-Pro`，并在响应侧恢复 advertised model；可通过
+`HARBOR_CODEX_UPSTREAM_MODEL` 覆盖。provider 同时关闭 WebSocket 和 web search，并显式设置
+272000-token context。
 
 `--auto-partition` 不会只凭“是否有 Compose 文件”猜测兼容性。Compose 题直接进入 DinD；其余题在
 Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbox 预检。预检成功的题进入
@@ -380,7 +383,8 @@ token/cost context 并生成 ATIF 文件。每道题（每个 attempt）的评�
 - `sessions/**/rollout-*.jsonl`：全部 Codex native rollout。`CODEX_HOME/sessions` 在运行开始前
   直接链接到 `/logs/agent/sessions`，不是结束后才复制，所以 timeout 时也保留已落盘内容。
 - `codex_result.json`：进程状态、trace 完整性、最终公开消息和 usage；硬中断显示为
-  `incomplete`，不会伪装成正常完成。
+  `incomplete`，不会伪装成正常完成；`model` 与 `upstream_model` 分别记录 Codex advertised
+  model 和 NorthGate 实际请求模型。
 - `trace_manifest.json`：上述文件的大小、SHA-256、JSONL 完整性和事件计数。
 
 Codex 模式的可信分析源是 `codex_events.jsonl` 与所有 native rollout；按当前约定不生成

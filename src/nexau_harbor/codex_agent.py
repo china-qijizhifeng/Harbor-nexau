@@ -208,13 +208,19 @@ class TraceSafeCodexAgent(Codex):
         responses_bridge: bool = True,
         bridge_port: int = DEFAULT_BRIDGE_PORT,
         provider_name: str = "northgate",
+        upstream_model_name: str | None = None,
         context_window: int = 272000,
         version: str | None = None,
         **kwargs: Any,
     ) -> None:
         normalized_provider = provider_name.strip()
+        normalized_upstream_model = (
+            upstream_model_name.strip() if upstream_model_name is not None else None
+        )
         if not normalized_provider:
             raise ValueError("provider_name must not be empty")
+        if upstream_model_name is not None and not normalized_upstream_model:
+            raise ValueError("upstream_model_name must not be empty")
         if context_window < 1:
             raise ValueError("context_window must be positive")
         if bridge_port < 1 or bridge_port > 65535:
@@ -223,6 +229,8 @@ class TraceSafeCodexAgent(Codex):
             raise ValueError("code_mode_only requires code_mode")
         if responses_bridge and multi_agent:
             raise ValueError("responses_bridge does not support namespace multi-agent tools")
+        if normalized_upstream_model and not responses_bridge:
+            raise ValueError("upstream_model_name requires responses_bridge")
 
         extra_env = dict(kwargs.pop("extra_env", None) or {})
         for env_name in ("NO_PROXY", "no_proxy"):
@@ -237,6 +245,7 @@ class TraceSafeCodexAgent(Codex):
             extra_env[env_name] = ",".join(entries)
 
         self._northgate_provider_name = normalized_provider
+        self._northgate_upstream_model_name = normalized_upstream_model
         self._northgate_context_window = int(context_window)
         self._northgate_unified_exec = bool(unified_exec)
         self._northgate_code_mode = bool(code_mode)
@@ -423,6 +432,7 @@ class TraceSafeCodexAgent(Codex):
             (
                 "set -euo pipefail",
                 f"mkdir -p {bridge_dir} {agent_dir}",
+                "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi",
                 f"nohup node {script} > {log_file} 2>&1 </dev/null &",
                 "bridge_pid=$!",
                 f"printf '%s\\n' \"$bridge_pid\" > {pid_file}",
@@ -440,13 +450,16 @@ class TraceSafeCodexAgent(Codex):
                 "exit 1",
             )
         )
+        bridge_env = {
+            "NORTHGATE_UPSTREAM_BASE_URL": upstream_base_url.rstrip("/"),
+            "NORTHGATE_BRIDGE_PORT": str(self._northgate_bridge_port),
+        }
+        if self._northgate_upstream_model_name:
+            bridge_env["NORTHGATE_UPSTREAM_MODEL"] = self._northgate_upstream_model_name
         await self.exec_as_agent(
             environment,
             command=command,
-            env={
-                "NORTHGATE_UPSTREAM_BASE_URL": upstream_base_url.rstrip("/"),
-                "NORTHGATE_BRIDGE_PORT": str(self._northgate_bridge_port),
-            },
+            env=bridge_env,
         )
 
     async def _stop_responses_bridge(self, environment: BaseEnvironment) -> None:
@@ -669,6 +682,9 @@ class TraceSafeCodexAgent(Codex):
             "trace_complete": trace_complete,
             "trajectory_generated": False,
             "model": self._runtime_model_name(),
+            "upstream_model": (
+                self._northgate_upstream_model_name or self._runtime_model_name()
+            ),
             "thread_ids": event_summary["thread_ids"],
             "final_response": event_summary["final_response"],
             "usage": usage or None,
@@ -685,6 +701,12 @@ class TraceSafeCodexAgent(Codex):
             ],
             "trajectory_generated": False,
             "trace_complete": trace_complete,
+            "models": {
+                "advertised": self._runtime_model_name(),
+                "upstream": (
+                    self._northgate_upstream_model_name or self._runtime_model_name()
+                ),
+            },
             "event_summary": event_summary,
             "artifacts": {
                 "events": events_record,

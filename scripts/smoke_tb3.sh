@@ -21,6 +21,7 @@ harness="${HARBOR_NEXAU_HARNESS:-nexau}"
 codex_version="${HARBOR_CODEX_VERSION:-0.148.0}"
 codex_reasoning_effort="${HARBOR_CODEX_REASONING_EFFORT:-high}"
 codex_reasoning_summary="${HARBOR_CODEX_REASONING_SUMMARY:-detailed}"
+codex_upstream_model="${HARBOR_CODEX_UPSTREAM_MODEL:-nex-agi/Nex-N2-Pro}"
 trace_mode=0
 trace_timeout_sec="${HARBOR_NEXAU_TRACE_TIMEOUT_SEC:-36000}"
 e2b_start_ramp_delay_sec="${HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC:-0}"
@@ -544,6 +545,7 @@ if [[ "$trace_mode" == "1" ]]; then
       printf '%s\n' '      responses_bridge: true'
       printf '%s\n' '      bridge_port: 48123'
       printf '      provider_name: %s\n' "$(yaml_quote 'northgate')"
+      printf '      upstream_model_name: %s\n' "$(yaml_quote "$codex_upstream_model")"
       printf '%s\n' '      context_window: 272000'
       printf '      reasoning_effort: %s\n' "$(yaml_quote "$codex_reasoning_effort")"
       printf '      reasoning_summary: %s\n' "$(yaml_quote "$codex_reasoning_summary")"
@@ -578,6 +580,7 @@ if [[ "$harness" == "codex" ]]; then
     --agent-kwarg "responses_bridge=true"
     --agent-kwarg "bridge_port=48123"
     --agent-kwarg "provider_name=northgate"
+    --agent-kwarg "upstream_model_name=$codex_upstream_model"
     --agent-kwarg "context_window=272000"
     --agent-kwarg "reasoning_effort=$codex_reasoning_effort"
     --agent-kwarg "reasoning_summary=$codex_reasoning_summary"

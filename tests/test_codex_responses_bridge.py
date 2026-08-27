@@ -67,7 +67,10 @@ def _upstream_server(
 
 
 @contextmanager
-def _bridge_process(upstream_port: int) -> Iterator[int]:
+def _bridge_process(
+    upstream_port: int,
+    upstream_model: str | None = None,
+) -> Iterator[int]:
     if shutil.which("node") is None:
         pytest.skip("node is required for the Codex Responses bridge test")
 
@@ -77,6 +80,8 @@ def _bridge_process(upstream_port: int) -> Iterator[int]:
         "NORTHGATE_UPSTREAM_BASE_URL": f"http://127.0.0.1:{upstream_port}/v1",
         "NORTHGATE_BRIDGE_PORT": str(bridge_port),
     }
+    if upstream_model is not None:
+        env["NORTHGATE_UPSTREAM_MODEL"] = upstream_model
     process = subprocess.Popen(
         ["node", str(BRIDGE_SCRIPT)],
         stdout=subprocess.PIPE,
@@ -161,12 +166,14 @@ def test_bridge_converts_standard_mode_apply_patch_custom_tool() -> None:
     patch = "*** Begin Patch\n*** Add File: probe.txt\n+ok\n*** End Patch"
 
     def responder(handler: BaseHTTPRequestHandler, payload: dict[str, Any]) -> None:
+        assert payload["model"] == "nex-agi/Nex-N2-Pro"
         assert payload["tools"][0]["type"] == "function"
         assert payload["tools"][0]["name"] == "apply_patch"
         body = json.dumps(
             {
                 "id": "resp_patch",
                 "object": "response",
+                "model": "nex-agi/Nex-N2-Pro",
                 "status": "completed",
                 "output": [
                     {
@@ -174,7 +181,7 @@ def test_bridge_converts_standard_mode_apply_patch_custom_tool() -> None:
                         "type": "function_call",
                         "call_id": "call_patch",
                         "name": "apply_patch",
-                        "arguments": json.dumps({"input": patch}),
+                        "arguments": json.dumps({"command": patch}),
                         "status": "completed",
                     }
                 ],
@@ -187,7 +194,10 @@ def test_bridge_converts_standard_mode_apply_patch_custom_tool() -> None:
         handler.wfile.write(body)
 
     with _upstream_server(responder) as (_state, upstream_port):
-        with _bridge_process(upstream_port) as bridge_port:
+        with _bridge_process(
+            upstream_port,
+            upstream_model="nex-agi/Nex-N2-Pro",
+        ) as bridge_port:
             status, _content_type, body = _post_json(
                 bridge_port,
                 {
@@ -200,6 +210,7 @@ def test_bridge_converts_standard_mode_apply_patch_custom_tool() -> None:
 
     assert status == 200
     response = json.loads(body)
+    assert response["model"] == "gpt-5.5"
     assert response["output"][0]["type"] == "custom_tool_call"
     assert response["output"][0]["name"] == "apply_patch"
     assert response["output"][0]["input"] == patch
@@ -343,6 +354,7 @@ def test_bridge_emits_custom_tool_stream_events_with_raw_input() -> None:
             "response": {
                 "id": "resp_stream",
                 "object": "response",
+                "model": "nex-agi/Nex-N2-Pro",
                 "status": "in_progress",
                 "output": [],
             },
@@ -401,6 +413,7 @@ def test_bridge_emits_custom_tool_stream_events_with_raw_input() -> None:
             "response": {
                 "id": "resp_stream",
                 "object": "response",
+                "model": "nex-agi/Nex-N2-Pro",
                 "status": "completed",
                 "output": [
                     {
@@ -430,7 +443,10 @@ def test_bridge_emits_custom_tool_stream_events_with_raw_input() -> None:
             handler.wfile.flush()
 
     with _upstream_server(responder) as (state, upstream_port):
-        with _bridge_process(upstream_port) as bridge_port:
+        with _bridge_process(
+            upstream_port,
+            upstream_model="nex-agi/Nex-N2-Pro",
+        ) as bridge_port:
             status, content_type, body = _post_json(
                 bridge_port,
                 {
@@ -445,6 +461,7 @@ def test_bridge_emits_custom_tool_stream_events_with_raw_input() -> None:
     assert status == 200
     assert content_type == "text/event-stream"
     assert state.requests[0]["payload"]["stream"] is True
+    assert state.requests[0]["payload"]["model"] == "nex-agi/Nex-N2-Pro"
 
     payloads = [
         json.loads(line.removeprefix("data: "))
@@ -483,6 +500,7 @@ def test_bridge_emits_custom_tool_stream_events_with_raw_input() -> None:
     completed = next(
         payload for payload in payloads if payload["type"] == "response.completed"
     )
+    assert completed["response"]["model"] == "test-model"
     assert completed["response"]["output"][0]["type"] == "custom_tool_call"
     assert completed["response"]["output"][0]["input"] == 'text("OK");'
 

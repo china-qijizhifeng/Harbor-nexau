@@ -73,6 +73,12 @@ function unwrapFunctionArguments(argumentsText) {
       if (typeof parsed.content === "string") {
         return parsed.content;
       }
+      if (typeof parsed.command === "string") {
+        return parsed.command;
+      }
+      if (typeof parsed.patch === "string") {
+        return parsed.patch;
+      }
     }
   } catch (_error) {
     // Preserve malformed arguments so Codex can surface the provider failure.
@@ -219,7 +225,7 @@ function transformInputItem(item, customNames) {
   return item;
 }
 
-function transformRequestBody(body) {
+function transformRequestBody(body, upstreamModel = null) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new Error("Responses request body must be a JSON object");
   }
@@ -255,6 +261,10 @@ function transformRequestBody(body) {
 
   const customNames = new Set(customTools.keys());
   const converted = { ...body };
+  const downstreamModel = typeof body.model === "string" ? body.model : null;
+  if (upstreamModel) {
+    converted.model = upstreamModel;
+  }
   if (Array.isArray(body.tools)) {
     converted.tools = body.tools.map((tool) =>
       tool && typeof tool === "object" && tool.type === "custom"
@@ -267,7 +277,14 @@ function transformRequestBody(body) {
   }
   converted.tool_choice = transformToolChoice(body.tool_choice, customNames);
 
-  return { body: converted, customNames, customTools, functionTools };
+  return {
+    body: converted,
+    customNames,
+    customTools,
+    functionTools,
+    downstreamModel,
+    upstreamModel,
+  };
 }
 
 function transformCallItem(item, context) {
@@ -305,6 +322,12 @@ function transformResponseObject(response, context) {
     return response;
   }
   const converted = { ...response };
+  if (
+    context.downstreamModel &&
+    Object.prototype.hasOwnProperty.call(response, "model")
+  ) {
+    converted.model = context.downstreamModel;
+  }
   if (Array.isArray(response.output)) {
     converted.output = response.output.map((item) => transformCallItem(item, context));
   }
@@ -550,7 +573,7 @@ async function proxyResponses(request, response, options) {
 
   let transformed;
   try {
-    transformed = transformRequestBody(parsedBody);
+    transformed = transformRequestBody(parsedBody, options.upstreamModel);
   } catch (error) {
     error.statusCode = 400;
     throw error;
@@ -574,6 +597,8 @@ async function proxyResponses(request, response, options) {
     customNames: transformed.customNames,
     customTools: transformed.customTools,
     functionTools: transformed.functionTools,
+    downstreamModel: transformed.downstreamModel,
+    upstreamModel: transformed.upstreamModel,
     calls: new Map(),
     nextSequence: 0,
   };
@@ -660,6 +685,7 @@ function main() {
   }
   const options = {
     upstreamBaseUrl: normalizeUpstreamBaseUrl(upstreamValue),
+    upstreamModel: String(process.env.NORTHGATE_UPSTREAM_MODEL || "").trim() || null,
     port: parsePositiveInteger(
       process.env.NORTHGATE_BRIDGE_PORT,
       DEFAULT_PORT,
@@ -673,7 +699,12 @@ function main() {
   };
   const server = createBridgeServer(options);
   server.listen(options.port, "127.0.0.1", () => {
-    process.stdout.write(`NorthGate Responses bridge listening on 127.0.0.1:${options.port}\n`);
+    const modelRoute = options.upstreamModel
+      ? `; upstream model ${options.upstreamModel}`
+      : "; model passthrough";
+    process.stdout.write(
+      `NorthGate Responses bridge listening on 127.0.0.1:${options.port}${modelRoute}\n`,
+    );
   });
   const shutdown = () => server.close(() => process.exit(0));
   process.on("SIGINT", shutdown);

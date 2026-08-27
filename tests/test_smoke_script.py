@@ -101,6 +101,7 @@ printf "%s\\n" "$@"
     for name in (
         "HARBOR_NEXAU_HARNESS",
         "HARBOR_CODEX_VERSION",
+        "HARBOR_CODEX_UPSTREAM_MODEL",
         "HARBOR_CODEX_REASONING_EFFORT",
         "HARBOR_CODEX_REASONING_SUMMARY",
     ):
@@ -294,6 +295,7 @@ def test_smoke_script_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> Non
         "      responses_bridge: true\n"
         "      bridge_port: 48123\n"
         "      provider_name: 'northgate'\n"
+        "      upstream_model_name: 'nex-agi/Nex-N2-Pro'\n"
         "      context_window: 272000\n"
         "      reasoning_effort: 'high'\n"
         "      reasoning_summary: 'detailed'\n"
@@ -316,6 +318,7 @@ def test_smoke_script_non_trace_mode_selects_trace_safe_codex(tmp_path: Path) ->
     assert "responses_bridge=true" in arguments
     assert "bridge_port=48123" in arguments
     assert "provider_name=northgate" in arguments
+    assert "upstream_model_name=nex-agi/Nex-N2-Pro" in arguments
     assert "context_window=272000" in arguments
     assert "reasoning_effort=high" in arguments
     assert "reasoning_summary=detailed" in arguments

@@ -41,6 +41,7 @@ def make_agent(
     model_name: str = "gpt-5.5",
     **agent_kwargs: Any,
 ) -> TraceSafeCodexAgent:
+    agent_kwargs.setdefault("upstream_model_name", "nex-agi/Nex-N2-Pro")
     return TraceSafeCodexAgent(
         logs_dir=tmp_path,
         model_name=model_name,
@@ -70,6 +71,7 @@ def test_harbor_factory_constructs_trace_safe_codex(tmp_path: Path) -> None:
         logs_dir=tmp_path,
         model_name="gpt-5.5",
         version="0.148.0",
+        upstream_model_name="nex-agi/Nex-N2-Pro",
         extra_env={
             "OPENAI_API_KEY": "test-key",
             "OPENAI_BASE_URL": "https://example.test/v1",
@@ -78,6 +80,7 @@ def test_harbor_factory_constructs_trace_safe_codex(tmp_path: Path) -> None:
 
     assert isinstance(agent, TraceSafeCodexAgent)
     assert agent._runtime_model_name() == "gpt-5.5"
+    assert agent._northgate_upstream_model_name == "nex-agi/Nex-N2-Pro"
 
 
 def test_codex_agent_uses_standard_function_tools_with_bridge_provider(tmp_path: Path) -> None:
@@ -149,6 +152,10 @@ async def test_codex_agent_writes_raw_streams_and_sessions_during_run(tmp_path: 
     bridge_path = "/tmp/northgate-codex-bridge/bridge.js"
     assert bridge_path in environment.uploaded_payloads
     assert b"customToolToFunction" in environment.uploaded_payloads[bridge_path]
+    bridge_start_call = next(
+        call for call in environment.exec_calls if "nohup node" in call["command"]
+    )
+    assert bridge_start_call["env"]["NORTHGATE_UPSTREAM_MODEL"] == "nex-agi/Nex-N2-Pro"
     syntax = subprocess.run(
         ["bash", "-n"],
         input=run_command,
@@ -163,6 +170,7 @@ async def test_codex_agent_can_disable_optional_responses_bridge(tmp_path: Path)
     agent = make_agent(
         tmp_path,
         responses_bridge=False,
+        upstream_model_name=None,
     )
     environment = FakeEnvironment()
 
@@ -365,6 +373,12 @@ def test_post_run_writes_manifest_and_metrics_without_trajectory(tmp_path: Path)
     assert manifest["artifacts"]["events"]["invalid_json_lines"] == 0
     assert manifest["artifacts"]["history"]["invalid_json_lines"] == 0
     assert manifest["artifacts"]["bridge_log"]["size_bytes"] > 0
+    assert manifest["models"] == {
+        "advertised": "gpt-5.5",
+        "upstream": "nex-agi/Nex-N2-Pro",
+    }
+    assert result["model"] == "gpt-5.5"
+    assert result["upstream_model"] == "nex-agi/Nex-N2-Pro"
     assert manifest["artifacts"]["rollouts"][0]["path"].endswith("rollout-test.jsonl")
     assert context.n_input_tokens == 120
     assert context.n_cache_tokens == 80
