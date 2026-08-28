@@ -24,6 +24,7 @@ codex_reasoning_summary="${HARBOR_CODEX_REASONING_SUMMARY:-detailed}"
 codex_upstream_model="${HARBOR_CODEX_UPSTREAM_MODEL:-nex-agi/Nex-N2-Pro}"
 trace_mode=0
 trace_timeout_sec="${HARBOR_NEXAU_TRACE_TIMEOUT_SEC:-36000}"
+agent_setup_timeout_sec="${HARBOR_AGENT_SETUP_TIMEOUT_SEC:-3600}"
 e2b_start_ramp_delay_sec="${HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC:-0}"
 e2b_preflight_timeout_sec="${HARBOR_NEXAU_E2B_PREFLIGHT_TIMEOUT_SEC:-7200}"
 e2b_preflight_attempts="${HARBOR_NEXAU_E2B_PREFLIGHT_ATTEMPTS:-3}"
@@ -215,6 +216,11 @@ fi
 if [[ ! "$e2b_preflight_attempts" =~ ^[1-9][0-9]*$ ]]; then
   printf 'E2B preflight attempts must be a positive integer, got: %s\n' \
     "$e2b_preflight_attempts" >&2
+  exit 2
+fi
+if [[ ! "$agent_setup_timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'Agent setup timeout must be a positive integer, got: %s\n' \
+    "$agent_setup_timeout_sec" >&2
   exit 2
 fi
 if [[ "$refresh_e2b_routing" == "1" && "$task_partition" != "auto" ]]; then
@@ -535,6 +541,7 @@ if [[ "$trace_mode" == "1" ]]; then
     fi
     printf '    model_name: %s\n' "$(yaml_quote "$model")"
     printf '    override_timeout_sec: %s\n' "$trace_timeout_sec"
+    printf '    override_setup_timeout_sec: %s\n' "$agent_setup_timeout_sec"
     printf '%s\n' '    kwargs:'
     if [[ "$harness" == "codex" ]]; then
       printf '      version: %s\n' "$(yaml_quote "$codex_version")"

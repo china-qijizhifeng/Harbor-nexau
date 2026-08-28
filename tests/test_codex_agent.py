@@ -192,11 +192,17 @@ async def test_codex_install_uses_detached_e2b_execution(tmp_path: Path) -> None
 
     await agent.install(environment)
 
+    repair_call = next(
+        call
+        for call in environment.exec_calls
+        if "/etc/ssl/certs/java" in call["command"]
+    )
     install_call = next(
         call
         for call in environment.exec_calls
         if "npm install -g @openai/codex" in call["command"]
     )
+    assert environment.exec_calls.index(repair_call) < environment.exec_calls.index(install_call)
     assert install_call["env"][NEXAU_DETACHED_EXEC_ENV] == "1"
 
 

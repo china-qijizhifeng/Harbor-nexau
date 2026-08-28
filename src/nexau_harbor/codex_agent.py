@@ -15,6 +15,7 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV, REMOTE_LOG_DIR
+from nexau_harbor.system_dependencies import PREPARE_DEBIAN_CA_CERTIFICATES_JAVA
 from nexau_harbor.trace_artifacts import (
     CODEX_BRIDGE_LOG_NAME,
     CODEX_EVENTS_NAME,
@@ -296,6 +297,10 @@ class TraceSafeCodexAgent(Codex):
     async def install(self, environment: BaseEnvironment) -> None:
         self._northgate_detached_install = True
         try:
+            await self.exec_as_root(
+                environment,
+                command=PREPARE_DEBIAN_CA_CERTIFICATES_JAVA,
+            )
             await super().install(environment)
         finally:
             self._northgate_detached_install = False

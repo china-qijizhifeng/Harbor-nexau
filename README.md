@@ -139,6 +139,13 @@ trace 模式通过 Harbor 的 `agent.override_timeout_sec` 覆盖每道题自己
 `--agent-timeout-multiplier`。Terminal-Bench profile 的 500 次迭代上限仍然生效。已经启动的
 job 无法动态切换到 trace 模式。
 
+Agent 安装阶段使用独立的 `agent.override_setup_timeout_sec`，默认从
+`HARBOR_AGENT_SETUP_TIMEOUT_SEC=3600` 读取并写入 trace Job 配置；这与模型解题的10小时上限
+无关。仅设置宿主环境变量但不写入 Agent config 不会改变 Harbor 0.21 的默认360秒 setup 限制。
+在执行 apt 前，两个 installed agent 还会仅对已安装 `ca-certificates-java` 的 Debian 镜像创建
+缺失的 `/etc/ssl/certs/java`，必要时重新配置该包，避免二次 apt 触发官方任务镜像的 keystore
+父目录缺失问题；非 Debian 或未安装该包的镜像保持 no-op。
+
 如果只想单独重跑或诊断某一组，仍可手工选择固定 CPU68 分组：
 
 ```bash

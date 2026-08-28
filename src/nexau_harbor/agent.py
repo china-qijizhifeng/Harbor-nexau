@@ -19,6 +19,7 @@ from nexau_harbor.constants import (
     REMOTE_VENV,
     REMOTE_WORKSPACE,
 )
+from nexau_harbor.system_dependencies import PREPARE_DEBIAN_CA_CERTIFICATES_JAVA
 from nexau_harbor.trajectory import populate_context_from_logs
 
 _PROXY_ENV_NAMES = frozenset(("HTTP_PROXY", "HTTPS_PROXY"))
@@ -327,6 +328,10 @@ class NexAUAgent(BaseInstalledAgent):
 
     @override
     async def install(self, environment: BaseEnvironment) -> None:
+        await self.exec_as_root(
+            environment,
+            command=PREPARE_DEBIAN_CA_CERTIFICATES_JAVA,
+        )
         await self.ensure_system_dependencies(
             environment,
             ("curl", "git", "build_tools", "ripgrep", "procps", "ca_certificates"),

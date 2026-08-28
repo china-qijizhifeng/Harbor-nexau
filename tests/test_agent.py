@@ -14,6 +14,7 @@ from nexau_harbor.constants import (
     NEXAU_GIT_COMMIT,
     REMOTE_WORKSPACE,
 )
+from nexau_harbor.system_dependencies import PREPARE_DEBIAN_CA_CERTIFICATES_JAVA
 
 
 class FakeEnvironment:
@@ -179,6 +180,8 @@ async def test_install_uploads_config_and_pinned_runner(tmp_path: Path) -> None:
     ]
     assert environment.uploaded_files[0][1] == "/nexau-workspace/runner.py"
     install_commands = "\n".join(call["command"] for call in environment.exec_calls)
+    assert PREPARE_DEBIAN_CA_CERTIFICATES_JAVA in install_commands
+    assert "/etc/ssl/certs/java" in environment.exec_calls[0]["command"]
     assert NEXAU_GIT_COMMIT in install_commands
     assert "chown -R 10001:10001 /nexau-workspace /opt/nexau-venv" in install_commands
     assert "uv venv --clear /opt/nexau-venv" in install_commands

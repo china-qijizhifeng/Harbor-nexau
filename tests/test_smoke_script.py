@@ -250,6 +250,7 @@ def test_smoke_script_trace_mode_overrides_task_timeout(tmp_path: Path) -> None:
         "  - name: 'nexau_harbor.agent:NexAUAgent'\n"
         "    model_name: 'gpt-5.5'\n"
         "    override_timeout_sec: 36000\n"
+        "    override_setup_timeout_sec: 3600\n"
         "    kwargs:\n"
         f"      config_path: '{_DEFAULT_TB_CONFIG}'\n"
     )
@@ -286,6 +287,7 @@ def test_smoke_script_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> Non
         "  - name: 'nexau_harbor.codex_agent:TraceSafeCodexAgent'\n"
         "    model_name: 'gpt-5.5'\n"
         "    override_timeout_sec: 36000\n"
+        "    override_setup_timeout_sec: 3600\n"
         "    kwargs:\n"
         "      version: '0.148.0'\n"
         "      unified_exec: true\n"
