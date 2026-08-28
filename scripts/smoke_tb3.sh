@@ -25,6 +25,7 @@ codex_upstream_model="${HARBOR_CODEX_UPSTREAM_MODEL:-nex-agi/Nex-N2-Pro}"
 trace_mode=0
 trace_timeout_sec="${HARBOR_NEXAU_TRACE_TIMEOUT_SEC:-36000}"
 agent_setup_timeout_sec="${HARBOR_AGENT_SETUP_TIMEOUT_SEC:-3600}"
+environment_build_timeout_multiplier="${HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER:-4}"
 e2b_start_ramp_delay_sec="${HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC:-0}"
 e2b_preflight_timeout_sec="${HARBOR_NEXAU_E2B_PREFLIGHT_TIMEOUT_SEC:-7200}"
 e2b_preflight_attempts="${HARBOR_NEXAU_E2B_PREFLIGHT_ATTEMPTS:-3}"
@@ -221,6 +222,11 @@ fi
 if [[ ! "$agent_setup_timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
   printf 'Agent setup timeout must be a positive integer, got: %s\n' \
     "$agent_setup_timeout_sec" >&2
+  exit 2
+fi
+if [[ ! "$environment_build_timeout_multiplier" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'Environment build timeout multiplier must be a positive integer, got: %s\n' \
+    "$environment_build_timeout_multiplier" >&2
   exit 2
 fi
 if [[ "$refresh_e2b_routing" == "1" && "$task_partition" != "auto" ]]; then
@@ -507,6 +513,22 @@ if [[ -n "$environment" ]]; then
   fi
 fi
 
+environment_timeout_args=()
+has_environment_timeout_arg=0
+for argument in "$@"; do
+  case "$argument" in
+    --environment-build-timeout-multiplier | --environment-build-timeout-multiplier=*)
+      has_environment_timeout_arg=1
+      break
+      ;;
+  esac
+done
+if [[ "$has_environment_timeout_arg" == "0" ]]; then
+  environment_timeout_args=(
+    --environment-build-timeout-multiplier "$environment_build_timeout_multiplier"
+  )
+fi
+
 harbor_command=(uv run --project "$project_root" harbor)
 if [[ "${_HARBOR_NEXAU_DOTENV_LOADED:-0}" == "1" ]]; then
   harbor_command=(harbor)
@@ -569,6 +591,7 @@ if [[ "$trace_mode" == "1" ]]; then
     "${task_source_args[@]}" \
     "${partition_args[@]}" \
     "${environment_args[@]}" \
+    "${environment_timeout_args[@]}" \
     --n-tasks "${HARBOR_NEXAU_N_TASKS:-1}" \
     --n-concurrent "${HARBOR_NEXAU_CONCURRENCY:-1}" \
     "$@"
@@ -605,6 +628,7 @@ exec "${harbor_command[@]}" run \
   "${agent_args[@]}" \
   --model "$model" \
   "${environment_args[@]}" \
+  "${environment_timeout_args[@]}" \
   --n-tasks "${HARBOR_NEXAU_N_TASKS:-1}" \
   --n-concurrent "${HARBOR_NEXAU_CONCURRENCY:-1}" \
   "$@"

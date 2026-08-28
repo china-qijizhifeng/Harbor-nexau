@@ -104,6 +104,7 @@ printf "%s\\n" "$@"
         "HARBOR_CODEX_UPSTREAM_MODEL",
         "HARBOR_CODEX_REASONING_EFFORT",
         "HARBOR_CODEX_REASONING_SUMMARY",
+        "HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER",
     ):
         env.pop(name, None)
     if config_path is not None:
@@ -303,6 +304,9 @@ def test_smoke_script_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> Non
         "      reasoning_summary: 'detailed'\n"
     )
     assert "Trace mode (codex harness)" in result.stderr
+    arguments = result.stdout.splitlines()
+    timeout_index = arguments.index("--environment-build-timeout-multiplier")
+    assert arguments[timeout_index + 1] == "4"
 
 
 def test_smoke_script_non_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> None:
@@ -324,6 +328,24 @@ def test_smoke_script_non_trace_mode_selects_trace_safe_codex(tmp_path: Path) ->
     assert "context_window=272000" in arguments
     assert "reasoning_effort=high" in arguments
     assert "reasoning_summary=detailed" in arguments
+    timeout_index = arguments.index("--environment-build-timeout-multiplier")
+    assert arguments[timeout_index + 1] == "4"
+
+
+def test_smoke_script_preserves_explicit_environment_timeout_multiplier(
+    tmp_path: Path,
+) -> None:
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--environment-build-timeout-multiplier",
+        "2",
+    )
+
+    assert result.returncode == 0, result.stderr
+    arguments = result.stdout.splitlines()
+    assert arguments.count("--environment-build-timeout-multiplier") == 1
+    timeout_index = arguments.index("--environment-build-timeout-multiplier")
+    assert arguments[timeout_index + 1] == "2"
 
 
 def test_smoke_script_rejects_unknown_harness(tmp_path: Path) -> None:

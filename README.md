@@ -146,6 +146,11 @@ Agent 安装阶段使用独立的 `agent.override_setup_timeout_sec`，默认从
 缺失的 `/etc/ssl/certs/java`，必要时重新配置该包，避免二次 apt 触发官方任务镜像的 keystore
 父目录缺失问题；非 Debian 或未安装该包的镜像保持 no-op。
 
+环境构建使用 Harbor 原生 `--environment-build-timeout-multiplier`，脚本默认从
+`HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER=4` 读取；例如官方600/900秒的 Compose build
+预算会变为2400/3600秒。命令行显式传入同名参数时优先使用显式值。该设置只延长 provisioning，
+不改变 Agent 或 verifier timeout，也不修改任务 Dockerfile。
+
 如果只想单独重跑或诊断某一组，仍可手工选择固定 CPU68 分组：
 
 ```bash
