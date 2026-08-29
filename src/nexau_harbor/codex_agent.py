@@ -210,7 +210,7 @@ class TraceSafeCodexAgent(Codex):
         bridge_port: int = DEFAULT_BRIDGE_PORT,
         provider_name: str = "northgate",
         upstream_model_name: str | None = None,
-        context_window: int = 272000,
+        context_window: int = 262144,
         version: str | None = None,
         **kwargs: Any,
     ) -> None:

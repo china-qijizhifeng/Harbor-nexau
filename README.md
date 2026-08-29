@@ -103,7 +103,7 @@ Codex harness 默认使用 CLI `0.148.0` 的标准 function-tool 模式：启用
 `exec`。bridge 同时将 Codex 侧 advertised model `gpt-5.5` 重写为 NorthGate 实际提供的
 `nex-agi/Nex-N2-Pro`，并在响应侧恢复 advertised model；可通过
 `HARBOR_CODEX_UPSTREAM_MODEL` 覆盖。provider 同时关闭 WebSocket 和 web search，并显式设置
-272000-token context。
+N2 实际提供的 262144-token context。
 
 `--auto-partition` 不会只凭“是否有 Compose 文件”猜测兼容性。Compose 题直接进入 DinD；其余题在
 Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbox 预检。预检成功的题进入
@@ -210,7 +210,7 @@ prompt、工具 YAML 和 binding 都应位于同一目录树内。
 ```dotenv
 # Frontier Bench/TB3（包括多服务 Compose 题）使用 DinD adapter：
 HARBOR_NEXAU_ENV=nexau_harbor.e2b_dind_environment:NexAUE2BDinDEnvironment
-HARBOR_NEXAU_E2B_DIND_TEMPLATE=harbor-nexau-dind:v1
+HARBOR_NEXAU_E2B_DIND_TEMPLATE=e2b-nex/harbor-nexau-dind:v1
 HARBOR_NEXAU_E2B_MAX_LIFETIME_SEC=86400
 HARBOR_NEXAU_NO_PROXY_HOSTS=e2b.app,.e2b.app,api.e2b.app,sandbox.e2b.app
 # 自建 E2B 必须将 API URL、domain 和对应 Key 成套配置；官方 E2B 留空前两项。

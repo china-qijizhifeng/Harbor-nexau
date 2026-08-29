@@ -575,7 +575,7 @@ if [[ "$trace_mode" == "1" ]]; then
       printf '%s\n' '      bridge_port: 48123'
       printf '      provider_name: %s\n' "$(yaml_quote 'northgate')"
       printf '      upstream_model_name: %s\n' "$(yaml_quote "$codex_upstream_model")"
-      printf '%s\n' '      context_window: 272000'
+      printf '%s\n' '      context_window: 262144'
       printf '      reasoning_effort: %s\n' "$(yaml_quote "$codex_reasoning_effort")"
       printf '      reasoning_summary: %s\n' "$(yaml_quote "$codex_reasoning_summary")"
     else
@@ -611,7 +611,7 @@ if [[ "$harness" == "codex" ]]; then
     --agent-kwarg "bridge_port=48123"
     --agent-kwarg "provider_name=northgate"
     --agent-kwarg "upstream_model_name=$codex_upstream_model"
-    --agent-kwarg "context_window=272000"
+    --agent-kwarg "context_window=262144"
     --agent-kwarg "reasoning_effort=$codex_reasoning_effort"
     --agent-kwarg "reasoning_summary=$codex_reasoning_summary"
   )

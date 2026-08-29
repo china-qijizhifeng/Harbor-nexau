@@ -141,6 +141,7 @@ def test_dind_environment_uses_versioned_template_and_accepts_capacity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert E2B_DIND_DEFAULT_TEMPLATE == "e2b-nex/harbor-nexau-dind:v1"
     (tmp_path / "Dockerfile").write_text("FROM alpine:3.22\n")
     monkeypatch.setattr(
         NexAUE2BEnvironment,

@@ -299,7 +299,7 @@ def test_smoke_script_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> Non
         "      bridge_port: 48123\n"
         "      provider_name: 'northgate'\n"
         "      upstream_model_name: 'nex-agi/Nex-N2-Pro'\n"
-        "      context_window: 272000\n"
+        "      context_window: 262144\n"
         "      reasoning_effort: 'high'\n"
         "      reasoning_summary: 'detailed'\n"
     )
@@ -325,7 +325,7 @@ def test_smoke_script_non_trace_mode_selects_trace_safe_codex(tmp_path: Path) ->
     assert "bridge_port=48123" in arguments
     assert "provider_name=northgate" in arguments
     assert "upstream_model_name=nex-agi/Nex-N2-Pro" in arguments
-    assert "context_window=272000" in arguments
+    assert "context_window=262144" in arguments
     assert "reasoning_effort=high" in arguments
     assert "reasoning_summary=detailed" in arguments
     timeout_index = arguments.index("--environment-build-timeout-multiplier")

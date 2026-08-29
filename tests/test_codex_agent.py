@@ -89,7 +89,7 @@ def test_codex_agent_uses_standard_function_tools_with_bridge_provider(tmp_path:
     assert agent._runtime_model_name() == "gpt-5.5"
     assert agent._build_trace_config("https://example.test/v1") == {
         "model_provider": "northgate",
-        "model_context_window": 272000,
+        "model_context_window": 262144,
         "web_search": "disabled",
         "model_providers": {
             "northgate": {
