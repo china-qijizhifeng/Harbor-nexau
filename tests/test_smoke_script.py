@@ -21,6 +21,7 @@ def _run_with_fake_uv(
     ramp_capture: Path | None = None,
     invocation_capture_dir: Path | None = None,
     interrupt_when_children_ready: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -104,9 +105,17 @@ printf "%s\\n" "$@"
         "HARBOR_CODEX_UPSTREAM_MODEL",
         "HARBOR_CODEX_REASONING_EFFORT",
         "HARBOR_CODEX_REASONING_SUMMARY",
+        "HARBOR_CODEX_UNIFIED_EXEC",
+        "HARBOR_CODEX_CODE_MODE",
+        "HARBOR_CODEX_CODE_MODE_ONLY",
+        "HARBOR_CODEX_MULTI_AGENT",
+        "HARBOR_CODEX_RESPONSES_BRIDGE",
+        "HARBOR_CODEX_CONTEXT_WINDOW",
         "HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER",
     ):
         env.pop(name, None)
+    if extra_env is not None:
+        env.update(extra_env)
     if config_path is not None:
         env["HARBOR_NEXAU_CONFIG_PATH"] = str(config_path)
     else:
@@ -307,6 +316,51 @@ def test_smoke_script_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> Non
     arguments = result.stdout.splitlines()
     timeout_index = arguments.index("--environment-build-timeout-multiplier")
     assert arguments[timeout_index + 1] == "4"
+
+
+def test_smoke_script_trace_mode_supports_native_terra_code_mode(tmp_path: Path) -> None:
+    trace_config_capture = tmp_path / "trace-job.yaml"
+
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--trace-mode",
+        "--harness",
+        "codex",
+        trace_config_capture=trace_config_capture,
+        extra_env={
+            "HARBOR_NEXAU_MODEL": "gpt-5.6-terra",
+            "HARBOR_CODEX_UNIFIED_EXEC": "false",
+            "HARBOR_CODEX_CODE_MODE": "true",
+            "HARBOR_CODEX_CODE_MODE_ONLY": "true",
+            "HARBOR_CODEX_MULTI_AGENT": "false",
+            "HARBOR_CODEX_RESPONSES_BRIDGE": "false",
+            "HARBOR_CODEX_CONTEXT_WINDOW": "272000",
+            "HARBOR_CODEX_REASONING_EFFORT": "max",
+            "HARBOR_CODEX_UPSTREAM_MODEL": "must-not-be-used",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert trace_config_capture.read_text() == (
+        "agents:\n"
+        "  - name: 'nexau_harbor.codex_agent:TraceSafeCodexAgent'\n"
+        "    model_name: 'gpt-5.6-terra'\n"
+        "    override_timeout_sec: 36000\n"
+        "    override_setup_timeout_sec: 3600\n"
+        "    kwargs:\n"
+        "      version: '0.148.0'\n"
+        "      unified_exec: false\n"
+        "      code_mode: true\n"
+        "      code_mode_only: true\n"
+        "      multi_agent: false\n"
+        "      responses_bridge: false\n"
+        "      bridge_port: 48123\n"
+        "      provider_name: 'northgate'\n"
+        "      context_window: 272000\n"
+        "      reasoning_effort: 'max'\n"
+        "      reasoning_summary: 'detailed'\n"
+    )
+    assert "must-not-be-used" not in trace_config_capture.read_text()
 
 
 def test_smoke_script_non_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> None:

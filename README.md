@@ -105,6 +105,14 @@ Codex harness 默认使用 CLI `0.148.0` 的标准 function-tool 模式：启用
 `HARBOR_CODEX_UPSTREAM_MODEL` 覆盖。provider 同时关闭 WebSocket 和 web search，并显式设置
 N2 实际提供的 262144-token context。
 
+这些 Codex 工具模式不是模型别名。脚本默认继续使用上述 N2 兼容配置，但可通过
+`HARBOR_CODEX_UNIFIED_EXEC`、`HARBOR_CODEX_CODE_MODE`、
+`HARBOR_CODEX_CODE_MODE_ONLY`、`HARBOR_CODEX_MULTI_AGENT`、
+`HARBOR_CODEX_RESPONSES_BRIDGE` 和 `HARBOR_CODEX_CONTEXT_WINDOW` 覆盖。比如原生
+`gpt-5.6-terra` 使用真实模型名、`code_mode=true`、`code_mode_only=true`、
+`unified_exec=false`、`responses_bridge=false` 和 272000-token context；此时不会设置或改写
+`upstream_model_name`。
+
 `--auto-partition` 不会只凭“是否有 Compose 文件”猜测兼容性。Compose 题直接进入 DinD；其余题在
 Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbox 预检。预检成功的题进入
 普通 E2B，确定性的 Dockerfile/E2B 构建不兼容进入 DinD；网络、限流或 provisioning 临时错误会

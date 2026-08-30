@@ -22,6 +22,12 @@ codex_version="${HARBOR_CODEX_VERSION:-0.148.0}"
 codex_reasoning_effort="${HARBOR_CODEX_REASONING_EFFORT:-high}"
 codex_reasoning_summary="${HARBOR_CODEX_REASONING_SUMMARY:-detailed}"
 codex_upstream_model="${HARBOR_CODEX_UPSTREAM_MODEL:-nex-agi/Nex-N2-Pro}"
+codex_unified_exec="${HARBOR_CODEX_UNIFIED_EXEC:-true}"
+codex_code_mode="${HARBOR_CODEX_CODE_MODE:-false}"
+codex_code_mode_only="${HARBOR_CODEX_CODE_MODE_ONLY:-false}"
+codex_multi_agent="${HARBOR_CODEX_MULTI_AGENT:-false}"
+codex_responses_bridge="${HARBOR_CODEX_RESPONSES_BRIDGE:-true}"
+codex_context_window="${HARBOR_CODEX_CONTEXT_WINDOW:-262144}"
 trace_mode=0
 trace_timeout_sec="${HARBOR_NEXAU_TRACE_TIMEOUT_SEC:-36000}"
 agent_setup_timeout_sec="${HARBOR_AGENT_SETUP_TIMEOUT_SEC:-3600}"
@@ -201,6 +207,33 @@ if [[ "$trace_mode" == "1" && ! "$trace_timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ "$harness" != "nexau" && "$harness" != "codex" ]]; then
   printf 'Harness must be nexau or codex, got: %s\n' "$harness" >&2
+  exit 2
+fi
+for codex_boolean_setting in \
+  "$codex_unified_exec" \
+  "$codex_code_mode" \
+  "$codex_code_mode_only" \
+  "$codex_multi_agent" \
+  "$codex_responses_bridge"
+do
+  if [[ "$codex_boolean_setting" != "true" && "$codex_boolean_setting" != "false" ]]; then
+    printf 'Codex boolean settings must be true or false, got: %s\n' \
+      "$codex_boolean_setting" >&2
+    exit 2
+  fi
+done
+if [[ "$codex_code_mode_only" == "true" && "$codex_code_mode" != "true" ]]; then
+  printf '%s\n' 'HARBOR_CODEX_CODE_MODE_ONLY=true requires HARBOR_CODEX_CODE_MODE=true' >&2
+  exit 2
+fi
+if [[ "$codex_responses_bridge" == "true" && "$codex_multi_agent" == "true" ]]; then
+  printf '%s\n' \
+    'HARBOR_CODEX_RESPONSES_BRIDGE=true does not support HARBOR_CODEX_MULTI_AGENT=true' >&2
+  exit 2
+fi
+if [[ ! "$codex_context_window" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'Codex context window must be a positive integer, got: %s\n' \
+    "$codex_context_window" >&2
   exit 2
 fi
 
@@ -567,15 +600,17 @@ if [[ "$trace_mode" == "1" ]]; then
     printf '%s\n' '    kwargs:'
     if [[ "$harness" == "codex" ]]; then
       printf '      version: %s\n' "$(yaml_quote "$codex_version")"
-      printf '%s\n' '      unified_exec: true'
-      printf '%s\n' '      code_mode: false'
-      printf '%s\n' '      code_mode_only: false'
-      printf '%s\n' '      multi_agent: false'
-      printf '%s\n' '      responses_bridge: true'
+      printf '      unified_exec: %s\n' "$codex_unified_exec"
+      printf '      code_mode: %s\n' "$codex_code_mode"
+      printf '      code_mode_only: %s\n' "$codex_code_mode_only"
+      printf '      multi_agent: %s\n' "$codex_multi_agent"
+      printf '      responses_bridge: %s\n' "$codex_responses_bridge"
       printf '%s\n' '      bridge_port: 48123'
       printf '      provider_name: %s\n' "$(yaml_quote 'northgate')"
-      printf '      upstream_model_name: %s\n' "$(yaml_quote "$codex_upstream_model")"
-      printf '%s\n' '      context_window: 262144'
+      if [[ "$codex_responses_bridge" == "true" ]]; then
+        printf '      upstream_model_name: %s\n' "$(yaml_quote "$codex_upstream_model")"
+      fi
+      printf '      context_window: %s\n' "$codex_context_window"
       printf '      reasoning_effort: %s\n' "$(yaml_quote "$codex_reasoning_effort")"
       printf '      reasoning_summary: %s\n' "$(yaml_quote "$codex_reasoning_summary")"
     else
@@ -603,18 +638,20 @@ if [[ "$harness" == "codex" ]]; then
   agent_args=(
     --agent nexau_harbor.codex_agent:TraceSafeCodexAgent
     --agent-kwarg "version=$codex_version"
-    --agent-kwarg "unified_exec=true"
-    --agent-kwarg "code_mode=false"
-    --agent-kwarg "code_mode_only=false"
-    --agent-kwarg "multi_agent=false"
-    --agent-kwarg "responses_bridge=true"
+    --agent-kwarg "unified_exec=$codex_unified_exec"
+    --agent-kwarg "code_mode=$codex_code_mode"
+    --agent-kwarg "code_mode_only=$codex_code_mode_only"
+    --agent-kwarg "multi_agent=$codex_multi_agent"
+    --agent-kwarg "responses_bridge=$codex_responses_bridge"
     --agent-kwarg "bridge_port=48123"
     --agent-kwarg "provider_name=northgate"
-    --agent-kwarg "upstream_model_name=$codex_upstream_model"
-    --agent-kwarg "context_window=262144"
+    --agent-kwarg "context_window=$codex_context_window"
     --agent-kwarg "reasoning_effort=$codex_reasoning_effort"
     --agent-kwarg "reasoning_summary=$codex_reasoning_summary"
   )
+  if [[ "$codex_responses_bridge" == "true" ]]; then
+    agent_args+=(--agent-kwarg "upstream_model_name=$codex_upstream_model")
+  fi
 else
   agent_args=(
     --agent nexau_harbor.agent:NexAUAgent
