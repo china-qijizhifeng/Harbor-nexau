@@ -100,6 +100,7 @@ _HOST_TRANSFER_MAX_ATTEMPTS = 5
 _AGENT_TRACE_DOWNLOAD_CONCURRENCY = 4
 _AGENT_TRACE_RECOVERY_GRACE_SEC = 15 * 60
 _HOST_DETACHED_STATE_ROOT = PurePosixPath("/tmp/harbor-nexau-exec")
+_HOST_DETACHED_DIAGNOSTIC_TAIL_CHARS = 16_384
 _COMPOSE_BUILD_MAX_ATTEMPTS = 3
 _COMPOSE_BUILD_RETRY_BASE_DELAY_SEC = 5
 
@@ -121,6 +122,19 @@ def _positive_int(value: int | str, *, name: str) -> int:
     if resolved <= 0:
         raise ValueError(f"{name} must be positive, got {resolved}")
     return resolved
+
+
+def _diagnostic_tail(value: str) -> str:
+    stripped = value.rstrip()
+    if not stripped:
+        return "<empty>"
+    if len(stripped) <= _HOST_DETACHED_DIAGNOSTIC_TAIL_CHARS:
+        return stripped
+    omitted = len(stripped) - _HOST_DETACHED_DIAGNOSTIC_TAIL_CHARS
+    return (
+        f"<omitted {omitted} earlier characters>\n"
+        f"{stripped[-_HOST_DETACHED_DIAGNOSTIC_TAIL_CHARS:]}"
+    )
 
 
 def _is_transient_docker_build_error(result: ExecResult) -> bool:
@@ -527,7 +541,14 @@ class _E2BDinDCompose(DinDComposeOps):
         compose_env = self._compose_env_vars()
         command = self._compose_cmd(subcommand)
         for attempt in range(1, _COMPOSE_BUILD_MAX_ATTEMPTS + 1):
-            result = await self._env._exec_on_host_detached(command, env=compose_env)
+            result = await self._env._exec_on_host_detached(
+                command,
+                env=compose_env,
+                diagnostic_label=(
+                    f"docker compose {phase} attempt "
+                    f"{attempt}/{_COMPOSE_BUILD_MAX_ATTEMPTS}"
+                ),
+            )
             if result.return_code == 0:
                 return result
             if attempt >= _COMPOSE_BUILD_MAX_ATTEMPTS or not _is_transient_docker_build_error(
@@ -939,6 +960,7 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
         command: str,
         *,
         env: dict[str, str] | None = None,
+        diagnostic_label: str = "detached E2B DinD host command",
     ) -> ExecResult:
         """Run a long DinD-host command in the background and poll it briefly."""
 
@@ -979,6 +1001,22 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
                 pid=pid,
                 paths=paths,
                 user="root",
+            )
+            snapshot = await self._detached_exec_result(
+                paths,
+                user="root",
+                return_code=-1,
+                diagnostic="Cancelled before the detached command wrote an exit status",
+            )
+            self.logger.error(
+                "Cancelled %s (process %s; state directory %s).\n"
+                "stdout tail:\n%s\n"
+                "stderr tail:\n%s",
+                diagnostic_label,
+                pid,
+                paths.directory,
+                _diagnostic_tail(snapshot.stdout),
+                _diagnostic_tail(snapshot.stderr),
             )
             raise
 

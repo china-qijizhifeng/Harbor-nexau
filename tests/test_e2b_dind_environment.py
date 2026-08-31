@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path, PurePath
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from nexau_harbor.e2b_dind_environment import (
     _AgentLogDownloadError,
     _compose_env_file_content,
     _compose_project_name,
+    _diagnostic_tail,
     _E2BDinDCompose,
     _PendingAgentLogDownload,
     _remote_pack_command_with_exclusions,
@@ -282,6 +284,12 @@ async def test_compose_build_retries_only_transient_network_failures(
 
     assert result is success
     assert detached_exec.await_count == 2
+    assert detached_exec.await_args_list[0].kwargs["diagnostic_label"] == (
+        "docker compose build attempt 1/3"
+    )
+    assert detached_exec.await_args_list[1].kwargs["diagnostic_label"] == (
+        "docker compose build attempt 2/3"
+    )
     sleep.assert_awaited_once_with(5)
 
 
@@ -326,6 +334,55 @@ async def test_detached_host_build_has_no_inner_command_timeout() -> None:
     dispatched_wrapper = environment._dispatch_command.await_args.args[0]
     assert "/tmp/harbor-nexau-exec/harbor-exec-" in dispatched_wrapper
     assert "/logs/agent/harbor-exec-" not in dispatched_wrapper
+
+
+async def test_cancelled_detached_host_build_logs_saved_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    handle = SimpleNamespace(pid=73, disconnect=AsyncMock())
+    command_kill = AsyncMock()
+    environment = object.__new__(NexAUE2BDinDEnvironment)
+    environment.logger = logging.getLogger("test-e2b-dind-cancel-diagnostic")
+    environment._sandbox = SimpleNamespace(commands=SimpleNamespace(kill=command_kill))
+    environment._dispatch_command = AsyncMock(return_value=handle)
+    environment._poll_detached_command = AsyncMock(side_effect=asyncio.CancelledError())
+    environment._detached_exec_result = AsyncMock(
+        return_value=ExecResult(
+            stdout="pulling layer 17/20\n",
+            stderr="registry connection stalled\n",
+            return_code=-1,
+        )
+    )
+
+    with caplog.at_level(logging.ERROR, logger=environment.logger.name):
+        with pytest.raises(asyncio.CancelledError):
+            await environment._exec_on_host_detached(
+                "docker compose build",
+                diagnostic_label="docker compose build attempt 1/3",
+            )
+
+    command_kill.assert_awaited_once_with(
+        73,
+        request_timeout=30,
+    )
+    snapshot_call = environment._detached_exec_result.await_args
+    assert snapshot_call.kwargs["user"] == "root"
+    assert snapshot_call.kwargs["return_code"] == -1
+    assert "Cancelled before" in snapshot_call.kwargs["diagnostic"]
+    assert "docker compose build attempt 1/3" in caplog.text
+    assert "process 73" in caplog.text
+    assert "pulling layer 17/20" in caplog.text
+    assert "registry connection stalled" in caplog.text
+
+
+def test_diagnostic_tail_keeps_only_bounded_suffix() -> None:
+    long_output = "prefix-marker\n" + ("x" * 20_000) + "\nlast-progress"
+
+    captured = _diagnostic_tail(long_output)
+
+    assert "prefix-marker" not in captured
+    assert "omitted" in captured
+    assert captured.endswith("last-progress")
 
 
 def test_remote_log_archive_can_exclude_the_prefetched_trace() -> None:
