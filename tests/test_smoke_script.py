@@ -125,6 +125,7 @@ printf "%s\\n" "$@"
         "HARBOR_NEXAU_DIND_PREWARM_CONCURRENCY",
         "HARBOR_NEXAU_DIND_PREWARM_TIMEOUT_SEC",
         "HARBOR_NEXAU_DIND_PREWARM_ATTEMPTS",
+        "HARBOR_NEXAU_DIND_PREWARM_REQUIRED",
     ):
         env.pop(name, None)
     if extra_env is not None:
@@ -519,8 +520,8 @@ def test_smoke_script_prewarms_selected_dind_images_before_harbor(tmp_path: Path
     assert "nexau_harbor.e2b_dind_prewarm" in arguments
     assert _last_option_value(arguments, "--dataset") == "/tmp/frontier-bench-cpu68"
     assert _last_option_value(arguments, "--concurrency") == "2"
-    assert _last_option_value(arguments, "--timeout-sec") == "600"
-    assert _last_option_value(arguments, "--attempts") == "3"
+    assert _last_option_value(arguments, "--timeout-sec") == "60"
+    assert _last_option_value(arguments, "--attempts") == "1"
     assert arguments.count("--include") == 33
     assert "Prewarming Docker Hub images" in result.stderr
 
@@ -541,7 +542,7 @@ def test_smoke_script_can_disable_dind_prewarm(tmp_path: Path) -> None:
     assert not prewarm_capture.exists()
 
 
-def test_smoke_script_stops_before_harbor_when_dind_prewarm_fails(tmp_path: Path) -> None:
+def test_smoke_script_continues_when_best_effort_dind_prewarm_fails(tmp_path: Path) -> None:
     result = _run_with_fake_uv(
         tmp_path,
         "--compose-only",
@@ -550,8 +551,26 @@ def test_smoke_script_stops_before_harbor_when_dind_prewarm_fails(tmp_path: Path
         extra_env={"PREWARM_EXIT_CODE": "7"},
     )
 
+    assert result.returncode == 0, result.stderr
+    assert "continuing because formal sandboxes have official-registry fallback" in result.stderr
+    assert "harbor" in result.stdout.splitlines()
+
+
+def test_smoke_script_required_prewarm_stops_before_harbor(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--compose-only",
+        "--path",
+        "/tmp/frontier-bench-cpu68",
+        extra_env={
+            "PREWARM_EXIT_CODE": "7",
+            "HARBOR_NEXAU_DIND_PREWARM_REQUIRED": "true",
+        },
+    )
+
     assert result.returncode == 7
     assert result.stdout == ""
+    assert "required mode stops Harbor" in result.stderr
 
 
 def test_smoke_script_rejects_invalid_dind_prewarm_concurrency(tmp_path: Path) -> None:

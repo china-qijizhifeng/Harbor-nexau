@@ -8,7 +8,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from nexau_harbor import e2b_dind_prewarm
-from nexau_harbor.e2b_dind_prewarm import discover_prewarm_plan, prewarm_images
+from nexau_harbor.e2b_dind_prewarm import (
+    discover_environment_images,
+    discover_prewarm_plan,
+    docker_hub_local_reference,
+    docker_hub_official_reference,
+    prewarm_images,
+)
 from nexau_harbor.e2b_dind_template import E2BConnection
 
 
@@ -106,6 +112,44 @@ def test_discovery_applies_name_glob_exclusions(tmp_path: Path) -> None:
 
     assert plan.task_paths == (keep,)
     assert plan.images == ("fedora:42",)
+
+
+def test_environment_discovery_accepts_task_image_variables(tmp_path: Path) -> None:
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    (environment / "docker-compose.yaml").write_text(
+        "services:\n  db:\n    image: postgres:${POSTGRES_TAG}\n",
+        encoding="utf-8",
+    )
+
+    plan = discover_environment_images(
+        environment,
+        extra_variables={"POSTGRES_TAG": "18"},
+    )
+
+    assert plan.images == ("postgres:18",)
+    assert plan.unresolved_references == ()
+
+
+@pytest.mark.parametrize(
+    ("image", "official", "local"),
+    [
+        ("node:22-bookworm", "registry-1.docker.io/library/node:22-bookworm", "node:22-bookworm"),
+        (
+            "apache/kafka-native:4.3.1",
+            "registry-1.docker.io/apache/kafka-native:4.3.1",
+            "apache/kafka-native:4.3.1",
+        ),
+        (
+            "docker.io/library/python:3.12-slim",
+            "registry-1.docker.io/library/python:3.12-slim",
+            "python:3.12-slim",
+        ),
+    ],
+)
+def test_docker_hub_references(image: str, official: str, local: str) -> None:
+    assert docker_hub_official_reference(image) == official
+    assert docker_hub_local_reference(image) == local
 
 
 class _FakeSandbox:

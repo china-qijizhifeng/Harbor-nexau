@@ -37,8 +37,9 @@ e2b_preflight_timeout_sec="${HARBOR_NEXAU_E2B_PREFLIGHT_TIMEOUT_SEC:-7200}"
 e2b_preflight_attempts="${HARBOR_NEXAU_E2B_PREFLIGHT_ATTEMPTS:-3}"
 dind_prewarm="${HARBOR_NEXAU_DIND_PREWARM:-true}"
 dind_prewarm_concurrency="${HARBOR_NEXAU_DIND_PREWARM_CONCURRENCY:-2}"
-dind_prewarm_timeout_sec="${HARBOR_NEXAU_DIND_PREWARM_TIMEOUT_SEC:-600}"
-dind_prewarm_attempts="${HARBOR_NEXAU_DIND_PREWARM_ATTEMPTS:-3}"
+dind_prewarm_timeout_sec="${HARBOR_NEXAU_DIND_PREWARM_TIMEOUT_SEC:-60}"
+dind_prewarm_attempts="${HARBOR_NEXAU_DIND_PREWARM_ATTEMPTS:-1}"
+dind_prewarm_required="${HARBOR_NEXAU_DIND_PREWARM_REQUIRED:-false}"
 refresh_e2b_routing=0
 task_partition=""
 forwarded_args=()
@@ -259,6 +260,11 @@ fi
 if [[ "$dind_prewarm" != "true" && "$dind_prewarm" != "false" ]]; then
   printf 'HARBOR_NEXAU_DIND_PREWARM must be true or false, got: %s\n' \
     "$dind_prewarm" >&2
+  exit 2
+fi
+if [[ "$dind_prewarm_required" != "true" && "$dind_prewarm_required" != "false" ]]; then
+  printf 'HARBOR_NEXAU_DIND_PREWARM_REQUIRED must be true or false, got: %s\n' \
+    "$dind_prewarm_required" >&2
   exit 2
 fi
 if [[ ! "$dind_prewarm_concurrency" =~ ^[1-9][0-9]*$ ]]; then
@@ -663,7 +669,19 @@ if [[ "$dind_prewarm" == "true" && "$effective_environment" == "$compose_e2b_env
     done
     printf 'Prewarming Docker Hub images for the selected DinD task(s) with concurrency %s.\n' \
       "$dind_prewarm_concurrency" >&2
+    set +e
     "${prewarm_command[@]}" "${prewarm_args[@]}"
+    prewarm_exit_code=$?
+    set -e
+    if ((prewarm_exit_code != 0)); then
+      if [[ "$dind_prewarm_required" == "true" ]]; then
+        printf 'DinD image prewarm failed with status %s; required mode stops Harbor.\n' \
+          "$prewarm_exit_code" >&2
+        exit "$prewarm_exit_code"
+      fi
+      printf 'DinD image prewarm failed with status %s; continuing because formal sandboxes have official-registry fallback.\n' \
+        "$prewarm_exit_code" >&2
+    fi
   fi
 fi
 

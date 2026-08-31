@@ -63,6 +63,34 @@ def test_custom_dind_environment_import_path_is_loadable() -> None:
     assert environment_class is NexAUE2BDinDEnvironment
 
 
+def test_compose_discovers_images_and_uses_bounded_fallback_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment_dir = tmp_path / "environment"
+    environment_dir.mkdir()
+    (environment_dir / "Dockerfile").write_text("FROM node:22-bookworm\n", encoding="utf-8")
+    for name in (
+        "HARBOR_NEXAU_DIND_MIRROR_PULL_TIMEOUT_SEC",
+        "HARBOR_NEXAU_DIND_DIRECT_PULL_TIMEOUT_SEC",
+        "HARBOR_NEXAU_DIND_IMAGE_PULL_CONCURRENCY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    environment = SimpleNamespace(
+        task_env_config=EnvironmentConfig(),
+        environment_dir=environment_dir,
+        _persistent_env={},
+        logger=logging.getLogger("test-e2b-dind-discovery"),
+    )
+
+    compose = _E2BDinDCompose(environment)
+
+    assert compose._docker_hub_images == ("node:22-bookworm",)
+    assert compose._mirror_pull_timeout_sec == 60
+    assert compose._direct_pull_timeout_sec == 600
+    assert compose._image_pull_concurrency == 1
+
+
 def test_dind_environment_declares_compose_and_resource_capabilities() -> None:
     environment = object.__new__(NexAUE2BDinDEnvironment)
 
@@ -346,6 +374,92 @@ async def test_compose_build_does_not_retry_a_deterministic_failure(
     assert result is failure
     detached_exec.assert_awaited_once()
     sleep.assert_not_awaited()
+
+
+async def test_docker_hub_image_uses_mirror_when_it_succeeds() -> None:
+    success = ExecResult(stdout="pulled", stderr="", return_code=0)
+    detached_exec = AsyncMock(return_value=success)
+    compose = object.__new__(_E2BDinDCompose)
+    compose._env = SimpleNamespace(
+        _exec_on_host_detached=detached_exec,
+        logger=logging.getLogger("test-e2b-dind-mirror"),
+    )
+    compose._mirror_pull_timeout_sec = 60
+    compose._direct_pull_timeout_sec = 600
+
+    await compose._pull_docker_hub_image_with_fallback("node:22-bookworm")
+
+    detached_exec.assert_awaited_once()
+    command = detached_exec.await_args.args[0]
+    assert "timeout --signal=TERM --kill-after=30 60" in command
+    assert "docker pull -- node:22-bookworm" in command
+    assert detached_exec.await_args.kwargs["diagnostic_label"] == (
+        "Docker mirror pull for node:22-bookworm"
+    )
+
+
+async def test_docker_hub_image_falls_back_to_official_registry_and_tags() -> None:
+    mirror_failure = ExecResult(
+        stdout="Pulling fs layer",
+        stderr="",
+        return_code=124,
+    )
+    direct_success = ExecResult(stdout="direct pull complete", stderr="", return_code=0)
+    detached_exec = AsyncMock(side_effect=[mirror_failure, direct_success])
+    compose = object.__new__(_E2BDinDCompose)
+    compose._env = SimpleNamespace(
+        _exec_on_host_detached=detached_exec,
+        logger=logging.getLogger("test-e2b-dind-fallback"),
+    )
+    compose._mirror_pull_timeout_sec = 60
+    compose._direct_pull_timeout_sec = 600
+
+    await compose._pull_docker_hub_image_with_fallback("node:22-bookworm")
+
+    assert detached_exec.await_count == 2
+    direct_command = detached_exec.await_args_list[1].args[0]
+    assert "timeout --signal=TERM --kill-after=30 600" in direct_command
+    assert "docker pull -- registry-1.docker.io/library/node:22-bookworm" in direct_command
+    assert "docker image tag -- registry-1.docker.io/library/node:22-bookworm node:22-bookworm" in (
+        direct_command
+    )
+    assert detached_exec.await_args_list[1].kwargs["diagnostic_label"] == (
+        "official Docker Hub pull for node:22-bookworm"
+    )
+
+
+async def test_docker_hub_image_reports_both_source_failures() -> None:
+    mirror_failure = ExecResult(stdout="mirror stalled", stderr="", return_code=124)
+    direct_failure = ExecResult(stdout="", stderr="official denied", return_code=1)
+    compose = object.__new__(_E2BDinDCompose)
+    compose._env = SimpleNamespace(
+        _exec_on_host_detached=AsyncMock(side_effect=[mirror_failure, direct_failure]),
+        logger=logging.getLogger("test-e2b-dind-double-failure"),
+    )
+    compose._mirror_pull_timeout_sec = 60
+    compose._direct_pull_timeout_sec = 600
+
+    with pytest.raises(RuntimeError, match="Both Docker Hub sources failed") as raised:
+        await compose._pull_docker_hub_image_with_fallback("node:22-bookworm")
+
+    assert "mirror stalled" in str(raised.value)
+    assert "official denied" in str(raised.value)
+
+
+async def test_compose_only_pulls_service_images_that_are_still_missing() -> None:
+    compose = object.__new__(_E2BDinDCompose)
+    compose._ensure_docker_hub_images = AsyncMock()
+    compose._compose_build_exec = AsyncMock(
+        return_value=ExecResult(stdout="pulled", stderr="", return_code=0)
+    )
+
+    await compose._prepare_docker_images()
+
+    compose._ensure_docker_hub_images.assert_awaited_once_with()
+    compose._compose_build_exec.assert_awaited_once_with(
+        ["pull", "--ignore-buildable", "--policy", "missing"],
+        phase="pull",
+    )
 
 
 async def test_detached_host_build_has_no_inner_command_timeout() -> None:

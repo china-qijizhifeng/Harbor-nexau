@@ -107,6 +107,13 @@ _COMPOSE_BUILD_MAX_ATTEMPTS = 3
 _COMPOSE_BUILD_RETRY_BASE_DELAY_SEC = 5
 _DOCKER_DOWNLOAD_STALL_TIMEOUT_SEC = 180
 _DOCKER_DOWNLOAD_STALLED_RETURN_CODE = 75
+_DIND_MIRROR_PULL_TIMEOUT_ENV = "HARBOR_NEXAU_DIND_MIRROR_PULL_TIMEOUT_SEC"
+_DIND_DIRECT_PULL_TIMEOUT_ENV = "HARBOR_NEXAU_DIND_DIRECT_PULL_TIMEOUT_SEC"
+_DIND_IMAGE_PULL_CONCURRENCY_ENV = "HARBOR_NEXAU_DIND_IMAGE_PULL_CONCURRENCY"
+_DIND_MIRROR_PULL_TIMEOUT_SEC = 60
+_DIND_DIRECT_PULL_TIMEOUT_SEC = 600
+_DIND_IMAGE_PULL_CONCURRENCY = 1
+_DIND_PULL_KILL_GRACE_SEC = 30
 
 _agent_trace_download_slots = asyncio.Semaphore(_AGENT_TRACE_DOWNLOAD_CONCURRENCY)
 _TRANSIENT_DOCKER_BUILD_ERROR = re.compile(
@@ -307,6 +314,43 @@ class _E2BDinDCompose(DinDComposeOps):
         self._resolved_task_env = (
             resolve_env_vars(env.task_env_config.env) if env.task_env_config.env else {}
         )
+        discovery_variables = dict(self._resolved_task_env)
+        discovery_variables.update(env._persistent_env)
+        # Imported lazily because the standalone prewarmer imports this module's
+        # versioned template constants.
+        from nexau_harbor.e2b_dind_prewarm import discover_environment_images
+
+        image_plan = discover_environment_images(
+            env.environment_dir,
+            extra_variables=discovery_variables,
+        )
+        self._docker_hub_images = image_plan.images
+        self._mirror_pull_timeout_sec = _positive_int(
+            os.environ.get(
+                _DIND_MIRROR_PULL_TIMEOUT_ENV,
+                str(_DIND_MIRROR_PULL_TIMEOUT_SEC),
+            ),
+            name=_DIND_MIRROR_PULL_TIMEOUT_ENV,
+        )
+        self._direct_pull_timeout_sec = _positive_int(
+            os.environ.get(
+                _DIND_DIRECT_PULL_TIMEOUT_ENV,
+                str(_DIND_DIRECT_PULL_TIMEOUT_SEC),
+            ),
+            name=_DIND_DIRECT_PULL_TIMEOUT_ENV,
+        )
+        self._image_pull_concurrency = _positive_int(
+            os.environ.get(
+                _DIND_IMAGE_PULL_CONCURRENCY_ENV,
+                str(_DIND_IMAGE_PULL_CONCURRENCY),
+            ),
+            name=_DIND_IMAGE_PULL_CONCURRENCY_ENV,
+        )
+        if image_plan.unresolved_references:
+            env.logger.warning(
+                "DinD Docker Hub fallback skipped %s unresolved image reference(s)",
+                len(image_plan.unresolved_references),
+            )
 
     @override
     async def _host_exec(
@@ -675,6 +719,99 @@ class _E2BDinDCompose(DinDComposeOps):
             await asyncio.sleep(delay_sec)
         raise AssertionError("unreachable")
 
+    async def _pull_docker_hub_image_with_fallback(self, image: str) -> None:
+        from nexau_harbor.e2b_dind_prewarm import (
+            docker_hub_local_reference,
+            docker_hub_official_reference,
+        )
+
+        direct_image = docker_hub_official_reference(image)
+        local_image = docker_hub_local_reference(image)
+        if image.startswith("registry-1.docker.io/"):
+            mirror = None
+        else:
+            mirror_command = (
+                f"timeout --signal=TERM --kill-after={_DIND_PULL_KILL_GRACE_SEC} "
+                f"{self._mirror_pull_timeout_sec} docker pull -- {shlex.quote(image)}"
+            )
+            mirror = await self._env._exec_on_host_detached(
+                mirror_command,
+                diagnostic_label=f"Docker mirror pull for {image}",
+            )
+            if mirror.return_code == 0:
+                self._env.logger.info(
+                    "Pulled Docker Hub image %s through the configured mirror",
+                    image,
+                )
+                return
+
+            self._env.logger.warning(
+                "Docker mirror pull failed for %s; falling back to the official registry: %s",
+                image,
+                _diagnostic_tail(mirror.stderr or mirror.stdout),
+            )
+
+        tag_command = ""
+        if direct_image != image:
+            tag_command = (
+                f" && docker image tag -- {shlex.quote(direct_image)} "
+                f"{shlex.quote(local_image)}"
+            )
+        direct_command = (
+            f"timeout --signal=TERM --kill-after={_DIND_PULL_KILL_GRACE_SEC} "
+            f"{self._direct_pull_timeout_sec} docker pull -- {shlex.quote(direct_image)}"
+            f"{tag_command}"
+        )
+        direct = await self._env._exec_on_host_detached(
+            direct_command,
+            diagnostic_label=f"official Docker Hub pull for {image}",
+        )
+        if direct.return_code != 0:
+            mirror_detail = (
+                _diagnostic_tail(mirror.stderr or mirror.stdout)
+                if mirror is not None
+                else "not tried"
+            )
+            raise RuntimeError(
+                f"Both Docker Hub sources failed for {image}. "
+                f"Mirror: {mirror_detail}. Official registry: "
+                f"{_diagnostic_tail(direct.stderr or direct.stdout)}"
+            )
+        self._env.logger.info(
+            "Pulled Docker Hub image %s directly as %s and tagged it as %s",
+            image,
+            direct_image,
+            local_image,
+        )
+
+    async def _ensure_docker_hub_images(self) -> None:
+        if not self._docker_hub_images:
+            return
+        self._env.logger.info(
+            "Ensuring %s Docker Hub image(s) with mirror-to-official fallback",
+            len(self._docker_hub_images),
+        )
+        semaphore = asyncio.Semaphore(
+            min(self._image_pull_concurrency, len(self._docker_hub_images))
+        )
+
+        async def pull(image: str) -> None:
+            async with semaphore:
+                await self._pull_docker_hub_image_with_fallback(image)
+
+        await asyncio.gather(*(pull(image) for image in self._docker_hub_images))
+
+    async def _prepare_docker_images(self) -> None:
+        await self._ensure_docker_hub_images()
+        pulled = await self._compose_build_exec(
+            ["pull", "--ignore-buildable", "--policy", "missing"],
+            phase="pull",
+        )
+        if pulled.return_code != 0:
+            raise RuntimeError(
+                f"docker compose pull failed: {pulled.stderr or pulled.stdout or 'no output'}"
+            )
+
     @staticmethod
     def _service_exec_subcommand(
         command: str,
@@ -862,14 +999,7 @@ class _E2BDinDCompose(DinDComposeOps):
                 f"{configured.stderr or configured.stdout or 'no output'}"
             )
 
-        pulled = await self._compose_build_exec(
-            ["pull", "--ignore-buildable"],
-            phase="pull",
-        )
-        if pulled.return_code != 0:
-            raise RuntimeError(
-                f"docker compose pull failed: {pulled.stderr or pulled.stdout or 'no output'}"
-            )
+        await self._prepare_docker_images()
 
         built = await self._compose_build_exec(
             ["build"],

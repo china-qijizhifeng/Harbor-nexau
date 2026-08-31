@@ -26,8 +26,8 @@ from nexau_harbor.e2b_dind_environment import (
 from nexau_harbor.e2b_dind_template import E2BConnection, load_e2b_connection
 
 DEFAULT_CONCURRENCY = 2
-DEFAULT_PULL_TIMEOUT_SEC = 600
-DEFAULT_PULL_ATTEMPTS = 3
+DEFAULT_PULL_TIMEOUT_SEC = 60
+DEFAULT_PULL_ATTEMPTS = 1
 DEFAULT_SANDBOX_TIMEOUT_SEC = 3_600
 _READY_TIMEOUT_SEC = 180
 _KEEPALIVE_INTERVAL_SEC = 60
@@ -57,6 +57,13 @@ _HEREDOC_PATTERN = re.compile(r"<<-?\s*['\"]?(?P<delimiter>[A-Za-z_][A-Za-z0-9_]
 @dataclass(frozen=True)
 class PrewarmPlan:
     task_paths: tuple[Path, ...]
+    images: tuple[str, ...]
+    skipped_external_images: tuple[str, ...]
+    unresolved_references: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class EnvironmentImagePlan:
     images: tuple[str, ...]
     skipped_external_images: tuple[str, ...]
     unresolved_references: tuple[str, ...]
@@ -212,6 +219,34 @@ def _docker_hub_image(image: str) -> str | None:
     return normalized
 
 
+def docker_hub_official_reference(image: str) -> str:
+    """Return an explicit Docker Hub Registry API reference that bypasses mirrors."""
+
+    normalized = image.strip()
+    for prefix in ("registry-1.docker.io/", "docker.io/", "index.docker.io/"):
+        if normalized.startswith(prefix):
+            path = normalized.removeprefix(prefix)
+            break
+    else:
+        path = normalized
+    if "/" not in path:
+        path = f"library/{path}"
+    return f"registry-1.docker.io/{path}"
+
+
+def docker_hub_local_reference(image: str) -> str:
+    """Return the local tag expected by an unqualified Dockerfile/Compose reference."""
+
+    normalized = image.strip()
+    for prefix in ("registry-1.docker.io/", "docker.io/", "index.docker.io/"):
+        if normalized.startswith(prefix):
+            normalized = normalized.removeprefix(prefix)
+            break
+    if normalized.startswith("library/"):
+        normalized = normalized.removeprefix("library/")
+    return normalized.split("@", 1)[0]
+
+
 def _dockerfile_images(path: Path) -> tuple[set[str], set[str], set[str]]:
     images: set[str] = set()
     external: set[str] = set()
@@ -329,23 +364,44 @@ def discover_prewarm_plan(
         environment_dir = task_path / "environment"
         if not environment_dir.is_dir():
             continue
-        for dockerfile in sorted(environment_dir.rglob("Dockerfile*")):
-            if not dockerfile.is_file():
-                continue
-            found, skipped, missing = _dockerfile_images(dockerfile)
-            images.update(found)
-            external.update(skipped)
-            unresolved.update(missing)
-        variables = _compose_variables(environment_dir)
-        for compose_path in sorted(environment_dir.rglob("*")):
-            if not compose_path.is_file() or compose_path.name not in _COMPOSE_FILENAMES:
-                continue
-            found, skipped, missing = _compose_images(compose_path, variables)
-            images.update(found)
-            external.update(skipped)
-            unresolved.update(missing)
+        environment_plan = discover_environment_images(environment_dir)
+        images.update(environment_plan.images)
+        external.update(environment_plan.skipped_external_images)
+        unresolved.update(environment_plan.unresolved_references)
     return PrewarmPlan(
         task_paths=task_paths,
+        images=tuple(sorted(images)),
+        skipped_external_images=tuple(sorted(external)),
+        unresolved_references=tuple(sorted(unresolved)),
+    )
+
+
+def discover_environment_images(
+    environment_dir: Path | str,
+    *,
+    extra_variables: dict[str, str] | None = None,
+) -> EnvironmentImagePlan:
+    environment_path = Path(environment_dir)
+    images: set[str] = set()
+    external: set[str] = set()
+    unresolved: set[str] = set()
+    for dockerfile in sorted(environment_path.rglob("Dockerfile*")):
+        if not dockerfile.is_file():
+            continue
+        found, skipped, missing = _dockerfile_images(dockerfile)
+        images.update(found)
+        external.update(skipped)
+        unresolved.update(missing)
+    variables = _compose_variables(environment_path)
+    variables.update(extra_variables or {})
+    for compose_path in sorted(environment_path.rglob("*")):
+        if not compose_path.is_file() or compose_path.name not in _COMPOSE_FILENAMES:
+            continue
+        found, skipped, missing = _compose_images(compose_path, variables)
+        images.update(found)
+        external.update(skipped)
+        unresolved.update(missing)
+    return EnvironmentImagePlan(
         images=tuple(sorted(images)),
         skipped_external_images=tuple(sorted(external)),
         unresolved_references=tuple(sorted(unresolved)),
@@ -409,6 +465,12 @@ async def _pull_image(
         except Exception as exc:
             last_detail = _failure_detail(exc)
         if attempt < attempts:
+            print(
+                f"Prewarm attempt {attempt}/{attempts} failed for {image}: "
+                f"{last_detail[-_OUTPUT_TAIL_CHARS:]}",
+                file=sys.stderr,
+                flush=True,
+            )
             await asyncio.sleep(_PULL_RETRY_BASE_DELAY_SEC * (2 ** (attempt - 1)))
     return PullFailure(image=image, attempts=attempts, detail=last_detail)
 
