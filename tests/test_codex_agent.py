@@ -21,14 +21,21 @@ from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV
 class FakeEnvironment:
     SUPPORTS_DETACHED_AGENT_EXEC = True
 
-    def __init__(self) -> None:
+    def __init__(self, *, missing_system_dependencies: bool = False) -> None:
         self.default_user = "agent"
+        self.missing_system_dependencies = missing_system_dependencies
         self.exec_calls: list[dict[str, Any]] = []
         self.uploaded_files: list[tuple[Path | str, str]] = []
         self.uploaded_payloads: dict[str, bytes] = {}
 
     async def exec(self, **kwargs: Any) -> ExecResult:
         self.exec_calls.append(kwargs)
+        command = str(kwargs.get("command", ""))
+        if self.missing_system_dependencies:
+            if command.startswith("command -v curl"):
+                return ExecResult(stdout="", stderr="", return_code=1)
+            if "for manager in apt-get dnf yum apk" in command:
+                return ExecResult(stdout="apt-get", stderr="", return_code=0)
         return ExecResult(stdout="", stderr="", return_code=0)
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
@@ -188,7 +195,7 @@ async def test_codex_agent_can_disable_optional_responses_bridge(tmp_path: Path)
 
 async def test_codex_install_uses_detached_e2b_execution(tmp_path: Path) -> None:
     agent = make_agent(tmp_path)
-    environment = FakeEnvironment()
+    environment = FakeEnvironment(missing_system_dependencies=True)
 
     await agent.install(environment)
 
@@ -197,13 +204,38 @@ async def test_codex_install_uses_detached_e2b_execution(tmp_path: Path) -> None
         for call in environment.exec_calls
         if "/etc/ssl/certs/java" in call["command"]
     )
+    dependency_call = next(
+        call for call in environment.exec_calls if "apt-get update" in call["command"]
+    )
     install_call = next(
         call
         for call in environment.exec_calls
         if "npm install -g @openai/codex" in call["command"]
     )
-    assert environment.exec_calls.index(repair_call) < environment.exec_calls.index(install_call)
-    assert install_call["env"][NEXAU_DETACHED_EXEC_ENV] == "1"
+    symlink_call = next(
+        call for call in environment.exec_calls if "ln -sf" in call["command"]
+    )
+    assert environment.exec_calls.index(repair_call) < environment.exec_calls.index(
+        dependency_call
+    )
+    assert environment.exec_calls.index(dependency_call) < environment.exec_calls.index(
+        install_call
+    )
+    assert environment.exec_calls.index(install_call) < environment.exec_calls.index(
+        symlink_call
+    )
+    for call in (repair_call, dependency_call, install_call, symlink_call):
+        assert call["env"][NEXAU_DETACHED_EXEC_ENV] == "1"
+    assert dependency_call["env"]["DEBIAN_FRONTEND"] == "noninteractive"
+
+
+async def test_codex_root_execution_outside_install_stays_attached(tmp_path: Path) -> None:
+    agent = make_agent(tmp_path)
+    environment = FakeEnvironment()
+
+    await agent.exec_as_root(environment, "true", env={"VISIBLE": "yes"})
+
+    assert environment.exec_calls[-1]["env"] == {"VISIBLE": "yes"}
 
 
 async def test_codex_shell_pipeline_keeps_jsonl_clean_and_propagates_exit(

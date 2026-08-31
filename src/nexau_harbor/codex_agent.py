@@ -272,6 +272,29 @@ class TraceSafeCodexAgent(Codex):
         return "codex"
 
     @override
+    async def exec_as_root(
+        self,
+        environment: BaseEnvironment,
+        command: str,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        timeout_sec: int | None = None,
+    ) -> Any:
+        runtime_env = dict(env or {})
+        if (
+            getattr(environment, "SUPPORTS_DETACHED_AGENT_EXEC", False)
+            and self._northgate_detached_install
+        ):
+            runtime_env[NEXAU_DETACHED_EXEC_ENV] = "1"
+        return await super().exec_as_root(
+            environment,
+            command,
+            env=runtime_env or None,
+            cwd=cwd,
+            timeout_sec=timeout_sec,
+        )
+
+    @override
     async def exec_as_agent(
         self,
         environment: BaseEnvironment,
