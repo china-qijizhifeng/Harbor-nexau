@@ -380,6 +380,29 @@ async def test_detached_exec_disconnects_and_polls_short_commands(monkeypatch) -
         assert poll.kwargs["request_timeout"] == E2B_DETACHED_REQUEST_TIMEOUT_SEC
 
 
+async def test_detached_poll_invokes_running_observer(monkeypatch) -> None:
+    command_run = AsyncMock(
+        side_effect=[
+            SimpleNamespace(stdout="__HARBOR_NEXAU_STATUS__:RUNNING\n"),
+            SimpleNamespace(stdout="__HARBOR_NEXAU_STATUS__:DONE:0\n"),
+        ]
+    )
+    file_read = AsyncMock(side_effect=["captured stdout", ""])
+    environment, _ = _detached_test_environment(command_run, file_read)
+    on_running = AsyncMock()
+    monkeypatch.setattr(e2b_environment, "E2B_DETACHED_POLL_INTERVAL_SEC", 0)
+
+    result = await environment._poll_detached_command(
+        pid=432,
+        paths=e2b_environment._detached_exec_paths(),
+        user="root",
+        on_running=on_running,
+    )
+
+    assert result.return_code == 0
+    on_running.assert_awaited_once_with()
+
+
 async def test_detached_exec_preserves_nonzero_exit_code(monkeypatch) -> None:
     handle = SimpleNamespace(pid=654, disconnect=AsyncMock())
     command_run = AsyncMock(

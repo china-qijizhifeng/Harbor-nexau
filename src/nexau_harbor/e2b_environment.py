@@ -8,6 +8,7 @@ import shlex
 import threading
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import override
@@ -377,6 +378,7 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         pid: int,
         paths: _DetachedExecPaths,
         user: str,
+        on_running: Callable[[], Awaitable[None]] | None = None,
     ) -> ExecResult:
         status_command = _detached_status_command(pid, paths)
         consecutive_errors = 0
@@ -420,6 +422,8 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
 
             consecutive_errors = 0
             if status == "RUNNING":
+                if on_running is not None:
+                    await on_running()
                 continue
             if status == "CRASHED":
                 return await self._detached_exec_result(

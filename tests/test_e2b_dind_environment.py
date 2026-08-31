@@ -13,12 +13,16 @@ from harbor.utils.import_path import import_class
 
 from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV
 from nexau_harbor.e2b_dind_environment import (
+    _DOCKER_DOWNLOAD_STALLED_RETURN_CODE,
     E2B_DIND_DEFAULT_TEMPLATE,
     NexAUE2BDinDEnvironment,
     _AgentLogDownloadError,
     _compose_env_file_content,
     _compose_project_name,
     _diagnostic_tail,
+    _docker_download_progress_signature,
+    _DockerDownloadProgressMonitor,
+    _DockerDownloadStalledError,
     _E2BDinDCompose,
     _PendingAgentLogDownload,
     _remote_pack_command_with_exclusions,
@@ -293,6 +297,35 @@ async def test_compose_build_retries_only_transient_network_failures(
     sleep.assert_awaited_once_with(5)
 
 
+async def test_compose_build_retries_a_stalled_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stalled = ExecResult(
+        stdout="#6 sha256:abc 0B / 61.13MB 180.0s",
+        stderr="Docker download stalled: no byte progress for 180 seconds",
+        return_code=_DOCKER_DOWNLOAD_STALLED_RETURN_CODE,
+    )
+    success = ExecResult(stdout="done", stderr="", return_code=0)
+    detached_exec = AsyncMock(side_effect=[stalled, success])
+    compose = object.__new__(_E2BDinDCompose)
+    compose._env = SimpleNamespace(
+        _exec_on_host_detached=detached_exec,
+        logger=logging.getLogger("test-e2b-dind"),
+    )
+    compose._compose_env_vars = MagicMock(return_value={"BUILDKIT_PROGRESS": "plain"})
+    compose._compose_cmd = MagicMock(return_value="docker compose build")
+    sleep = AsyncMock()
+    monkeypatch.setattr("nexau_harbor.e2b_dind_environment.asyncio.sleep", sleep)
+
+    result = await compose._compose_build_exec(["build"], phase="build")
+
+    assert result is success
+    assert detached_exec.await_count == 2
+    for detached_call in detached_exec.await_args_list:
+        assert detached_call.kwargs["monitor_docker_download"] is True
+    sleep.assert_awaited_once_with(5)
+
+
 async def test_compose_build_does_not_retry_a_deterministic_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -341,9 +374,14 @@ async def test_cancelled_detached_host_build_logs_saved_output(
 ) -> None:
     handle = SimpleNamespace(pid=73, disconnect=AsyncMock())
     command_kill = AsyncMock()
+    process_tree_kill = AsyncMock(
+        return_value=SimpleNamespace(exit_code=0, stdout="", stderr="")
+    )
     environment = object.__new__(NexAUE2BDinDEnvironment)
     environment.logger = logging.getLogger("test-e2b-dind-cancel-diagnostic")
-    environment._sandbox = SimpleNamespace(commands=SimpleNamespace(kill=command_kill))
+    environment._sandbox = SimpleNamespace(
+        commands=SimpleNamespace(run=process_tree_kill, kill=command_kill)
+    )
     environment._dispatch_command = AsyncMock(return_value=handle)
     environment._poll_detached_command = AsyncMock(side_effect=asyncio.CancelledError())
     environment._detached_exec_result = AsyncMock(
@@ -365,6 +403,8 @@ async def test_cancelled_detached_host_build_logs_saved_output(
         73,
         request_timeout=30,
     )
+    assert "pgrep -P" in process_tree_kill.await_args.args[0]
+    assert "kill_tree 73" in process_tree_kill.await_args.args[0]
     snapshot_call = environment._detached_exec_result.await_args
     assert snapshot_call.kwargs["user"] == "root"
     assert snapshot_call.kwargs["return_code"] == -1
@@ -373,6 +413,76 @@ async def test_cancelled_detached_host_build_logs_saved_output(
     assert "process 73" in caplog.text
     assert "pulling layer 17/20" in caplog.text
     assert "registry connection stalled" in caplog.text
+
+
+def test_docker_download_progress_ignores_elapsed_time_only_updates() -> None:
+    first = "#6 sha256:accf 0B / 61.13MB 30.1s"
+    elapsed_only = f"{first}\n#6 sha256:accf 0B / 61.13MB 150.2s"
+    advanced = f"{elapsed_only}\n#6 sha256:accf 1.05MB / 61.13MB 180.3s"
+
+    first_signature = _docker_download_progress_signature(first)
+
+    assert first_signature is not None
+    assert _docker_download_progress_signature(elapsed_only) == first_signature
+    assert _docker_download_progress_signature(advanced) != first_signature
+    assert _docker_download_progress_signature(f"{advanced}\n#6 DONE 181.0s") is None
+
+
+def test_docker_download_monitor_only_times_out_an_unchanged_transfer() -> None:
+    monitor = _DockerDownloadProgressMonitor(timeout_sec=180)
+    stalled = "#6 sha256:accf 0B / 61.13MB 30.1s"
+
+    monitor.observe(stalled, now=10)
+    monitor.observe(stalled, now=189)
+    with pytest.raises(_DockerDownloadStalledError, match="no byte progress for 180 seconds"):
+        monitor.observe(stalled, now=190)
+
+    monitor.observe("#7 10.0 RUN dnf install", now=400)
+    assert monitor.signature is None
+    assert monitor.last_progress_at is None
+
+
+async def test_stalled_detached_host_build_is_stopped_and_returned_for_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    handle = SimpleNamespace(pid=91, disconnect=AsyncMock())
+    command_kill = AsyncMock()
+    process_tree_kill = AsyncMock(
+        return_value=SimpleNamespace(exit_code=0, stdout="", stderr="")
+    )
+    environment = object.__new__(NexAUE2BDinDEnvironment)
+    environment.logger = logging.getLogger("test-e2b-dind-stall")
+    environment._sandbox = SimpleNamespace(
+        commands=SimpleNamespace(run=process_tree_kill, kill=command_kill)
+    )
+    environment._dispatch_command = AsyncMock(return_value=handle)
+    environment._poll_detached_command = AsyncMock(
+        side_effect=_DockerDownloadStalledError(
+            "Docker download stalled: no byte progress for 180 seconds"
+        )
+    )
+    stalled_result = ExecResult(
+        stdout="#6 sha256:accf 0B / 61.13MB 180.0s",
+        stderr="Docker download stalled: no byte progress for 180 seconds",
+        return_code=_DOCKER_DOWNLOAD_STALLED_RETURN_CODE,
+    )
+    environment._detached_exec_result = AsyncMock(return_value=stalled_result)
+
+    with caplog.at_level(logging.WARNING, logger=environment.logger.name):
+        result = await environment._exec_on_host_detached(
+            "docker compose build",
+            diagnostic_label="docker compose build attempt 1/3",
+            monitor_docker_download=True,
+        )
+
+    assert result is stalled_result
+    assert environment._poll_detached_command.await_args.kwargs["on_running"] is not None
+    command_kill.assert_awaited_once_with(91, request_timeout=30)
+    assert "kill_tree 91" in process_tree_kill.await_args.args[0]
+    snapshot_call = environment._detached_exec_result.await_args
+    assert snapshot_call.kwargs["return_code"] == _DOCKER_DOWNLOAD_STALLED_RETURN_CODE
+    assert "Docker download stalled" in snapshot_call.kwargs["diagnostic"]
+    assert "Stopped stalled docker compose build attempt 1/3" in caplog.text
 
 
 def test_diagnostic_tail_keeps_only_bounded_suffix() -> None:

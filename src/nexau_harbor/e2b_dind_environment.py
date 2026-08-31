@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import override
 from uuid import uuid4
@@ -101,8 +102,11 @@ _AGENT_TRACE_DOWNLOAD_CONCURRENCY = 4
 _AGENT_TRACE_RECOVERY_GRACE_SEC = 15 * 60
 _HOST_DETACHED_STATE_ROOT = PurePosixPath("/tmp/harbor-nexau-exec")
 _HOST_DETACHED_DIAGNOSTIC_TAIL_CHARS = 16_384
+_HOST_DETACHED_PROGRESS_TAIL_BYTES = 32_768
 _COMPOSE_BUILD_MAX_ATTEMPTS = 3
 _COMPOSE_BUILD_RETRY_BASE_DELAY_SEC = 5
+_DOCKER_DOWNLOAD_STALL_TIMEOUT_SEC = 180
+_DOCKER_DOWNLOAD_STALLED_RETURN_CODE = 75
 
 _agent_trace_download_slots = asyncio.Semaphore(_AGENT_TRACE_DOWNLOAD_CONCURRENCY)
 _TRANSIENT_DOCKER_BUILD_ERROR = re.compile(
@@ -110,6 +114,45 @@ _TRANSIENT_DOCKER_BUILD_ERROR = re.compile(
     r"peer closed connection without sending tls close_notify)",
     flags=re.IGNORECASE,
 )
+_DOCKER_TRANSFER_PROGRESS = re.compile(
+    r"(?P<current>\d+(?:\.\d+)?)\s*(?P<current_unit>[kmgt]?i?b)\s*/\s*"
+    r"(?P<total>\d+(?:\.\d+)?)\s*(?P<total_unit>[kmgt]?i?b)",
+    flags=re.IGNORECASE,
+)
+_BUILDKIT_STEP_PREFIX = re.compile(r"^(?P<step>#\d+)\b")
+_DOCKER_LAYER_PREFIX = re.compile(r"^(?P<layer>[0-9a-f]{8,64})(?::|\s)", re.IGNORECASE)
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_PROGRESS_BAR = re.compile(r"\[[=>.\s-]+\]")
+
+
+class _DockerDownloadStalledError(RuntimeError):
+    """A Docker layer remained incomplete without byte progress."""
+
+
+@dataclass
+class _DockerDownloadProgressMonitor:
+    timeout_sec: float
+    signature: str | None = None
+    last_progress_at: float | None = None
+
+    def observe(self, output: str, *, now: float) -> None:
+        signature = _docker_download_progress_signature(output)
+        if signature is None:
+            self.signature = None
+            self.last_progress_at = None
+            return
+        if signature != self.signature or self.last_progress_at is None:
+            self.signature = signature
+            self.last_progress_at = now
+            return
+
+        stalled_sec = now - self.last_progress_at
+        if stalled_sec < self.timeout_sec:
+            return
+        raise _DockerDownloadStalledError(
+            "Docker download stalled: no byte progress for "
+            f"{int(stalled_sec)} seconds; active transfers: {signature[:500]}"
+        )
 
 
 def _positive_int(value: int | str, *, name: str) -> int:
@@ -137,9 +180,72 @@ def _diagnostic_tail(value: str) -> str:
     )
 
 
+def _docker_size_bytes(value: str, unit: str) -> float:
+    normalized = unit.lower()
+    binary = "i" in normalized
+    prefix = normalized.removesuffix("b").removesuffix("i")
+    exponent = {"": 0, "k": 1, "m": 2, "g": 3, "t": 4}[prefix]
+    return float(value) * ((1024 if binary else 1000) ** exponent)
+
+
+def _docker_download_progress_signature(output: str) -> str | None:
+    """Return active layer byte counters while ignoring elapsed-time-only updates."""
+
+    active: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        line = _ANSI_ESCAPE.sub("", raw_line).strip()
+        if not line:
+            continue
+
+        step_match = _BUILDKIT_STEP_PREFIX.match(line)
+        layer_match = _DOCKER_LAYER_PREFIX.match(line)
+        step = step_match.group("step") if step_match else None
+        layer = layer_match.group("layer").lower() if layer_match else None
+        lowered = line.lower()
+
+        if step is not None and any(marker in lowered for marker in (" done", " cached", " error")):
+            for key in tuple(active):
+                if key.startswith(f"{step}|"):
+                    active.pop(key)
+        if layer is not None and any(
+            marker in lowered for marker in ("download complete", "pull complete")
+        ):
+            for key in tuple(active):
+                if key.startswith(f"{layer}|"):
+                    active.pop(key)
+
+        progress = _DOCKER_TRANSFER_PROGRESS.search(line)
+        if progress is None or (step is None and layer is None):
+            continue
+        if "extracting" in lowered and "downloading" not in lowered:
+            continue
+
+        prefix = _PROGRESS_BAR.sub("[]", line[: progress.start()].strip())
+        owner = step or layer
+        key = f"{owner}|{prefix}"
+        current_bytes = _docker_size_bytes(
+            progress.group("current"),
+            progress.group("current_unit"),
+        )
+        total_bytes = _docker_size_bytes(
+            progress.group("total"),
+            progress.group("total_unit"),
+        )
+        if current_bytes >= total_bytes:
+            active.pop(key, None)
+            continue
+        active[key] = f"{key} {int(current_bytes)}/{int(total_bytes)} bytes"
+
+    return " | ".join(sorted(active.values())) or None
+
+
 def _is_transient_docker_build_error(result: ExecResult) -> bool:
     output = f"{result.stderr}\n{result.stdout}"
-    return _TRANSIENT_DOCKER_BUILD_ERROR.search(output) is not None
+    stalled = (
+        result.return_code == _DOCKER_DOWNLOAD_STALLED_RETURN_CODE
+        and "Docker download stalled:" in output
+    )
+    return stalled or _TRANSIENT_DOCKER_BUILD_ERROR.search(output) is not None
 
 
 def _remote_pack_command_with_exclusions(
@@ -545,9 +651,9 @@ class _E2BDinDCompose(DinDComposeOps):
                 command,
                 env=compose_env,
                 diagnostic_label=(
-                    f"docker compose {phase} attempt "
-                    f"{attempt}/{_COMPOSE_BUILD_MAX_ATTEMPTS}"
+                    f"docker compose {phase} attempt {attempt}/{_COMPOSE_BUILD_MAX_ATTEMPTS}"
                 ),
+                monitor_docker_download=True,
             )
             if result.return_code == 0:
                 return result
@@ -955,12 +1061,88 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
         )
         self._start_keepalive()
 
+    async def _read_host_detached_progress_tail(self, paths: _DetachedExecPaths) -> str:
+        sandbox = self._sandbox
+        if sandbox is None:
+            return ""
+        command = " ".join(
+            (
+                f"tail -c {_HOST_DETACHED_PROGRESS_TAIL_BYTES}",
+                shlex.quote(paths.stdout),
+                "2>/dev/null || true; printf '\\n'; tail -c",
+                str(_HOST_DETACHED_PROGRESS_TAIL_BYTES),
+                shlex.quote(paths.stderr),
+                "2>/dev/null || true",
+            )
+        )
+        try:
+            result = await sandbox.commands.run(
+                command,
+                timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
+                request_timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
+                user="root",
+            )
+            return result.stdout or ""
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to read detached Docker progress; stall detection will wait: %s",
+                exc,
+            )
+            return ""
+
+    async def _cancel_host_detached_process_tree(
+        self,
+        pid: int,
+        paths: _DetachedExecPaths,
+    ) -> None:
+        sandbox = self._sandbox
+        if sandbox is not None:
+            command = (
+                "kill_tree() { "
+                'for child in $(pgrep -P "$1" 2>/dev/null); do '
+                'kill_tree "$child"; '
+                "done; "
+                'kill -KILL "$1" 2>/dev/null || true; '
+                f"}}; kill_tree {pid}"
+            )
+            try:
+                result = await sandbox.commands.run(
+                    command,
+                    timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
+                    request_timeout=E2B_DETACHED_REQUEST_TIMEOUT_SEC,
+                    user="root",
+                )
+                if result.exit_code != 0:
+                    self.logger.warning(
+                        "Failed to kill detached E2B DinD process tree %s: %s",
+                        pid,
+                        result.stderr or result.stdout or f"exit code {result.exit_code}",
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to kill detached E2B DinD process tree %s: %s",
+                    pid,
+                    exc,
+                )
+
+        await NexAUE2BEnvironment._cancel_detached_command(
+            self,
+            pid=pid,
+            paths=paths,
+            user="root",
+        )
+
     async def _exec_on_host_detached(
         self,
         command: str,
         *,
         env: dict[str, str] | None = None,
         diagnostic_label: str = "detached E2B DinD host command",
+        monitor_docker_download: bool = False,
     ) -> ExecResult:
         """Run a long DinD-host command in the background and poll it briefly."""
 
@@ -990,18 +1172,44 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
                     "short polling anyway: %s",
                     exc,
                 )
+            progress_monitor = _DockerDownloadProgressMonitor(
+                timeout_sec=_DOCKER_DOWNLOAD_STALL_TIMEOUT_SEC
+            )
+
+            async def observe_docker_progress() -> None:
+                output = await self._read_host_detached_progress_tail(paths)
+                progress_monitor.observe(
+                    output,
+                    now=asyncio.get_running_loop().time(),
+                )
+
             return await self._poll_detached_command(
                 pid=pid,
                 paths=paths,
                 user="root",
+                on_running=(observe_docker_progress if monitor_docker_download else None),
             )
-        except asyncio.CancelledError:
-            await NexAUE2BEnvironment._cancel_detached_command(
-                self,
-                pid=pid,
-                paths=paths,
+        except _DockerDownloadStalledError as exc:
+            await self._cancel_host_detached_process_tree(pid, paths)
+            snapshot = await self._detached_exec_result(
+                paths,
                 user="root",
+                return_code=_DOCKER_DOWNLOAD_STALLED_RETURN_CODE,
+                diagnostic=str(exc),
             )
+            self.logger.warning(
+                "Stopped stalled %s (process %s; state directory %s).\n"
+                "stdout tail:\n%s\n"
+                "stderr tail:\n%s",
+                diagnostic_label,
+                pid,
+                paths.directory,
+                _diagnostic_tail(snapshot.stdout),
+                _diagnostic_tail(snapshot.stderr),
+            )
+            return snapshot
+        except asyncio.CancelledError:
+            await self._cancel_host_detached_process_tree(pid, paths)
             snapshot = await self._detached_exec_result(
                 paths,
                 user="root",
