@@ -20,6 +20,7 @@ def _run_with_fake_uv(
     trace_config_capture: Path | None = None,
     ramp_capture: Path | None = None,
     invocation_capture_dir: Path | None = None,
+    prewarm_capture: Path | None = None,
     interrupt_when_children_ready: bool = False,
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -30,10 +31,12 @@ def _run_with_fake_uv(
         """#!/usr/bin/env bash
 set -euo pipefail
 is_preflight=0
+is_prewarm=0
 for argument in "$@"; do
   if [[ "$argument" == "nexau_harbor.e2b_preflight" ]]; then
     is_preflight=1
-    break
+  elif [[ "$argument" == "nexau_harbor.e2b_dind_prewarm" ]]; then
+    is_prewarm=1
   fi
 done
 if [[ "$is_preflight" == "1" ]]; then
@@ -66,6 +69,12 @@ if [[ "$is_preflight" == "1" ]]; then
     printf '%s\t%s\n' "$route" "${resolved##*/}" >> "$selectors_output"
   done
   exit 0
+fi
+if [[ "$is_prewarm" == "1" ]]; then
+  if [[ -n "${PREWARM_CAPTURE:-}" ]]; then
+    printf "%s\\n" "$@" > "$PREWARM_CAPTURE"
+  fi
+  exit "${PREWARM_EXIT_CODE:-0}"
 fi
 previous=""
 for argument in "$@"; do
@@ -112,6 +121,10 @@ printf "%s\\n" "$@"
         "HARBOR_CODEX_RESPONSES_BRIDGE",
         "HARBOR_CODEX_CONTEXT_WINDOW",
         "HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER",
+        "HARBOR_NEXAU_DIND_PREWARM",
+        "HARBOR_NEXAU_DIND_PREWARM_CONCURRENCY",
+        "HARBOR_NEXAU_DIND_PREWARM_TIMEOUT_SEC",
+        "HARBOR_NEXAU_DIND_PREWARM_ATTEMPTS",
     ):
         env.pop(name, None)
     if extra_env is not None:
@@ -133,6 +146,10 @@ printf "%s\\n" "$@"
         env["INVOCATION_CAPTURE_DIR"] = str(invocation_capture_dir)
     else:
         env.pop("INVOCATION_CAPTURE_DIR", None)
+    if prewarm_capture is not None:
+        env["PREWARM_CAPTURE"] = str(prewarm_capture)
+    else:
+        env.pop("PREWARM_CAPTURE", None)
 
     command = [str(_SCRIPT), *arguments]
     if interrupt_when_children_ready:
@@ -484,6 +501,67 @@ def test_smoke_script_selects_compose_partition_and_dind_environment(
     assert "bc62e2e43cf5c91f63442cd787d82fc4765461c0b4fd06cab76ac4322c13dbff" in arguments
     assert "--compose-only" not in arguments
     assert "TB3 partition: compose tasks" in result.stderr
+
+
+def test_smoke_script_prewarms_selected_dind_images_before_harbor(tmp_path: Path) -> None:
+    prewarm_capture = tmp_path / "prewarm-args.txt"
+
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--compose-only",
+        "--path",
+        "/tmp/frontier-bench-cpu68",
+        prewarm_capture=prewarm_capture,
+    )
+
+    assert result.returncode == 0, result.stderr
+    arguments = prewarm_capture.read_text().splitlines()
+    assert "nexau_harbor.e2b_dind_prewarm" in arguments
+    assert _last_option_value(arguments, "--dataset") == "/tmp/frontier-bench-cpu68"
+    assert _last_option_value(arguments, "--concurrency") == "2"
+    assert _last_option_value(arguments, "--timeout-sec") == "600"
+    assert _last_option_value(arguments, "--attempts") == "3"
+    assert arguments.count("--include") == 33
+    assert "Prewarming Docker Hub images" in result.stderr
+
+
+def test_smoke_script_can_disable_dind_prewarm(tmp_path: Path) -> None:
+    prewarm_capture = tmp_path / "prewarm-args.txt"
+
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--compose-only",
+        "--path",
+        "/tmp/frontier-bench-cpu68",
+        prewarm_capture=prewarm_capture,
+        extra_env={"HARBOR_NEXAU_DIND_PREWARM": "false"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not prewarm_capture.exists()
+
+
+def test_smoke_script_stops_before_harbor_when_dind_prewarm_fails(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--compose-only",
+        "--path",
+        "/tmp/frontier-bench-cpu68",
+        extra_env={"PREWARM_EXIT_CODE": "7"},
+    )
+
+    assert result.returncode == 7
+    assert result.stdout == ""
+
+
+def test_smoke_script_rejects_invalid_dind_prewarm_concurrency(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(
+        tmp_path,
+        extra_env={"HARBOR_NEXAU_DIND_PREWARM_CONCURRENCY": "0"},
+    )
+
+    assert result.returncode == 2
+    assert "prewarm concurrency must be a positive integer" in result.stderr
 
 
 def test_smoke_script_selects_non_compose_partition_and_plain_e2b_environment(

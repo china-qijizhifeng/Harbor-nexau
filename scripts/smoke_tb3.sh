@@ -35,6 +35,10 @@ environment_build_timeout_multiplier="${HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPL
 e2b_start_ramp_delay_sec="${HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC:-0}"
 e2b_preflight_timeout_sec="${HARBOR_NEXAU_E2B_PREFLIGHT_TIMEOUT_SEC:-7200}"
 e2b_preflight_attempts="${HARBOR_NEXAU_E2B_PREFLIGHT_ATTEMPTS:-3}"
+dind_prewarm="${HARBOR_NEXAU_DIND_PREWARM:-true}"
+dind_prewarm_concurrency="${HARBOR_NEXAU_DIND_PREWARM_CONCURRENCY:-2}"
+dind_prewarm_timeout_sec="${HARBOR_NEXAU_DIND_PREWARM_TIMEOUT_SEC:-600}"
+dind_prewarm_attempts="${HARBOR_NEXAU_DIND_PREWARM_ATTEMPTS:-3}"
 refresh_e2b_routing=0
 task_partition=""
 forwarded_args=()
@@ -250,6 +254,26 @@ fi
 if [[ ! "$e2b_preflight_attempts" =~ ^[1-9][0-9]*$ ]]; then
   printf 'E2B preflight attempts must be a positive integer, got: %s\n' \
     "$e2b_preflight_attempts" >&2
+  exit 2
+fi
+if [[ "$dind_prewarm" != "true" && "$dind_prewarm" != "false" ]]; then
+  printf 'HARBOR_NEXAU_DIND_PREWARM must be true or false, got: %s\n' \
+    "$dind_prewarm" >&2
+  exit 2
+fi
+if [[ ! "$dind_prewarm_concurrency" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'DinD prewarm concurrency must be a positive integer, got: %s\n' \
+    "$dind_prewarm_concurrency" >&2
+  exit 2
+fi
+if [[ ! "$dind_prewarm_timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'DinD prewarm timeout must be a positive integer, got: %s\n' \
+    "$dind_prewarm_timeout_sec" >&2
+  exit 2
+fi
+if [[ ! "$dind_prewarm_attempts" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'DinD prewarm attempts must be a positive integer, got: %s\n' \
+    "$dind_prewarm_attempts" >&2
   exit 2
 fi
 if [[ ! "$agent_setup_timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
@@ -565,6 +589,82 @@ fi
 harbor_command=(uv run --project "$project_root" harbor)
 if [[ "${_HARBOR_NEXAU_DOTENV_LOADED:-0}" == "1" ]]; then
   harbor_command=(harbor)
+fi
+
+effective_environment="$environment"
+prewarm_dataset_path=""
+prewarm_includes=()
+prewarm_excludes=()
+prewarm_scan_args=("${partition_args[@]}" "$@")
+for ((argument_index = 0; argument_index < ${#prewarm_scan_args[@]}; argument_index++)); do
+  argument="${prewarm_scan_args[$argument_index]}"
+  case "$argument" in
+    --env | -e)
+      if ((argument_index + 1 < ${#prewarm_scan_args[@]})); then
+        effective_environment="${prewarm_scan_args[$((argument_index + 1))]}"
+        ((argument_index += 1))
+      fi
+      ;;
+    --env=* | -e=*)
+      effective_environment="${argument#*=}"
+      ;;
+    --path | -p)
+      if ((argument_index + 1 < ${#prewarm_scan_args[@]})); then
+        prewarm_dataset_path="${prewarm_scan_args[$((argument_index + 1))]}"
+        ((argument_index += 1))
+      fi
+      ;;
+    --path=* | -p=*)
+      prewarm_dataset_path="${argument#*=}"
+      ;;
+    --include-task-name | -i)
+      if ((argument_index + 1 < ${#prewarm_scan_args[@]})); then
+        prewarm_includes+=("${prewarm_scan_args[$((argument_index + 1))]}")
+        ((argument_index += 1))
+      fi
+      ;;
+    --include-task-name=* | -i=*)
+      prewarm_includes+=("${argument#*=}")
+      ;;
+    --exclude-task-name | -x)
+      if ((argument_index + 1 < ${#prewarm_scan_args[@]})); then
+        prewarm_excludes+=("${prewarm_scan_args[$((argument_index + 1))]}")
+        ((argument_index += 1))
+      fi
+      ;;
+    --exclude-task-name=* | -x=*)
+      prewarm_excludes+=("${argument#*=}")
+      ;;
+  esac
+done
+
+if [[ "$dind_prewarm" == "true" && "$effective_environment" == "$compose_e2b_environment" ]]; then
+  if [[ -z "$prewarm_dataset_path" ]]; then
+    printf '%s\n' \
+      'DinD image prewarm skipped because this invocation has no resolved local --path.' >&2
+  else
+    prewarm_command=(
+      uv run --project "$project_root" python -m nexau_harbor.e2b_dind_prewarm
+    )
+    if [[ "${_HARBOR_NEXAU_DOTENV_LOADED:-0}" == "1" ]]; then
+      prewarm_command=(python -m nexau_harbor.e2b_dind_prewarm)
+    fi
+    prewarm_args=(
+      --dataset "$prewarm_dataset_path"
+      --concurrency "$dind_prewarm_concurrency"
+      --timeout-sec "$dind_prewarm_timeout_sec"
+      --attempts "$dind_prewarm_attempts"
+    )
+    for selector in "${prewarm_includes[@]}"; do
+      prewarm_args+=(--include "$selector")
+    done
+    for selector in "${prewarm_excludes[@]}"; do
+      prewarm_args+=(--exclude "$selector")
+    done
+    printf 'Prewarming Docker Hub images for the selected DinD task(s) with concurrency %s.\n' \
+      "$dind_prewarm_concurrency" >&2
+    "${prewarm_command[@]}" "${prewarm_args[@]}"
+  fi
 fi
 
 if [[ "$trace_mode" == "1" ]]; then

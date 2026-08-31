@@ -124,6 +124,14 @@ Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbo
 - `<job-name>-plain-e2b` 使用 `NexAUE2BEnvironment`；
 - `<job-name>-dind` 使用 `NexAUE2BDinDEnvironment`。
 
+DinD 子 job 在启动 Harbor 前，会从本轮选中任务的所有 `Dockerfile*` 和 Compose services 自动
+收集 Docker Hub 基础/服务镜像，再在一个专用的临时 E2B DinD sandbox 中以默认 2 并发执行
+`docker pull`。这会沿正式任务相同的 E2B→registry 路径预热共享 pull-through cache；完成后
+会移除该 sandbox 的本地镜像以控制磁盘占用，最后立即删除预热 sandbox，不运行 Agent。
+非 Docker Hub registry、本地 `build:` 输出镜像和无法解析的变量引用会跳过，仍由正式 Compose
+build 处理。任一已识别镜像在 3 次、单次 600 秒后仍
+失败时，脚本会在启动模型任务前退出，避免消耗评测预算。
+
 无需手写 `--n-tasks`/`--n-concurrent`，也不要同时传 `--env` 或题名过滤器。自动模式目前只接受
 已经解析到本机的 `--path` 数据集；它不修改原题。可信分流结果按 environment hash、E2B SDK 版本
 和 E2B backend 缓存在 `~/.cache/harbor-nexau/e2b-routes.json`，后续运行直接复用；环境内容或 backend
@@ -131,6 +139,12 @@ Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbo
 尝试，可分别通过 `HARBOR_NEXAU_E2B_PREFLIGHT_TIMEOUT_SEC` 和
 `HARBOR_NEXAU_E2B_PREFLIGHT_ATTEMPTS` 调整；缓存路径可通过
 `HARBOR_NEXAU_E2B_ROUTE_CACHE` 覆盖。
+
+预热默认开启，可用 `HARBOR_NEXAU_DIND_PREWARM=false` 关闭；并发、单次 pull 上限和尝试数
+分别由 `HARBOR_NEXAU_DIND_PREWARM_CONCURRENCY`、
+`HARBOR_NEXAU_DIND_PREWARM_TIMEOUT_SEC`、`HARBOR_NEXAU_DIND_PREWARM_ATTEMPTS`
+设置。自动发现要求本次调用有已解析的本地 `--path`；只给 Harbor Hub `--dataset` 时会明确跳过，
+不会猜测或修改远端数据集。
 
 `--e2b-start-ramp-delay-sec 5` 不降低组内并发：trial 会立即进入 Harbor 调度，但每个子 job
 内部的 E2B sandbox 创建会按 5 秒错峰。预检使用一条创建队列；正式运行的普通 E2B 和 DinD
@@ -290,7 +304,9 @@ sidecar 的 collect hook、artifact 下载和单服务 stop；独立 verifier �
 耗时的 pull/build 以远端后台进程运行，每 30 秒用短连接轮询；其内部命令不重复应用题目原始
 build timeout，而由 Harbor 外层经 multiplier 计算后的 environment-build deadline 统一取消。
 遇到 `unexpected EOF`、`short read` 或连接重置时，会在同一 sandbox 内指数退避重试最多
-3 次，确定性的 Dockerfile/build 错误不会重试。
+3 次；未完成镜像层的字节计数连续 180 秒不变时，也会保存输出、结束完整 Compose 进程树并
+重试。只有 elapsed time 变化不算下载进度，普通编译、包安装和确定性的 Dockerfile/build 错误
+不会因此被终止或重试。
 镜像 pull/build 阶段临时使用公网，完成后由 E2B 外层网络策略限制整个 sandbox；这样既保留
 Compose 内部 DNS/bridge 通信，也支持 Harbor 在不同阶段动态切换 public/no-network/allowlist。
 
