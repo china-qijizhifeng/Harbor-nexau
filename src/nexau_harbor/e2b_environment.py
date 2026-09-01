@@ -21,6 +21,7 @@ from harbor.models.task.config import NetworkMode
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV, REMOTE_LOG_DIR
+from nexau_harbor.e2b_template_storage import requested_e2b_template_storage
 from nexau_harbor.trace_artifacts import (
     AgentLogDownloadError,
     PendingAgentLogDownload,
@@ -291,6 +292,24 @@ def _is_missing_default_template_tag(exc: Exception) -> bool:
     return message.startswith("404:") and _MISSING_DEFAULT_TEMPLATE_TAG in message
 
 
+def _storage_scoped_template_name(template_name: str, storage_mb: int | None) -> str:
+    if storage_mb is None:
+        return template_name
+    return f"{template_name}-s{storage_mb}"
+
+
+def _parse_root_disk_usage(output: str) -> tuple[int, int]:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("df returned no output")
+    fields = lines[-1].split()
+    if len(fields) < 6:
+        raise ValueError(f"unexpected df output: {lines[-1]!r}")
+    total_kib = int(fields[1])
+    available_kib = int(fields[3])
+    return total_kib // 1024, available_kib // 1024
+
+
 class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
     """Use a bounded renewable lease without exceeding the E2B plan limit."""
 
@@ -319,6 +338,11 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         self._keepalive_deadline: float | None = None
         self._pending_agent_log_download: _PendingAgentLogDownload | None = None
         super().__init__(*args, **kwargs)
+        if hasattr(self, "task_env_config") and hasattr(self, "_template_name"):
+            self._template_name = _storage_scoped_template_name(
+                self._template_name,
+                self._effective_storage_mb,
+            )
 
     @override
     async def start(self, force_build: bool) -> None:
@@ -712,20 +736,24 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         build_kwargs["on_build_logs"] = capture_build_log
         self._last_template_build_log_tail = ""
         try:
-            build_timeout_sec = getattr(self, "_e2b_template_build_timeout_sec", None)
-            if build_timeout_sec is None:
-                await harbor_e2b.AsyncTemplate.build(**build_kwargs)
-            else:
-                build_timeout = asyncio.timeout(build_timeout_sec)
-                try:
-                    async with build_timeout:
-                        await harbor_e2b.AsyncTemplate.build(**build_kwargs)
-                except TimeoutError as exc:
-                    if not build_timeout.expired():
-                        raise
-                    raise E2BTemplateBuildTimeoutError(
-                        f"E2B template build exceeded {build_timeout_sec:g}s"
-                    ) from exc
+            storage_mb = self._effective_storage_mb
+            if storage_mb is not None:
+                self.logger.info("Requesting %s MB of E2B template storage", storage_mb)
+            with requested_e2b_template_storage(storage_mb):
+                build_timeout_sec = getattr(self, "_e2b_template_build_timeout_sec", None)
+                if build_timeout_sec is None:
+                    await harbor_e2b.AsyncTemplate.build(**build_kwargs)
+                else:
+                    build_timeout = asyncio.timeout(build_timeout_sec)
+                    try:
+                        async with build_timeout:
+                            await harbor_e2b.AsyncTemplate.build(**build_kwargs)
+                    except TimeoutError as exc:
+                        if not build_timeout.expired():
+                            raise
+                        raise E2BTemplateBuildTimeoutError(
+                            f"E2B template build exceeded {build_timeout_sec:g}s"
+                        ) from exc
         except Exception as exc:
             try:
                 setattr(exc, "e2b_build_log_tail", self._last_template_build_log_tail)
@@ -778,7 +806,52 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
             allow_internet_access=(self.network_policy.network_mode != NetworkMode.NO_NETWORK),
             network=self._sandbox_create_network_options(),
         )
+        try:
+            await self._validate_sandbox_storage()
+        except BaseException:
+            try:
+                await self._sandbox.kill()
+            finally:
+                self._sandbox = None
+            raise
         self._start_keepalive()
+
+    async def _validate_sandbox_storage(self) -> None:
+        requested_mb = self._effective_storage_mb
+        if requested_mb is None:
+            return
+        if self._sandbox is None:
+            raise RuntimeError("Sandbox not found while validating E2B storage")
+
+        result = await self._sandbox.commands.run(
+            "df -Pk / | tail -n 1",
+            user="root",
+            timeout=30,
+            request_timeout=30,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                "Could not validate E2B sandbox storage: "
+                f"{result.stderr or result.stdout or 'df failed'}"
+            )
+        try:
+            total_mb, available_mb = _parse_root_disk_usage(result.stdout)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Could not parse E2B sandbox storage: {exc}") from exc
+
+        minimum_available_mb = max(1, int(requested_mb * 0.9))
+        if total_mb < requested_mb or available_mb < minimum_available_mb:
+            raise RuntimeError(
+                "E2B sandbox storage is below the requested capacity: "
+                f"requested={requested_mb} MB, total={total_mb} MB, "
+                f"available={available_mb} MB"
+            )
+        self.logger.info(
+            "E2B sandbox storage verified: requested=%s MB, total=%s MB, available=%s MB",
+            requested_mb,
+            total_mb,
+            available_mb,
+        )
 
     @retry(
         stop=stop_after_attempt(5),
@@ -830,9 +903,7 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         assets: PriorityTraceAssets,
     ) -> list[str]:
         missing = [name for name in assets.files if not (target / name).is_file()]
-        missing.extend(
-            name for name in assets.directories if not (target / name).is_dir()
-        )
+        missing.extend(name for name in assets.directories if not (target / name).is_dir())
         return missing
 
     async def _download_agent_logs(

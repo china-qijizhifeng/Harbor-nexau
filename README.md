@@ -407,6 +407,12 @@ NexAU JSONL，或 Codex events、stderr、result 和完整 native sessions，再
 Terminal-Bench 任务文件和 Harbor 缓存不会被修改。转换只匹配这个已知的 Astral uv 模式，
 其他多阶段复制语句保持原样。
 
+普通 `NexAUE2BEnvironment` 会把题目 `environment.storage_mb`（包括 Harbor 显式传入的
+`--override-storage-mb`）写入自托管 E2B v3 template build 的 `diskSizeMB` 字段。模板别名
+包含实际请求值，因此不同磁盘规格不会误复用同一个缓存；sandbox 启动后还会用 `df` 核验根盘
+总量和可用空间，不满足请求时立即清理并报错。这里不会设置统一的大磁盘默认值：没有声明磁盘
+要求的题目继续沿用 E2B 默认容量。
+
 宿主机的 `HTTP_PROXY`/`HTTPS_PROXY` 若指向 `localhost`、回环地址或未指定地址，不会传入
 远程 Agent；E2B 中的 `127.0.0.1` 指向 sandbox 自身，而不是宿主机代理。过滤只发生在
 Agent 执行环境，宿主机上的 E2B SDK 仍可继续使用该代理；具有远程可达主机名或 IP 的代理

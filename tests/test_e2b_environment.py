@@ -25,6 +25,8 @@ from nexau_harbor.e2b_environment import (
     E2B_SANDBOX_TIMEOUT_SEC,
     E2B_START_RAMP_DELAY_ENV,
     NexAUE2BEnvironment,
+    _parse_root_disk_usage,
+    _storage_scoped_template_name,
 )
 
 UV_COPY = "COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /uvx /usr/local/bin/"
@@ -71,6 +73,84 @@ def test_missing_default_template_tag_detection_is_narrow() -> None:
     assert not e2b_environment._is_missing_default_template_tag(
         RuntimeError("500: tag 'default' does not exist for template 'example/task'")
     )
+
+
+def test_storage_scopes_template_cache_and_parses_df_output() -> None:
+    assert _storage_scoped_template_name("task__abcdef", None) == "task__abcdef"
+    assert _storage_scoped_template_name("task__abcdef", 10_240) == "task__abcdef-s10240"
+    assert _parse_root_disk_usage(
+        "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+        "/dev/root 56605696 333824 56271872 1% /\n"
+    ) == (55_279, 54_953)
+
+
+def test_environment_scopes_template_name_to_effective_storage(monkeypatch) -> None:
+    def initialize_upstream(environment, *args, **kwargs) -> None:
+        del args, kwargs
+        environment.task_env_config = EnvironmentConfig(storage_mb=10_240)
+        environment._template_name = "task__abcdef"
+
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b.E2BEnvironment,
+        "__init__",
+        initialize_upstream,
+    )
+
+    environment = NexAUE2BEnvironment()
+
+    assert environment._template_name == "task__abcdef-s10240"
+
+
+async def test_validate_sandbox_storage_checks_root_capacity() -> None:
+    run = AsyncMock(
+        return_value=SimpleNamespace(
+            exit_code=0,
+            stdout=(
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                "/dev/root 56605696 333824 56271872 1% /\n"
+            ),
+            stderr="",
+        )
+    )
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment.task_env_config = EnvironmentConfig(storage_mb=10_240)
+    environment._sandbox = SimpleNamespace(commands=SimpleNamespace(run=run))
+    environment.logger = MagicMock()
+
+    await environment._validate_sandbox_storage()
+
+    run.assert_awaited_once_with(
+        "df -Pk / | tail -n 1",
+        user="root",
+        timeout=30,
+        request_timeout=30,
+    )
+    environment.logger.info.assert_called_once_with(
+        "E2B sandbox storage verified: requested=%s MB, total=%s MB, available=%s MB",
+        10_240,
+        55_279,
+        54_953,
+    )
+
+
+async def test_validate_sandbox_storage_rejects_insufficient_capacity() -> None:
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment.task_env_config = EnvironmentConfig(storage_mb=10_240)
+    environment._sandbox = SimpleNamespace(
+        commands=SimpleNamespace(
+            run=AsyncMock(
+                return_value=SimpleNamespace(
+                    exit_code=0,
+                    stdout="/dev/root 8192000 1024000 7168000 13% /\n",
+                    stderr="",
+                )
+            )
+        )
+    )
+    environment.logger = MagicMock()
+
+    with pytest.raises(RuntimeError, match="below the requested capacity"):
+        await environment._validate_sandbox_storage()
 
 
 async def test_start_rebuilds_once_when_cached_template_has_no_launchable_default(
