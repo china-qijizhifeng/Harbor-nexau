@@ -7,7 +7,10 @@ import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from nexau_harbor.harbor_compat import (
+    extract_tar_directory_from_file,
     install_harbor_task_directory_permissions_patch,
     normalize_package_task_directory_permissions,
 )
@@ -109,3 +112,50 @@ async def test_task_client_patch_repairs_local_dataset_symlink_cache_hits(
 
     assert result.results[0].path == task_link
     assert _mode(task_dir / "environment/src/worker") == 0o755
+
+
+def test_safe_artifact_extraction_preserves_directory_modes_under_umask(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    source.chmod(0o755)
+    public = source / "public"
+    public.mkdir()
+    public.chmod(0o755)
+    private = source / "private"
+    private.mkdir()
+    private.chmod(0o700)
+    requirements = public / "requirements.txt"
+    requirements.write_text("dependency==1.0\n")
+    requirements.chmod(0o644)
+    archive_path = tmp_path / "artifact.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        archive.add(source, arcname=".")
+
+    target = tmp_path / "target"
+    previous_umask = os.umask(0o077)
+    try:
+        target.mkdir()
+        extract_tar_directory_from_file(archive_path, target)
+    finally:
+        os.umask(previous_umask)
+
+    assert _mode(target) == 0o755
+    assert _mode(target / "public") == 0o755
+    assert _mode(target / "private") == 0o700
+    assert _mode(target / "public/requirements.txt") == 0o644
+
+
+def test_safe_artifact_extraction_keeps_data_filter_path_checks(tmp_path: Path) -> None:
+    archive_path = tmp_path / "escape.tar.gz"
+    payload = b"escape"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        member = tarfile.TarInfo("../outside.txt")
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+
+    with pytest.raises(tarfile.OutsideDestinationError):
+        extract_tar_directory_from_file(archive_path, tmp_path / "target")
+
+    assert not (tmp_path / "outside.txt").exists()

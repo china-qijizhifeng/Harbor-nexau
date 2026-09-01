@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import stat
+import tarfile
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from harbor.constants import PACKAGE_CACHE_DIR
 from harbor.tasks.client import TaskClient
@@ -14,6 +15,44 @@ _PACKAGE_DIRECTORY_MODE = 0o755
 _PATCH_MARKER = "_nexau_normalizes_package_directory_permissions"
 
 logger = logging.getLogger(__name__)
+
+
+def _data_filter_with_safe_directory_modes(
+    member: tarfile.TarInfo,
+    destination: str,
+) -> tarfile.TarInfo | None:
+    """Keep safe directory modes that Python's data filter intentionally drops."""
+
+    filtered = tarfile.data_filter(member, destination)
+    if filtered is None or not filtered.isdir():
+        return filtered
+
+    # Retain owner bits and group/other read+execute while stripping special
+    # bits and group/other writes, matching the data filter's file-mode policy.
+    return filtered.replace(mode=member.mode & 0o755)
+
+
+def extract_tar_directory(fileobj: BinaryIO, target_dir: Path | str) -> None:
+    """Safely extract a directory archive without leaking the host umask.
+
+    Python 3.13's ``tarfile.data_filter`` sets directory modes to ``None``.
+    That is safe for generic archives, but makes Harbor's artifact transfer
+    depend on the host process umask. This wrapper keeps the data filter's path
+    and link checks while restoring only its already-sanitized directory mode.
+    """
+
+    target_path = Path(target_dir)
+    target_path.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=fileobj, mode="r:*") as archive:
+        archive.extractall(target_path, filter=_data_filter_with_safe_directory_modes)
+
+
+def extract_tar_directory_from_file(
+    archive_path: Path | str,
+    target_dir: Path | str,
+) -> None:
+    with Path(archive_path).open("rb") as fileobj:
+        extract_tar_directory(fileobj, target_dir)
 
 
 def normalize_package_task_directory_permissions(

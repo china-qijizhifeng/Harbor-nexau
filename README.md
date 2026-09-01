@@ -61,7 +61,8 @@ scripts/smoke_tb3.sh --job-name nexau-smoke
 归档只记录文件条目；在宿主 `umask=0077` 时，解包器会把隐式父目录创建为 `0700`，导致独立
 verifier 切换到非 root 用户后无法读取 agent 产物。兼容补丁覆盖新下载、缓存命中以及指向 package
 cache 的本地 dataset symlink，不跟随包内目录 symlink、不改文件权限，也不修改 package cache
-之外的用户本地任务。
+之外的用户本地任务。DinD artifact 的 tar 解包同时保留经安全过滤后的目录 mode；仍使用 Python
+`data_filter` 拒绝路径穿越和越界 link，但不再让 agent→verifier 目录权限受宿主 `umask` 影响。
 
 `smoke_tb3.sh` 默认显式选择
 [`configs/terminal_bench/code_agent.yaml`](src/nexau_harbor/configs/terminal_bench/code_agent.yaml)，

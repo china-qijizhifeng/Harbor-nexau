@@ -47,7 +47,6 @@ from harbor.environments.docker.compose_env import (
 )
 from harbor.environments.docker.docker import _sanitize_docker_image_name
 from harbor.environments.tar_transfer import (
-    extract_dir_from_file,
     pack_dir_to_file,
     remote_pack_command,
     remote_unpack_command,
@@ -74,6 +73,7 @@ from nexau_harbor.e2b_environment import (
     _DetachedExecPaths,
     _reserve_sandbox_start_delay,
 )
+from nexau_harbor.harbor_compat import extract_tar_directory_from_file
 from nexau_harbor.trace_artifacts import (
     AgentLogDownloadError,
     PendingAgentLogDownload,
@@ -428,7 +428,7 @@ class _E2BDinDCompose(DinDComposeOps):
                         f"{result.stderr or result.stdout or 'no output'}"
                     )
                 await self._env._download_file_from_host(remote_archive, local_archive)
-                extract_dir_from_file(local_archive, target_dir)
+                extract_tar_directory_from_file(local_archive, target_dir)
             finally:
                 await self._env._remove_host_path_best_effort(remote_archive)
 
