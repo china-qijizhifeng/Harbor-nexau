@@ -10,6 +10,9 @@ dependencies = [
     "python-dotenv>=1.2,<2",
 ]
 
+[project.scripts]
+harbor-nexau = "nexau_harbor.harbor_cli:main"
+
 [project.optional-dependencies]
 cloud = [
     "harbor[daytona,e2b,modal]>=0.21.0,<0.22.0",

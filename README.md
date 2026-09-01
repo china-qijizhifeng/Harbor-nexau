@@ -1,10 +1,12 @@
 # Harbor NexAU
 
-这是一个独立的 NexAU-Harbor 集成仓库。它不包含 Harbor submodule，也不复制或修改
-Harbor 的 `Task`、`Trial`、Registry 等核心代码：
+这是一个独立的 NexAU-Harbor 集成仓库。它不包含 Harbor submodule，也不直接修改已安装的
+Harbor site-packages：
 
 - Harbor 是普通 Python 依赖，兼容范围固定为 `>=0.21.0,<0.22.0`。
 - `uv.lock` 固定每次实际运行的完整依赖版本。
+- `harbor-nexau` CLI 在进程内安装窄范围的 Harbor 0.21 兼容补丁；当前补丁只修复 registry
+  任务包目录权限受宿主 `umask` 影响的问题。
 - NexAU 固定为 v0.4.1 对应的 commit
   `265805b86d89081e8ec9f026ee7807d2be0ee853`。
 - runner 会为该版本缺少上限的 LLM 指数退避增加 30 秒硬上限和 25% jitter；可用
@@ -39,7 +41,7 @@ uv sync --locked --extra cloud
 export OPENAI_API_KEY="..."
 export LLM_KIND=openai_responses
 
-uv run harbor run \
+uv run harbor-nexau run \
   --dataset terminal-bench/terminal-bench-3@sha256:88433fbcecd1a3f81f7a71bff4cc76c394d0edbefb7e028f90d4109b639fefba \
   --agent nexau_harbor.agent:NexAUAgent \
   --agent-kwarg config_path="$PWD/src/nexau_harbor/configs/terminal_bench/code_agent.yaml" \
@@ -53,6 +55,13 @@ uv run harbor run \
 ```bash
 scripts/smoke_tb3.sh --job-name nexau-smoke
 ```
+
+`harbor-nexau` 和 `smoke_tb3.sh` 会在 Harbor 完成任务解析后，只检查解析到
+`~/.cache/harbor/tasks/packages` 内的任务树，并把包内目录规范为 `0755`。Harbor 0.21 的 registry
+归档只记录文件条目；在宿主 `umask=0077` 时，解包器会把隐式父目录创建为 `0700`，导致独立
+verifier 切换到非 root 用户后无法读取 agent 产物。兼容补丁覆盖新下载、缓存命中以及指向 package
+cache 的本地 dataset symlink，不跟随包内目录 symlink、不改文件权限，也不修改 package cache
+之外的用户本地任务。
 
 `smoke_tb3.sh` 默认显式选择
 [`configs/terminal_bench/code_agent.yaml`](src/nexau_harbor/configs/terminal_bench/code_agent.yaml)，

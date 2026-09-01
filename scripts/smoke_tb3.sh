@@ -611,9 +611,11 @@ if [[ "$has_environment_timeout_arg" == "0" ]]; then
   )
 fi
 
-harbor_command=(uv run --project "$project_root" harbor)
+harbor_command=(
+  uv run --project "$project_root" python -m nexau_harbor.harbor_cli
+)
 if [[ "${_HARBOR_NEXAU_DOTENV_LOADED:-0}" == "1" ]]; then
-  harbor_command=(harbor)
+  harbor_command=(python -m nexau_harbor.harbor_cli)
 fi
 
 effective_environment="$environment"

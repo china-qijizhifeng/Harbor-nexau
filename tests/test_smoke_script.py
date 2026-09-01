@@ -243,6 +243,16 @@ def test_smoke_script_selects_terminal_bench_config_by_default(
     ]
 
 
+def test_smoke_script_uses_permission_safe_harbor_cli(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    arguments = result.stdout.splitlines()
+    module_index = arguments.index("-m")
+    assert arguments[module_index + 1] == "nexau_harbor.harbor_cli"
+    assert arguments[module_index + 2] == "run"
+
+
 def test_smoke_script_allows_explicit_harness_config(tmp_path: Path) -> None:
     custom_config = tmp_path / "custom-agent.yaml"
     custom_config.write_text("type: agent\n")
@@ -578,7 +588,7 @@ def test_smoke_script_continues_when_best_effort_dind_prewarm_fails(tmp_path: Pa
 
     assert result.returncode == 0, result.stderr
     assert "continuing because formal sandboxes have official-registry fallback" in result.stderr
-    assert "harbor" in result.stdout.splitlines()
+    assert "nexau_harbor.harbor_cli" in result.stdout.splitlines()
 
 
 def test_smoke_script_required_prewarm_stops_before_harbor(tmp_path: Path) -> None:
