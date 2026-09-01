@@ -11,9 +11,15 @@ from nexau_harbor import e2b_dind_template
 from nexau_harbor.e2b_dind_template import (
     BASE_TEMPLATE_BUILD_ID,
     BASE_TEMPLATE_ID,
+    BUILDX_VERSION,
     COMPOSE_VERSION,
+    CONTAINERD_VERSION,
     DOCKER_VERSION,
+    PUBLISHED_DIND_TEMPLATES,
     REGISTRY_MIRRORS,
+    STANDALONE_SOURCE_BUILD,
+    STANDALONE_SOURCE_ID,
+    STANDALONE_UBUNTU_VARIANT,
     E2BConnection,
 )
 
@@ -109,6 +115,40 @@ def test_validate_base_template_rejects_unreviewed_default_tag_drift() -> None:
     )
 
 
+def test_validate_base_template_can_explicitly_trust_packaged_pin() -> None:
+    template_api = MagicMock()
+
+    assert (
+        e2b_dind_template.validate_base_template(
+            template_api,
+            E2BConnection(api_key="test-key"),
+            trust_pinned_base=True,
+        )
+        == BASE_TEMPLATE_BUILD_ID
+    )
+    template_api.get_tags.assert_not_called()
+
+
+def test_packaged_manifests_define_both_published_capacity_profiles() -> None:
+    assert PUBLISHED_DIND_TEMPLATES["e2b-nex/harbor-nexau-dind:v1"].cpu_count == 8
+    high_cpu = PUBLISHED_DIND_TEMPLATES["s-project-e89a/harbor-nexau-dind-16c:v1"]
+    assert high_cpu.cpu_count == 16
+    assert high_cpu.memory_mb == 16_384
+    assert high_cpu.storage_mb == 55_342
+
+
+def test_parser_requires_explicit_opt_in_to_trust_pinned_base() -> None:
+    assert not e2b_dind_template._parser().parse_args(["build"]).trust_pinned_base
+    assert (
+        e2b_dind_template._parser().parse_args(["build", "--trust-pinned-base"]).trust_pinned_base
+    )
+
+    standalone = e2b_dind_template._parser().parse_args(
+        ["build", "--standalone-ubuntu", STANDALONE_UBUNTU_VARIANT]
+    )
+    assert standalone.standalone_ubuntu == STANDALONE_UBUNTU_VARIANT
+
+
 def test_template_builder_derives_from_pinned_base_and_records_provenance() -> None:
     template_api = MagicMock()
     builder = MagicMock()
@@ -141,6 +181,35 @@ def test_template_builder_derives_from_pinned_base_and_records_provenance() -> N
     verification_command = builder.run_cmd.call_args_list[1].args[0]
     assert DOCKER_VERSION in verification_command
     assert COMPOSE_VERSION in verification_command
+
+
+def test_template_builder_can_install_standalone_docker_profile() -> None:
+    template_api = MagicMock()
+    builder = MagicMock()
+    template_api.return_value.from_ubuntu_image.return_value = builder
+    builder.run_cmd.return_value = builder
+    builder.copy.return_value = builder
+
+    result = e2b_dind_template._template_builder(
+        template_api,
+        STANDALONE_SOURCE_BUILD,
+        "standalone-dind",
+        "v-test",
+        base_template_id=STANDALONE_SOURCE_ID,
+        standalone_ubuntu=STANDALONE_UBUNTU_VARIANT,
+    )
+
+    assert result is builder
+    template_api.assert_called_once_with(file_context_path=e2b_dind_template.TEMPLATE_CONTEXT)
+    template_api.return_value.from_ubuntu_image.assert_called_once_with(STANDALONE_UBUNTU_VARIANT)
+    install_command = builder.run_cmd.call_args_list[0].args[0]
+    assert f"docker-ce='5:{DOCKER_VERSION}-" in install_command
+    assert f"containerd.io='{CONTAINERD_VERSION}-" in install_command
+    assert f"docker-buildx-plugin='{BUILDX_VERSION}-" in install_command
+    assert f"docker-compose-plugin='{COMPOSE_VERSION}-" in install_command
+    provenance_command = builder.run_cmd.call_args_list[1].args[0]
+    assert f'"base_template_id":"{STANDALONE_SOURCE_ID}"' in provenance_command
+    assert f'"base_build_id":"{STANDALONE_SOURCE_BUILD}"' in provenance_command
 
 
 def test_build_dind_template_publishes_default_and_version_tags(

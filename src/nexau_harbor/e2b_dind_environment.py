@@ -60,6 +60,7 @@ from nexau_harbor.constants import NEXAU_DETACHED_EXEC_ENV, REMOTE_LOG_DIR
 from nexau_harbor.e2b_dind_template import (
     DEFAULT_CPU_COUNT,
     DEFAULT_MEMORY_MB,
+    PUBLISHED_DIND_TEMPLATES,
     TEMPLATE_NAME,
     TEMPLATE_VERSION,
 )
@@ -570,9 +571,7 @@ class _E2BDinDCompose(DinDComposeOps):
         assets: PriorityTraceAssets,
     ) -> list[str]:
         missing = [name for name in assets.files if not (target / name).is_file()]
-        missing.extend(
-            name for name in assets.directories if not (target / name).is_dir()
-        )
+        missing.extend(name for name in assets.directories if not (target / name).is_dir())
         return missing
 
     def _compose_referenced_env_vars(self) -> dict[str, str]:
@@ -754,8 +753,7 @@ class _E2BDinDCompose(DinDComposeOps):
         tag_command = ""
         if direct_image != image:
             tag_command = (
-                f" && docker image tag -- {shlex.quote(direct_image)} "
-                f"{shlex.quote(local_image)}"
+                f" && docker image tag -- {shlex.quote(direct_image)} {shlex.quote(local_image)}"
             )
         direct_command = (
             f"timeout --signal=TERM --kill-after={_DIND_PULL_KILL_GRACE_SEC} "
@@ -1049,32 +1047,55 @@ class NexAUE2BDinDEnvironment(ComposeServiceOpsMixin, NexAUE2BEnvironment):
         )
         if not template or any(char.isspace() for char in template):
             raise ValueError("dind_template must be a non-empty E2B template reference")
+        published_profile = PUBLISHED_DIND_TEMPLATES.get(template)
         capacity_values = {
             "dind_cpu_capacity": dind_cpu_capacity,
             "dind_memory_capacity_mb": dind_memory_capacity_mb,
             "dind_storage_capacity_mb": dind_storage_capacity_mb,
         }
         missing_capacities = [name for name, value in capacity_values.items() if value is None]
-        if template != E2B_DIND_DEFAULT_TEMPLATE and missing_capacities:
+        if (
+            template != E2B_DIND_DEFAULT_TEMPLATE
+            and published_profile is None
+            and missing_capacities
+        ):
             names = ", ".join(missing_capacities)
             raise ValueError(
                 "A custom dind_template requires explicit capacity metadata; "
                 f"set {names} to the actual template capacity values"
             )
 
+        profile_cpu = published_profile.cpu_count if published_profile is not None else None
+        profile_memory = published_profile.memory_mb if published_profile is not None else None
+        profile_storage = published_profile.storage_mb if published_profile is not None else None
+
         self._dind_template = template
         self._dind_cpu_capacity = _positive_int(
-            dind_cpu_capacity if dind_cpu_capacity is not None else DEFAULT_CPU_COUNT,
+            (
+                dind_cpu_capacity
+                if dind_cpu_capacity is not None
+                else profile_cpu
+                if profile_cpu is not None
+                else DEFAULT_CPU_COUNT
+            ),
             name="dind_cpu_capacity",
         )
         self._dind_memory_capacity_mb = _positive_int(
-            (dind_memory_capacity_mb if dind_memory_capacity_mb is not None else DEFAULT_MEMORY_MB),
+            (
+                dind_memory_capacity_mb
+                if dind_memory_capacity_mb is not None
+                else profile_memory
+                if profile_memory is not None
+                else DEFAULT_MEMORY_MB
+            ),
             name="dind_memory_capacity_mb",
         )
         self._dind_storage_capacity_mb = _positive_int(
             (
                 dind_storage_capacity_mb
                 if dind_storage_capacity_mb is not None
+                else profile_storage
+                if profile_storage is not None
                 else E2B_DIND_DEFAULT_STORAGE_CAPACITY_MB
             ),
             name="dind_storage_capacity_mb",

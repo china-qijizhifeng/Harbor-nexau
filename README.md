@@ -288,8 +288,8 @@ HTTP 代理、但 E2B 控制连接需要直连的情况；无需覆盖或清空�
 `1ac1ebce-6cc3-43cf-8c30-1483468bbf38`，并固定 Docker 29.2.1、Docker Compose
 5.0.2、Docker Hub 镜像源和启动就绪检查。构建前会再次查询基座的 `default` tag；若它已被
 替换，脚本会停止，避免在未检查的基座上静默重建。当前已验证的模板 ID、build ID、资源和
-软件版本记录在
-[`src/nexau_harbor/e2b_dind/manifest.json`](src/nexau_harbor/e2b_dind/manifest.json)。
+软件版本记录在 `src/nexau_harbor/e2b_dind/` 下的发布 manifests。每份 manifest 都包含完整
+E2B reference；adapter 会据此加载 smoke 实测容量，未知自定义模板仍必须显式提供容量。
 
 `.env` 中配置好成套的 `E2B_API_URL`、`E2B_DOMAIN`、`E2B_API_KEY` 后执行：
 
@@ -306,6 +306,30 @@ uv run scripts/build_e2b_dind_template.py build-and-smoke
 ```bash
 uv run scripts/build_e2b_dind_template.py build-and-smoke --replace
 ```
+
+16 CPU 档不从旧 DinD snapshot 派生：E2B 的 `FROM TEMPLATE` 会继承旧 snapshot 的根盘大小，
+即使新项目额度更大或加入 `--skip-cache` 也不会扩盘。以下命令改从固定 Ubuntu 25.04 镜像
+安装精确版本的 Docker/containerd/buildx/Compose，让项目当前磁盘额度参与创建新的 ext4
+rootfs；它不会覆盖原有 8 CPU/32 GB 档：
+
+```bash
+uv run scripts/build_e2b_dind_template.py build-and-smoke \
+  --name harbor-nexau-dind-16c \
+  --version v1 \
+  --cpu-count 16 \
+  --memory-mb 16384 \
+  --replace \
+  --standalone-ubuntu 25.04
+```
+
+独立构建固定 Docker 29.2.1、containerd 2.2.1、buildx 0.31.1 和 Compose 5.0.2，并将
+Ubuntu/source package 版本写入 provenance。Smoke 会先从 Docker Hub 官方 registry 显式预拉
+Alpine，再以 `pull_policy: never` 验证本地 build 与完整 Compose 生命周期，避免 mirror 暂停被
+误判为模板失败。
+
+`--trust-pinned-base` 仍只用于旧的 `FROM TEMPLATE` 构建：它跳过无权限完成的公共基座 tag
+查询；预期 build ID 会写入 provenance，但不能证明公共 tag 未漂移，因此只应在基座所有者另行
+确认版本时使用。
 
 只复查当前模板而不重建：
 
@@ -338,12 +362,30 @@ Docker wrapper 并发初始化 daemon 配置时发生竞争；不同 Harbor tria
 镜像 pull/build 阶段临时使用公网，完成后由 E2B 外层网络策略限制整个 sandbox；这样既保留
 Compose 内部 DNS/bridge 通信，也支持 Harbor 在不同阶段动态切换 public/no-network/allowlist。
 
-默认 adapter 按已发布模板校验上限：8 CPU、32768 MB 内存、41062 MB 总磁盘。超出上限会在
-创建 sandbox 前报错；GPU 题同样会被拒绝。若重新发布了更大模板，需要同时用
-`--environment-kwarg dind_template=<name:tag>` 和对应的 `dind_cpu_capacity`、
-`dind_memory_capacity_mb`、`dind_storage_capacity_mb` 告知 adapter。当前 HK E2B API 会拒绝
-超过 8 CPU 的模板，所以声明 16 CPU 的题不能由当前 `v1` 完整满足；只有明确接受降配时才应
-使用 Harbor 的 `--override-cpus`/`--override-memory-mb`/`--override-storage-mb`。
+项目当前发布两档 DinD 模板：
+
+| E2B reference | CPU | 内存 | smoke 根盘 |
+| --- | ---: | ---: | ---: |
+| `e2b-nex/harbor-nexau-dind:v1` | 8 | 32768 MB | 41062 MB |
+| `s-project-e89a/harbor-nexau-dind-16c:v1` | 16 | 16384 MB | 55342 MB |
+
+16 CPU 档完整通过 Docker 29.2.1、Compose 5.0.2、网络、命名卷、`exec/cp/stop/down -v` 和
+`SYS_PTRACE` smoke。其 E2B build 记录为 59324 MB，运行态根盘为 55342 MB（可用 54694 MB）。
+两档是互补而非替代关系：16 CPU 档适合 `16 CPU / 16 GB` Compose 题，原档仍适合需要超过
+16 GB、但不超过 8 CPU 的题。
+
+选择已发布的 16 CPU 档时只需传 template reference，adapter 会从 packaged manifest 自动读取
+容量：
+
+```bash
+--environment-kwarg \
+  dind_template=s-project-e89a/harbor-nexau-dind-16c:v1
+```
+
+超出所选档位容量会在创建 sandbox 前报错；GPU 题同样会被拒绝。对于不在 packaged manifests
+中的自定义模板，仍需同时提供 `dind_cpu_capacity`、`dind_memory_capacity_mb` 和
+`dind_storage_capacity_mb`。只有明确接受非标准资源时，才应使用 Harbor 的
+`--override-cpus`/`--override-memory-mb`/`--override-storage-mb`。
 
 运行 NexAU 时，自定义 E2B environment 会将远程 Agent 作为独立后台进程启动，保存 PID、
 stdout、stderr 和退出码后立即断开初始事件流，再每 30 秒用短连接检查一次状态。暂时的轮询

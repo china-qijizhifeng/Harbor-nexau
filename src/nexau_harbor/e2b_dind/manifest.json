@@ -1,5 +1,6 @@
 {
   "name": "harbor-nexau-dind",
+  "reference": "e2b-nex/harbor-nexau-dind:v1",
   "template_id": "rm6nyjj5mfijqgvhua3i",
   "build_id": "7dc0451b-c631-4332-89e0-bcf138fda7b1",
   "tags": [

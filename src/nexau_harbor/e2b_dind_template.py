@@ -22,11 +22,17 @@ BASE_TEMPLATE_ID = "qusopjo1y7f5s6po0hyl"
 BASE_TEMPLATE_BUILD_ID = "1ac1ebce-6cc3-43cf-8c30-1483468bbf38"
 DOCKER_VERSION = "29.2.1"
 COMPOSE_VERSION = "5.0.2"
+CONTAINERD_VERSION = "2.2.1"
+BUILDX_VERSION = "0.31.1"
+STANDALONE_UBUNTU_VARIANT = "25.04"
+STANDALONE_SOURCE_ID = f"ubuntu:{STANDALONE_UBUNTU_VARIANT}"
+STANDALONE_SOURCE_BUILD = f"docker-ce-{DOCKER_VERSION}-compose-{COMPOSE_VERSION}-pinned"
 REGISTRY_MIRRORS = ("https://docker.1ms.run",)
+SMOKE_IMAGE = "registry-1.docker.io/library/alpine:3.20"
 
-# The current HK deployment enforces an 8-CPU template limit. E2B templates do
-# not currently express disk or GPU resources, so all task constraints must
-# still be enforced by the eventual Harbor environment adapter.
+# These defaults preserve the original 8-CPU/32-GiB published profile. Larger
+# profiles are built explicitly and loaded from their packaged manifests; GPU
+# resources remain unsupported by the E2B DinD adapter.
 DEFAULT_CPU_COUNT = 8
 DEFAULT_MEMORY_MB = 32_768
 DEFAULT_SANDBOX_TIMEOUT_SEC = 900
@@ -76,6 +82,46 @@ class DindSmokeResult:
     cpu_count: int
     memory_mb: int
     root_disk_mb: int
+    available_disk_mb: int
+
+
+@dataclass(frozen=True)
+class PublishedDindTemplate:
+    """Capacity metadata for a project-published DinD template."""
+
+    reference: str
+    cpu_count: int
+    memory_mb: int
+    storage_mb: int
+
+
+def load_published_dind_templates(
+    context: Path = TEMPLATE_CONTEXT,
+) -> dict[str, PublishedDindTemplate]:
+    """Load packaged, smoke-verified template manifests by full reference."""
+
+    profiles: dict[str, PublishedDindTemplate] = {}
+    for manifest_path in sorted(context.glob("manifest*.json")):
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        reference = str(data.get("reference", "")).strip()
+        resources = data.get("resources", {})
+        if not reference:
+            raise ValueError(f"Published DinD manifest {manifest_path} has no reference")
+        profile = PublishedDindTemplate(
+            reference=reference,
+            cpu_count=int(resources["cpu_count"]),
+            memory_mb=int(resources["memory_mb"]),
+            storage_mb=int(resources["observed_root_disk_mb"]),
+        )
+        if min(profile.cpu_count, profile.memory_mb, profile.storage_mb) <= 0:
+            raise ValueError(f"Published DinD manifest {manifest_path} has invalid resources")
+        if reference in profiles:
+            raise ValueError(f"Duplicate published DinD template reference {reference!r}")
+        profiles[reference] = profile
+    return profiles
+
+
+PUBLISHED_DIND_TEMPLATES = load_published_dind_templates()
 
 
 def _clean_env(name: str) -> str | None:
@@ -157,8 +203,18 @@ def validate_base_template(
     connection: E2BConnection,
     *,
     allow_base_drift: bool = False,
+    trust_pinned_base: bool = False,
 ) -> str:
-    """Return the current base build ID, rejecting an unexpected replacement."""
+    """Return the base build ID, rejecting an unexpected replacement.
+
+    ``trust_pinned_base`` is for deployments that may consume a public base but
+    are not allowed to inspect its tags. It explicitly accepts that the caller
+    cannot verify the current default build identity; the derived-template smoke
+    still validates the runtime software and provenance contract before use.
+    """
+
+    if trust_pinned_base:
+        return BASE_TEMPLATE_BUILD_ID
 
     current_build_id = _tag_build_id(
         template_api,
@@ -175,15 +231,63 @@ def validate_base_template(
     return current_build_id
 
 
-def _provenance(base_build_id: str, name: str, version: str) -> dict[str, str]:
-    return {
+def _provenance(
+    base_build_id: str,
+    name: str,
+    version: str,
+    *,
+    base_template_id: str = BASE_TEMPLATE_ID,
+    source_image: str | None = None,
+) -> dict[str, str]:
+    result = {
         "name": name,
         "version": version,
-        "base_template_id": BASE_TEMPLATE_ID,
+        "base_template_id": base_template_id,
         "base_build_id": base_build_id,
         "docker_version": DOCKER_VERSION,
         "compose_version": COMPOSE_VERSION,
     }
+    if source_image is not None:
+        result["source_image"] = source_image
+    return result
+
+
+def _standalone_docker_install_command(ubuntu_variant: str) -> str:
+    if ubuntu_variant != STANDALONE_UBUNTU_VARIANT:
+        raise ValueError(
+            f"Unsupported standalone Ubuntu variant {ubuntu_variant!r}; "
+            f"expected {STANDALONE_UBUNTU_VARIANT!r}"
+        )
+
+    package_suffix = f"1~ubuntu.{ubuntu_variant}~plucky"
+    return "\n".join(
+        (
+            "set -eux",
+            "export DEBIAN_FRONTEND=noninteractive",
+            "apt-get update",
+            "apt-get install -y --no-install-recommends ca-certificates curl python3",
+            "install -m 0755 -d /etc/apt/keyrings",
+            "curl -fsSL https://download.docker.com/linux/ubuntu/gpg "
+            "-o /etc/apt/keyrings/docker.asc",
+            "chmod a+r /etc/apt/keyrings/docker.asc",
+            ". /etc/os-release",
+            "printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] "
+            "https://download.docker.com/linux/ubuntu %s stable\\n' "
+            '"$(dpkg --print-architecture)" "${UBUNTU_CODENAME:-$VERSION_CODENAME}" '
+            "> /etc/apt/sources.list.d/docker.list",
+            "apt-get update",
+            "apt-get install -y --no-install-recommends "
+            f"docker-ce='5:{DOCKER_VERSION}-{package_suffix}' "
+            f"docker-ce-cli='5:{DOCKER_VERSION}-{package_suffix}' "
+            f"containerd.io='{CONTAINERD_VERSION}-{package_suffix}' "
+            f"docker-buildx-plugin='{BUILDX_VERSION}-{package_suffix}' "
+            f"docker-compose-plugin='{COMPOSE_VERSION}-{package_suffix}'",
+            "apt-mark hold docker-ce docker-ce-cli containerd.io "
+            "docker-buildx-plugin docker-compose-plugin",
+            "systemctl enable containerd.service docker.service docker.socket",
+            "rm -rf /var/lib/apt/lists/*",
+        )
+    )
 
 
 def _template_builder(
@@ -191,9 +295,18 @@ def _template_builder(
     base_build_id: str,
     name: str,
     version: str,
+    *,
+    base_template_id: str = BASE_TEMPLATE_ID,
+    standalone_ubuntu: str | None = None,
 ) -> Any:
     provenance = json.dumps(
-        _provenance(base_build_id, name, version),
+        _provenance(
+            base_build_id,
+            name,
+            version,
+            base_template_id=base_template_id,
+            source_image=(f"ubuntu:{standalone_ubuntu}" if standalone_ubuntu else None),
+        ),
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -204,15 +317,27 @@ def _template_builder(
             "test -x /usr/bin/docker",
             f"docker --version | grep -F {shlex.quote(DOCKER_VERSION)}",
             f"docker compose version --short | grep -Fx {shlex.quote(COMPOSE_VERSION)}",
+            *(
+                ("systemctl is-enabled docker.service", "systemctl is-enabled docker.socket")
+                if standalone_ubuntu
+                else ()
+            ),
             "test -s /etc/docker/daemon.json",
             "test -x /usr/local/bin/harbor-nexau-dind-ready",
         )
     )
 
+    template = template_api(file_context_path=TEMPLATE_CONTEXT)
+    if standalone_ubuntu is not None:
+        builder = template.from_ubuntu_image(standalone_ubuntu).run_cmd(
+            _standalone_docker_install_command(standalone_ubuntu),
+            user="root",
+        )
+    else:
+        builder = template.from_template(base_template_id)
+
     return (
-        template_api(file_context_path=TEMPLATE_CONTEXT)
-        .from_template(BASE_TEMPLATE_ID)
-        .copy("daemon.json", "/etc/docker/daemon.json", user="root", mode=0o644)
+        builder.copy("daemon.json", "/etc/docker/daemon.json", user="root", mode=0o644)
         .copy(
             "harbor-nexau-dind-ready",
             "/usr/local/bin/harbor-nexau-dind-ready",
@@ -240,6 +365,8 @@ def build_dind_template(
     memory_mb: int = DEFAULT_MEMORY_MB,
     replace: bool = False,
     allow_base_drift: bool = False,
+    trust_pinned_base: bool = False,
+    standalone_ubuntu: str | None = None,
     skip_cache: bool = False,
 ) -> DindBuildResult:
     """Build a versioned DinD template and make the new build the default."""
@@ -255,11 +382,26 @@ def build_dind_template(
 
     template_api, _ = _load_e2b_sdk()
     options = connection.sdk_options()
-    base_build_id = validate_base_template(
-        template_api,
-        connection,
-        allow_base_drift=allow_base_drift,
-    )
+    if standalone_ubuntu is not None:
+        if allow_base_drift or trust_pinned_base:
+            raise ValueError(
+                "Standalone Ubuntu builds do not use --allow-base-drift or --trust-pinned-base"
+            )
+        if standalone_ubuntu != STANDALONE_UBUNTU_VARIANT:
+            raise ValueError(
+                f"Unsupported standalone Ubuntu variant {standalone_ubuntu!r}; "
+                f"expected {STANDALONE_UBUNTU_VARIANT!r}"
+            )
+        base_template_id = f"ubuntu:{standalone_ubuntu}"
+        base_build_id = STANDALONE_SOURCE_BUILD
+    else:
+        base_template_id = BASE_TEMPLATE_ID
+        base_build_id = validate_base_template(
+            template_api,
+            connection,
+            allow_base_drift=allow_base_drift,
+            trust_pinned_base=trust_pinned_base,
+        )
 
     if template_api.alias_exists(name, **options) and not replace:
         raise RuntimeError(
@@ -268,7 +410,14 @@ def build_dind_template(
 
     candidate_tag = f"candidate-{uuid4().hex[:12]}"
     build_info = template_api.build(
-        _template_builder(template_api, base_build_id, name, version),
+        _template_builder(
+            template_api,
+            base_build_id,
+            name,
+            version,
+            base_template_id=base_template_id,
+            standalone_ubuntu=standalone_ubuntu,
+        ),
         name,
         tags=[candidate_tag],
         cpu_count=cpu_count,
@@ -323,7 +472,7 @@ def build_dind_template(
         build_id=str(build_info.build_id),
         name=name,
         tags=("default", version),
-        base_template_id=BASE_TEMPLATE_ID,
+        base_template_id=base_template_id,
         base_build_id=base_build_id,
         cpu_count=cpu_count,
         memory_mb=memory_mb,
@@ -351,6 +500,7 @@ def smoke_dind_template(
     name: str = TEMPLATE_NAME,
     version: str = TEMPLATE_VERSION,
     timeout_sec: int = DEFAULT_SANDBOX_TIMEOUT_SEC,
+    expected_base_template_id: str = BASE_TEMPLATE_ID,
 ) -> DindSmokeResult:
     """Launch the template and exercise Docker plus lifecycle-critical Compose APIs."""
 
@@ -377,7 +527,7 @@ def smoke_dind_template(
         expected_provenance = {
             "name": name,
             "version": version,
-            "base_template_id": BASE_TEMPLATE_ID,
+            "base_template_id": expected_base_template_id,
             "docker_version": DOCKER_VERSION,
             "compose_version": COMPOSE_VERSION,
         }
@@ -412,6 +562,7 @@ facts = {
     'cpu_count': os.cpu_count(),
     'memory_mb': mem_kib // 1024,
     'root_disk_mb': stat.f_blocks * stat.f_frsize // 1024 // 1024,
+    'available_disk_mb': stat.f_bavail * stat.f_frsize // 1024 // 1024,
 }
 print(json.dumps(facts))
 PY""",
@@ -431,10 +582,13 @@ PY""",
                 f"Expected Docker Compose {COMPOSE_VERSION}, got {compose_version or '<empty>'}"
             )
 
+        _run_checked(sandbox, f"docker pull {SMOKE_IMAGE}", timeout=600)
+        _run_checked(sandbox, f"docker tag {SMOKE_IMAGE} alpine:3.20")
+
         sandbox.files.make_dir(compose_dir, user="root", request_timeout=60)
         sandbox.files.write(
             f"{compose_dir}/Dockerfile",
-            "FROM alpine:3.20\nRUN printf 'image-built\\n' > /image-built\n",
+            f"FROM {SMOKE_IMAGE}\nRUN printf 'image-built\\n' > /image-built\n",
             user="root",
             request_timeout=60,
         )
@@ -442,12 +596,15 @@ PY""",
             f"{compose_dir}/compose.yaml",
             """services:
   server:
+    image: harbor-nexau-smoke-server:local
     build: .
+    pull_policy: never
     command: ["sh", "-c", "printf 'shared-ok\\n' > /shared/message; sleep 600"]
     volumes:
       - shared:/shared
   client:
-    image: alpine:3.20
+    image: registry-1.docker.io/library/alpine:3.20
+    pull_policy: never
     command: ["sleep", "600"]
     depends_on:
       - server
@@ -461,7 +618,8 @@ volumes:
         )
 
         compose = f"docker compose --project-directory {shlex.quote(compose_dir)}"
-        _run_checked(sandbox, f"{compose} up -d --build", timeout=300)
+        _run_checked(sandbox, f"{compose} build --pull=false", timeout=600)
+        _run_checked(sandbox, f"{compose} up -d --pull never", timeout=180)
         _run_checked(
             sandbox,
             f"{compose} exec -T client sh -c "
@@ -501,6 +659,7 @@ volumes:
             cpu_count=int(facts["cpu_count"]),
             memory_mb=int(facts["memory_mb"]),
             root_disk_mb=int(facts["root_disk_mb"]),
+            available_disk_mb=int(facts["available_disk_mb"]),
         )
     finally:
         if sandbox is not None:
@@ -546,6 +705,23 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--allow-base-drift", action="store_true")
+    parser.add_argument(
+        "--standalone-ubuntu",
+        choices=(STANDALONE_UBUNTU_VARIANT,),
+        help=(
+            "Build Docker/Compose from a pinned Ubuntu image instead of inheriting "
+            "the published DinD snapshot. This allows the current project disk quota "
+            "to size the new rootfs."
+        ),
+    )
+    parser.add_argument(
+        "--trust-pinned-base",
+        action="store_true",
+        help=(
+            "Accept the packaged expected base build without querying public-base tags. "
+            "This validates the runtime contract, not the inaccessible tag identity."
+        ),
+    )
     parser.add_argument("--skip-cache", action="store_true")
     return parser
 
@@ -564,6 +740,8 @@ def main(argv: list[str] | None = None) -> int:
             memory_mb=args.memory_mb,
             replace=args.replace,
             allow_base_drift=args.allow_base_drift,
+            trust_pinned_base=args.trust_pinned_base,
+            standalone_ubuntu=args.standalone_ubuntu,
             skip_cache=args.skip_cache,
         )
         summary["build"] = asdict(result)
@@ -574,6 +752,11 @@ def main(argv: list[str] | None = None) -> int:
             name=args.name,
             version=args.version,
             timeout_sec=args.sandbox_timeout_sec,
+            expected_base_template_id=(
+                f"ubuntu:{args.standalone_ubuntu}"
+                if args.standalone_ubuntu is not None
+                else BASE_TEMPLATE_ID
+            ),
         )
         summary["smoke"] = asdict(result)
 

@@ -216,6 +216,29 @@ def test_custom_dind_template_requires_explicit_capacity_metadata(
     assert environment._dind_template == "custom-dind:v2"
 
 
+def test_published_high_cpu_template_uses_packaged_capacity_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM alpine:3.22\n")
+    monkeypatch.setattr(
+        NexAUE2BEnvironment,
+        "__init__",
+        _fake_super_init(
+            tmp_path,
+            EnvironmentConfig(cpus=16, memory_mb=16_384, storage_mb=40_960),
+        ),
+    )
+
+    environment = NexAUE2BDinDEnvironment(
+        dind_template="s-project-e89a/harbor-nexau-dind-16c:v1",
+    )
+
+    assert environment._dind_cpu_capacity == 16
+    assert environment._dind_memory_capacity_mb == 16_384
+    assert environment._dind_storage_capacity_mb == 55_342
+
+
 @pytest.mark.parametrize(
     ("config", "message"),
     [
@@ -488,9 +511,7 @@ async def test_cancelled_detached_host_build_logs_saved_output(
 ) -> None:
     handle = SimpleNamespace(pid=73, disconnect=AsyncMock())
     command_kill = AsyncMock()
-    process_tree_kill = AsyncMock(
-        return_value=SimpleNamespace(exit_code=0, stdout="", stderr="")
-    )
+    process_tree_kill = AsyncMock(return_value=SimpleNamespace(exit_code=0, stdout="", stderr=""))
     environment = object.__new__(NexAUE2BDinDEnvironment)
     environment.logger = logging.getLogger("test-e2b-dind-cancel-diagnostic")
     environment._sandbox = SimpleNamespace(
@@ -561,9 +582,7 @@ async def test_stalled_detached_host_build_is_stopped_and_returned_for_retry(
 ) -> None:
     handle = SimpleNamespace(pid=91, disconnect=AsyncMock())
     command_kill = AsyncMock()
-    process_tree_kill = AsyncMock(
-        return_value=SimpleNamespace(exit_code=0, stdout="", stderr="")
-    )
+    process_tree_kill = AsyncMock(return_value=SimpleNamespace(exit_code=0, stdout="", stderr=""))
     environment = object.__new__(NexAUE2BDinDEnvironment)
     environment.logger = logging.getLogger("test-e2b-dind-stall")
     environment._sandbox = SimpleNamespace(
@@ -777,19 +796,13 @@ async def test_agent_log_download_prioritizes_codex_events_and_rollouts(
 
     await compose.download_agent_logs("/logs/agent", tmp_path)
 
-    assert (tmp_path / "codex_events.jsonl").read_bytes() == payloads[
-        "codex_events.jsonl"
-    ]
+    assert (tmp_path / "codex_events.jsonl").read_bytes() == payloads["codex_events.jsonl"]
     assert (tmp_path / "codex_stderr.log").read_bytes() == payloads["codex_stderr.log"]
     assert (tmp_path / "northgate-responses-bridge.log").read_bytes() == payloads[
         "northgate-responses-bridge.log"
     ]
-    assert (tmp_path / "codex_result.json").read_bytes() == payloads[
-        "codex_result.json"
-    ]
-    assert (tmp_path / "codex_history.jsonl").read_bytes() == payloads[
-        "codex_history.jsonl"
-    ]
+    assert (tmp_path / "codex_result.json").read_bytes() == payloads["codex_result.json"]
+    assert (tmp_path / "codex_history.jsonl").read_bytes() == payloads["codex_history.jsonl"]
     assert (tmp_path / "sessions/2026/08/19/rollout-test.jsonl").is_file()
     compose._env.logger.exception.assert_called_once()
 

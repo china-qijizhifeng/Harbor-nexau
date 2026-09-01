@@ -1,0 +1,29 @@
+{
+  "name": "harbor-nexau-dind-16c",
+  "reference": "s-project-e89a/harbor-nexau-dind-16c:v1",
+  "template_id": "vu56va4tdtzj32fz2miv",
+  "build_id": "790ceb05-d481-4fc7-b87e-3bf1f0c7ab0d",
+  "tags": [
+    "default",
+    "v1"
+  ],
+  "base": {
+    "source_image": "ubuntu:25.04",
+    "source_build": "docker-ce-29.2.1-compose-5.0.2-pinned"
+  },
+  "resources": {
+    "cpu_count": 16,
+    "memory_mb": 16384,
+    "observed_memory_mb": 16015,
+    "build_disk_mb": 59324,
+    "observed_root_disk_mb": 55342,
+    "observed_available_disk_mb": 54694
+  },
+  "software": {
+    "docker": "29.2.1",
+    "docker_compose": "5.0.2",
+    "containerd": "2.2.1",
+    "docker_buildx": "0.31.1"
+  },
+  "verified_at": "2026-09-01T15:25:08Z"
+}
