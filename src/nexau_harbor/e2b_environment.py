@@ -63,6 +63,26 @@ _ASTRAL_UV_COPY_PATTERN = re.compile(
     flags=re.IGNORECASE | re.MULTILINE,
 )
 
+_LAYOUT_FONTS_STALE_REVISION = "527de472741cabc95291aff416337569c5d91d6e"
+_LAYOUT_FONTS_FALLBACK_REVISION = "f01fff049773b5a3141538a1f3cb3dd1beadae82"
+_LAYOUT_FONTS_SHA256 = "fb37e6ad75f38640739c416c0325f9c5c5ccff48a05558f9eeb15557cfa8ab26"
+_LAYOUT_FONTS_STALE_URL = (
+    "https://huggingface.co/datasets/harborframework/terminal-bench-3.0-lfs/"
+    "resolve/${FONT_REV}/layout-config-recreation/google-fonts-regular.tar.xz"
+)
+_LAYOUT_FONTS_FALLBACK_URL = (
+    "https://huggingface.co/datasets/harborframework/terminal-bench-lfs/"
+    "resolve/${FONT_REV}/layout-config-recreation/google-fonts-regular.tar.xz"
+)
+_LAYOUT_FONTS_TAR_STEP = (
+    "        -o /tmp/fonts.tar.xz && \\\n    tar -xJf /tmp/fonts.tar.xz -C /tmp/google_fonts_cache"
+)
+_LAYOUT_FONTS_VERIFIED_TAR_STEP = (
+    "        -o /tmp/fonts.tar.xz && \\\n"
+    f'    echo "{_LAYOUT_FONTS_SHA256}  /tmp/fonts.tar.xz" | sha256sum -c - && \\\n'
+    "    tar -xJf /tmp/fonts.tar.xz -C /tmp/google_fonts_cache"
+)
+
 
 @dataclass(frozen=True)
 class _DetachedExecPaths:
@@ -163,6 +183,42 @@ def _rewrite_e2b_incompatible_uv_copy(dockerfile: str) -> tuple[str, int]:
         return f"{indent}RUN python -m pip install --no-cache-dir uv=={version}"
 
     return _ASTRAL_UV_COPY_PATTERN.sub(replace, dockerfile), rewrite_count
+
+
+def _rewrite_stale_layout_fonts_download(dockerfile: str) -> tuple[str, int]:
+    """Pin the moved TB3 font archive and verify its immutable LFS digest."""
+
+    replacements = (
+        (
+            f"ARG FONT_REV={_LAYOUT_FONTS_STALE_REVISION}",
+            f"ARG FONT_REV={_LAYOUT_FONTS_FALLBACK_REVISION}",
+        ),
+        (_LAYOUT_FONTS_STALE_URL, _LAYOUT_FONTS_FALLBACK_URL),
+        (_LAYOUT_FONTS_TAR_STEP, _LAYOUT_FONTS_VERIFIED_TAR_STEP),
+    )
+    if any(dockerfile.count(source) != 1 for source, _ in replacements):
+        return dockerfile, 0
+
+    rewritten = dockerfile
+    for source, replacement in replacements:
+        rewritten = rewritten.replace(source, replacement, 1)
+    return rewritten, 1
+
+
+def _layout_fonts_scoped_template_name(
+    template_name: str,
+    dockerfile_path: Path | None,
+) -> str:
+    if dockerfile_path is None:
+        return template_name
+    try:
+        dockerfile = dockerfile_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return template_name
+    _, rewrite_count = _rewrite_stale_layout_fonts_download(dockerfile)
+    if rewrite_count == 0:
+        return template_name
+    return f"{template_name}-lf{_LAYOUT_FONTS_SHA256[:12]}"
 
 
 def _resolve_max_lifetime_sec(configured: int | str | None) -> int:
@@ -342,6 +398,10 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
             self._template_name = _storage_scoped_template_name(
                 self._template_name,
                 self._effective_storage_mb,
+            )
+            self._template_name = _layout_fonts_scoped_template_name(
+                self._template_name,
+                getattr(self, "_environment_definition_path", None),
             )
 
     @override
@@ -706,6 +766,13 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
                 self.logger.info(
                     "Applied %s E2B compatibility rewrite(s) for Astral uv",
                     rewrite_count,
+                )
+            dockerfile, font_rewrite_count = _rewrite_stale_layout_fonts_download(dockerfile)
+            if font_rewrite_count:
+                self.logger.info(
+                    "Applied pinned TB3 layout-font fallback: revision=%s, sha256=%s",
+                    _LAYOUT_FONTS_FALLBACK_REVISION,
+                    _LAYOUT_FONTS_SHA256,
                 )
 
             template = harbor_e2b.Template(

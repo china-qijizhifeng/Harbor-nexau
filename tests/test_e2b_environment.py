@@ -25,11 +25,24 @@ from nexau_harbor.e2b_environment import (
     E2B_SANDBOX_TIMEOUT_SEC,
     E2B_START_RAMP_DELAY_ENV,
     NexAUE2BEnvironment,
+    _layout_fonts_scoped_template_name,
     _parse_root_disk_usage,
+    _rewrite_stale_layout_fonts_download,
     _storage_scoped_template_name,
 )
 
 UV_COPY = "COPY --from=ghcr.io/astral-sh/uv:0.9.7 /uv /uvx /usr/local/bin/"
+LAYOUT_FONTS_DOCKERFILE = (
+    "FROM python:3.11-slim\n"
+    "ARG FONT_REV=527de472741cabc95291aff416337569c5d91d6e\n"
+    "RUN mkdir -p /tmp/google_fonts_cache && \\\n"
+    '    curl -fsSL "https://huggingface.co/datasets/harborframework/'
+    "terminal-bench-3.0-lfs/resolve/${FONT_REV}/layout-config-recreation/"
+    'google-fonts-regular.tar.xz" \\\n'
+    "        -o /tmp/fonts.tar.xz && \\\n"
+    "    tar -xJf /tmp/fonts.tar.xz -C /tmp/google_fonts_cache && \\\n"
+    "    rm /tmp/fonts.tar.xz\n"
+)
 
 
 class _AsyncChunkStream:
@@ -82,6 +95,44 @@ def test_storage_scopes_template_cache_and_parses_df_output() -> None:
         "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
         "/dev/root 56605696 333824 56271872 1% /\n"
     ) == (55_279, 54_953)
+
+
+def test_rewrites_only_known_stale_layout_font_archive(tmp_path: Path) -> None:
+    rewritten, rewrite_count = _rewrite_stale_layout_fonts_download(LAYOUT_FONTS_DOCKERFILE)
+
+    assert rewrite_count == 1
+    assert "527de472741cabc95291aff416337569c5d91d6e" not in rewritten
+    assert "f01fff049773b5a3141538a1f3cb3dd1beadae82" in rewritten
+    assert "terminal-bench-3.0-lfs" not in rewritten
+    assert "harborframework/terminal-bench-lfs" in rewritten
+    assert "fb37e6ad75f38640739c416c0325f9c5c5ccff48a05558f9eeb15557cfa8ab26" in rewritten
+    assert "sha256sum -c -" in rewritten
+
+    dockerfile_path = tmp_path / "Dockerfile"
+    dockerfile_path.write_text(LAYOUT_FONTS_DOCKERFILE)
+    assert (
+        _layout_fonts_scoped_template_name(
+            "layout-config-recreation2__abcdef-s10240",
+            dockerfile_path,
+        )
+        == "layout-config-recreation2__abcdef-s10240-lffb37e6ad75f3"
+    )
+    assert dockerfile_path.read_text() == LAYOUT_FONTS_DOCKERFILE
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        LAYOUT_FONTS_DOCKERFILE.replace("527de472", "627de472", 1),
+        LAYOUT_FONTS_DOCKERFILE.replace("terminal-bench-3.0-lfs", "another-repo"),
+        LAYOUT_FONTS_DOCKERFILE.replace("tar -xJf", "tar -xf"),
+    ],
+)
+def test_does_not_partially_rewrite_unknown_layout_font_case(dockerfile: str) -> None:
+    rewritten, rewrite_count = _rewrite_stale_layout_fonts_download(dockerfile)
+
+    assert rewrite_count == 0
+    assert rewritten == dockerfile
 
 
 def test_environment_scopes_template_name_to_effective_storage(monkeypatch) -> None:
