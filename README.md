@@ -113,6 +113,15 @@ N2 实际提供的 262144-token context。
 `unified_exec=false`、`responses_bridge=false` 和 272000-token context；此时不会设置或改写
 `upstream_model_name`。
 
+Codex 0.148.0 不会重试直接 HTTP 429，尽管错误文案是 `exceeded retry limit`。Trace-safe
+harness 会在最终错误属于 408/429、HTTP 5xx、连接/stream/transport 临时失败时，从首次事件中
+读取精确 thread ID，并在同一 sandbox 内用 `codex exec resume <SESSION_ID>` 恢复；不会重新执行
+完整 Harbor trial。默认最多追加 8 次恢复，退避从 5 秒指数增长并带随机抖动，单次等待上限
+120 秒。可通过 `HARBOR_CODEX_TRANSIENT_RETRY_ATTEMPTS`、
+`HARBOR_CODEX_TRANSIENT_RETRY_BASE_DELAY_SEC` 和
+`HARBOR_CODEX_TRANSIENT_RETRY_MAX_DELAY_SEC` 调整；设置 attempts=0 可关闭。400/401/403、确定性
+404、context 超限、策略错误和普通工具退出不会自动重试。
+
 `--auto-partition` 不会只凭“是否有 Compose 文件”猜测兼容性。Compose 题直接进入 DinD；其余题在
 Agent 启动前使用 `NexAUE2BEnvironment` 做一次真实的 Template + sandbox 预检。预检成功的题进入
 普通 E2B，确定性的 Dockerfile/E2B 构建不兼容进入 DinD；网络、限流或 provisioning 临时错误会

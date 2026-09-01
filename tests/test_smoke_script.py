@@ -120,6 +120,9 @@ printf "%s\\n" "$@"
         "HARBOR_CODEX_MULTI_AGENT",
         "HARBOR_CODEX_RESPONSES_BRIDGE",
         "HARBOR_CODEX_CONTEXT_WINDOW",
+        "HARBOR_CODEX_TRANSIENT_RETRY_ATTEMPTS",
+        "HARBOR_CODEX_TRANSIENT_RETRY_BASE_DELAY_SEC",
+        "HARBOR_CODEX_TRANSIENT_RETRY_MAX_DELAY_SEC",
         "HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER",
         "HARBOR_NEXAU_DIND_PREWARM",
         "HARBOR_NEXAU_DIND_PREWARM_CONCURRENCY",
@@ -327,6 +330,9 @@ def test_smoke_script_trace_mode_selects_trace_safe_codex(tmp_path: Path) -> Non
         "      provider_name: 'northgate'\n"
         "      upstream_model_name: 'nex-agi/Nex-N2-Pro'\n"
         "      context_window: 262144\n"
+        "      transient_retry_attempts: 8\n"
+        "      transient_retry_base_delay_sec: 5\n"
+        "      transient_retry_max_delay_sec: 120\n"
         "      reasoning_effort: 'high'\n"
         "      reasoning_summary: 'detailed'\n"
     )
@@ -375,6 +381,9 @@ def test_smoke_script_trace_mode_supports_native_terra_code_mode(tmp_path: Path)
         "      bridge_port: 48123\n"
         "      provider_name: 'northgate'\n"
         "      context_window: 272000\n"
+        "      transient_retry_attempts: 8\n"
+        "      transient_retry_base_delay_sec: 5\n"
+        "      transient_retry_max_delay_sec: 120\n"
         "      reasoning_effort: 'max'\n"
         "      reasoning_summary: 'detailed'\n"
     )
@@ -398,6 +407,9 @@ def test_smoke_script_non_trace_mode_selects_trace_safe_codex(tmp_path: Path) ->
     assert "provider_name=northgate" in arguments
     assert "upstream_model_name=nex-agi/Nex-N2-Pro" in arguments
     assert "context_window=262144" in arguments
+    assert "transient_retry_attempts=8" in arguments
+    assert "transient_retry_base_delay_sec=5" in arguments
+    assert "transient_retry_max_delay_sec=120" in arguments
     assert "reasoning_effort=high" in arguments
     assert "reasoning_summary=detailed" in arguments
     timeout_index = arguments.index("--environment-build-timeout-multiplier")
@@ -425,6 +437,19 @@ def test_smoke_script_rejects_unknown_harness(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "Harness must be nexau or codex" in result.stderr
+
+
+def test_smoke_script_rejects_invalid_codex_retry_delays(tmp_path: Path) -> None:
+    result = _run_with_fake_uv(
+        tmp_path,
+        extra_env={
+            "HARBOR_CODEX_TRANSIENT_RETRY_BASE_DELAY_SEC": "10",
+            "HARBOR_CODEX_TRANSIENT_RETRY_MAX_DELAY_SEC": "5",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "must be at least the base delay" in result.stderr
 
 
 def test_smoke_script_trace_mode_rejects_agent_override(tmp_path: Path) -> None:

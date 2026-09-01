@@ -190,6 +190,9 @@ class TraceSafeCodexAgent(Codex):
 
     DEFAULT_CODEX_VERSION = "0.148.0"
     DEFAULT_BRIDGE_PORT = 48123
+    DEFAULT_TRANSIENT_RETRY_ATTEMPTS = 8
+    DEFAULT_TRANSIENT_RETRY_BASE_DELAY_SEC = 5
+    DEFAULT_TRANSIENT_RETRY_MAX_DELAY_SEC = 120
     _BRIDGE_SOURCE = Path(__file__).with_name("codex_responses_bridge.js")
     _REMOTE_BRIDGE_DIR = PurePosixPath("/tmp/northgate-codex-bridge")
     _REMOTE_BRIDGE_SCRIPT = _REMOTE_BRIDGE_DIR / "bridge.js"
@@ -211,6 +214,9 @@ class TraceSafeCodexAgent(Codex):
         provider_name: str = "northgate",
         upstream_model_name: str | None = None,
         context_window: int = 262144,
+        transient_retry_attempts: int = DEFAULT_TRANSIENT_RETRY_ATTEMPTS,
+        transient_retry_base_delay_sec: int = DEFAULT_TRANSIENT_RETRY_BASE_DELAY_SEC,
+        transient_retry_max_delay_sec: int = DEFAULT_TRANSIENT_RETRY_MAX_DELAY_SEC,
         version: str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -232,6 +238,19 @@ class TraceSafeCodexAgent(Codex):
             raise ValueError("responses_bridge does not support namespace multi-agent tools")
         if normalized_upstream_model and not responses_bridge:
             raise ValueError("upstream_model_name requires responses_bridge")
+        retry_values = {
+            "transient_retry_attempts": transient_retry_attempts,
+            "transient_retry_base_delay_sec": transient_retry_base_delay_sec,
+            "transient_retry_max_delay_sec": transient_retry_max_delay_sec,
+        }
+        for name, value in retry_values.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if transient_retry_max_delay_sec < transient_retry_base_delay_sec:
+            raise ValueError(
+                "transient_retry_max_delay_sec must be at least "
+                "transient_retry_base_delay_sec"
+            )
 
         extra_env = dict(kwargs.pop("extra_env", None) or {})
         for env_name in ("NO_PROXY", "no_proxy"):
@@ -254,6 +273,9 @@ class TraceSafeCodexAgent(Codex):
         self._northgate_multi_agent = bool(multi_agent)
         self._northgate_responses_bridge = bool(responses_bridge)
         self._northgate_bridge_port = int(bridge_port)
+        self._transient_retry_attempts = transient_retry_attempts
+        self._transient_retry_base_delay_sec = transient_retry_base_delay_sec
+        self._transient_retry_max_delay_sec = transient_retry_max_delay_sec
         self._northgate_detached_install = False
 
         kwargs.setdefault("reasoning_effort", "high")
@@ -582,15 +604,35 @@ class TraceSafeCodexAgent(Codex):
         )
         await self.exec_as_agent(environment, command=setup_command, env=env)
 
-        codex_command = (
-            "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
-            f"codex exec {'resume --last ' if resume_run else ''}"
+        common_codex_flags = (
             "--dangerously-bypass-approvals-and-sandbox "
             "--skip-git-repo-check "
             f"--model {shlex.quote(model)} "
             "--json "
             f"{cli_flags_arg}"
+        )
+        codex_command = (
+            "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
+            f"codex exec {'resume --last ' if resume_run else ''}"
+            f"{common_codex_flags}"
             f"-- {escaped_instruction}"
+        )
+        retry_instruction = shlex.quote(
+            "Continue the same task after the transient model request failure. "
+            "Preserve and inspect all existing work and side effects, then finish the "
+            "implementation and verification without starting over."
+        )
+        resume_codex_command = (
+            "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
+            f'codex exec resume "$thread_id" {common_codex_flags}'
+            f"-- {retry_instruction}"
+        )
+        transient_pattern = (
+            "429 Too Many Requests|408 Request Timeout|425 Too Early|"
+            "500 Internal Server Error|502 Bad Gateway|503 Service Unavailable|"
+            "504 Gateway Timeout|request (timed out|timeout)|stream (disconnected|error)|"
+            "connection (reset|closed|failed)|error sending request|transport error|"
+            "server overloaded"
         )
         run_command = (
             "set +e\n"
@@ -601,16 +643,63 @@ class TraceSafeCodexAgent(Codex):
             f'"$started_at" > {shlex.quote(result_path)}\n'
             f": > {shlex.quote(events_path)}\n"
             f": > {shlex.quote(stderr_path)}\n"
-            f"{codex_command} 2>{shlex.quote(stderr_path)} "
-            f"| tee {shlex.quote(events_path)} >/dev/null\n"
-            'codex_status="${PIPESTATUS[0]}"\n'
+            "attempt=0\n"
+            "transient_retries=0\n"
+            "thread_id=\"\"\n"
+            "codex_status=1\n"
+            "while true; do\n"
+            "  attempt=$((attempt + 1))\n"
+            f"  attempt_events={shlex.quote(events_path)}.attempt-$attempt\n"
+            f"  attempt_stderr={shlex.quote(stderr_path)}.attempt-$attempt\n"
+            "  : > \"$attempt_events\"\n"
+            "  : > \"$attempt_stderr\"\n"
+            f"  printf '\\n=== Codex attempt %s ===\\n' \"$attempt\" >> "
+            f"{shlex.quote(stderr_path)}\n"
+            "  if [ \"$attempt\" -eq 1 ]; then\n"
+            f"    {codex_command} 2>\"$attempt_stderr\" "
+            f"| tee \"$attempt_events\" >> {shlex.quote(events_path)}\n"
+            "  else\n"
+            f"    {resume_codex_command} 2>\"$attempt_stderr\" "
+            f"| tee \"$attempt_events\" >> {shlex.quote(events_path)}\n"
+            "  fi\n"
+            "  codex_status=\"${PIPESTATUS[0]}\"\n"
+            f"  cat \"$attempt_stderr\" >> {shlex.quote(stderr_path)}\n"
+            "  if [ \"$codex_status\" -eq 0 ]; then break; fi\n"
+            "  if [ -z \"$thread_id\" ]; then\n"
+            f"    thread_id=$(grep -m1 '\"type\":\"thread.started\"' "
+            f"{shlex.quote(events_path)} | sed -n "
+            "'s/.*\"thread_id\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p')\n"
+            "  fi\n"
+            f"  if [ \"$transient_retries\" -ge {self._transient_retry_attempts} ]; then "
+            "break; fi\n"
+            "  if ! printf '%s' \"$thread_id\" | grep -Eq '^[A-Za-z0-9_-]+$'; then "
+            "break; fi\n"
+            "  failure_events=$(grep -E '\"type\":\"(error|turn.failed)\"' "
+            "\"$attempt_events\" | tail -n 20)\n"
+            f"  if ! printf '%s\\n' \"$failure_events\" | grep -Eiq "
+            f"{shlex.quote(transient_pattern)}; then break; fi\n"
+            "  transient_retries=$((transient_retries + 1))\n"
+            f"  retry_delay=$(({self._transient_retry_base_delay_sec} * "
+            "(1 << (transient_retries - 1))))\n"
+            f"  if [ \"$retry_delay\" -gt {self._transient_retry_max_delay_sec} ]; then "
+            f"retry_delay={self._transient_retry_max_delay_sec}; fi\n"
+            "  retry_jitter=0\n"
+            "  if [ \"$retry_delay\" -gt 0 ]; then "
+            "retry_jitter=$((RANDOM % (retry_delay / 4 + 1))); fi\n"
+            "  retry_sleep=$((retry_delay + retry_jitter))\n"
+            f"  printf '{{\"type\":\"harness.retry\",\"attempt\":%s,"
+            "\"delay_seconds\":%s,\"reason\":\"transient_model_request\"}\\n' "
+            f'"$transient_retries" "$retry_sleep" >> {shlex.quote(events_path)}\n'
+            "  sleep \"$retry_sleep\"\n"
+            "done\n"
             'finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"\n'
             'if [ "$codex_status" -eq 0 ]; then trace_status=completed; '
             "else trace_status=failed; fi\n"
             f"printf '{{\"schema_version\":1,\"status\":\"%s\","
             f"\"started_at\":\"%s\",\"finished_at\":\"%s\","
-            f"\"exit_code\":%s}}\\n' \"$trace_status\" \"$started_at\" "
-            f'"$finished_at" "$codex_status" > {shlex.quote(result_path)}\n'
+            f"\"exit_code\":%s,\"attempts\":%s,\"transient_retries\":%s}}\\n' "
+            f'"$trace_status" "$started_at" "$finished_at" "$codex_status" '
+            f'"$attempt" "$transient_retries" > {shlex.quote(result_path)}\n'
             'exit "$codex_status"'
         )
 

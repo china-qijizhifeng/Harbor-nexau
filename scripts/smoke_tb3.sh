@@ -28,6 +28,9 @@ codex_code_mode_only="${HARBOR_CODEX_CODE_MODE_ONLY:-false}"
 codex_multi_agent="${HARBOR_CODEX_MULTI_AGENT:-false}"
 codex_responses_bridge="${HARBOR_CODEX_RESPONSES_BRIDGE:-true}"
 codex_context_window="${HARBOR_CODEX_CONTEXT_WINDOW:-262144}"
+codex_transient_retry_attempts="${HARBOR_CODEX_TRANSIENT_RETRY_ATTEMPTS:-8}"
+codex_transient_retry_base_delay_sec="${HARBOR_CODEX_TRANSIENT_RETRY_BASE_DELAY_SEC:-5}"
+codex_transient_retry_max_delay_sec="${HARBOR_CODEX_TRANSIENT_RETRY_MAX_DELAY_SEC:-120}"
 trace_mode=0
 trace_timeout_sec="${HARBOR_NEXAU_TRACE_TIMEOUT_SEC:-36000}"
 agent_setup_timeout_sec="${HARBOR_AGENT_SETUP_TIMEOUT_SEC:-3600}"
@@ -239,6 +242,22 @@ fi
 if [[ ! "$codex_context_window" =~ ^[1-9][0-9]*$ ]]; then
   printf 'Codex context window must be a positive integer, got: %s\n' \
     "$codex_context_window" >&2
+  exit 2
+fi
+for codex_retry_setting in \
+  "$codex_transient_retry_attempts" \
+  "$codex_transient_retry_base_delay_sec" \
+  "$codex_transient_retry_max_delay_sec"
+do
+  if [[ ! "$codex_retry_setting" =~ ^[0-9]+$ ]]; then
+    printf 'Codex transient retry settings must be non-negative integers, got: %s\n' \
+      "$codex_retry_setting" >&2
+    exit 2
+  fi
+done
+if ((codex_transient_retry_max_delay_sec < codex_transient_retry_base_delay_sec)); then
+  printf '%s\n' \
+    'HARBOR_CODEX_TRANSIENT_RETRY_MAX_DELAY_SEC must be at least the base delay' >&2
   exit 2
 fi
 
@@ -729,6 +748,11 @@ if [[ "$trace_mode" == "1" ]]; then
         printf '      upstream_model_name: %s\n' "$(yaml_quote "$codex_upstream_model")"
       fi
       printf '      context_window: %s\n' "$codex_context_window"
+      printf '      transient_retry_attempts: %s\n' "$codex_transient_retry_attempts"
+      printf '      transient_retry_base_delay_sec: %s\n' \
+        "$codex_transient_retry_base_delay_sec"
+      printf '      transient_retry_max_delay_sec: %s\n' \
+        "$codex_transient_retry_max_delay_sec"
       printf '      reasoning_effort: %s\n' "$(yaml_quote "$codex_reasoning_effort")"
       printf '      reasoning_summary: %s\n' "$(yaml_quote "$codex_reasoning_summary")"
     else
@@ -764,6 +788,9 @@ if [[ "$harness" == "codex" ]]; then
     --agent-kwarg "bridge_port=48123"
     --agent-kwarg "provider_name=northgate"
     --agent-kwarg "context_window=$codex_context_window"
+    --agent-kwarg "transient_retry_attempts=$codex_transient_retry_attempts"
+    --agent-kwarg "transient_retry_base_delay_sec=$codex_transient_retry_base_delay_sec"
+    --agent-kwarg "transient_retry_max_delay_sec=$codex_transient_retry_max_delay_sec"
     --agent-kwarg "reasoning_effort=$codex_reasoning_effort"
     --agent-kwarg "reasoning_summary=$codex_reasoning_summary"
   )

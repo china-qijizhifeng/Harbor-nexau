@@ -8,6 +8,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import pytest
 from harbor.agents.factory import AgentFactory
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
@@ -142,16 +143,20 @@ async def test_codex_agent_writes_raw_streams_and_sessions_during_run(tmp_path: 
     assert "ln -s /logs/agent/sessions" in setup_command
     assert "ln -s /logs/agent/codex_history.jsonl" in setup_command
     assert "--model gpt-5.5" in run_command
-    assert run_command.count("--enable unified_exec") == 1
+    assert run_command.count("--enable unified_exec") == 2
     assert "--disable code_mode" in run_command
     assert "--disable code_mode_only" in run_command
     assert "--disable multi_agent" in run_command
     assert "--disable multi_agent_v2" in run_command
     assert "set -o pipefail" in run_command
-    assert "2>/logs/agent/codex_stderr.log" in run_command
-    assert "| tee /logs/agent/codex_events.jsonl >/dev/null" in run_command
+    assert '2>"$attempt_stderr"' in run_command
+    assert 'tee "$attempt_events" >> /logs/agent/codex_events.jsonl' in run_command
+    assert 'cat "$attempt_stderr" >> /logs/agent/codex_stderr.log' in run_command
     assert "2>&1" not in run_command
     assert 'codex_status="${PIPESTATUS[0]}"' in run_command
+    assert 'codex exec resume "$thread_id"' in run_command
+    assert '"type":"harness.retry"' in run_command
+    assert '"transient_retries":%s' in run_command
     assert "/logs/agent/codex_result.json" in run_command
     assert run_call["env"][NEXAU_DETACHED_EXEC_ENV] == "1"
     assert any("nohup node" in command for command in commands)
@@ -171,6 +176,17 @@ async def test_codex_agent_writes_raw_streams_and_sessions_during_run(tmp_path: 
         check=False,
     )
     assert syntax.returncode == 0, syntax.stderr
+
+
+def test_codex_agent_validates_transient_retry_settings(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        make_agent(tmp_path, transient_retry_attempts=-1)
+    with pytest.raises(ValueError, match="must be at least"):
+        make_agent(
+            tmp_path,
+            transient_retry_base_delay_sec=10,
+            transient_retry_max_delay_sec=5,
+        )
 
 
 async def test_codex_agent_can_disable_optional_responses_bridge(tmp_path: Path) -> None:
@@ -303,7 +319,9 @@ async def test_codex_shell_pipeline_keeps_jsonl_clean_and_propagates_exit(
         for line in (remote_logs / "codex_events.jsonl").read_text().splitlines()
     ]
     assert [event["type"] for event in event_lines] == ["thread.started", "turn.completed"]
-    assert (remote_logs / "codex_stderr.log").read_text() == "diagnostic only\n"
+    stderr = (remote_logs / "codex_stderr.log").read_text()
+    assert "=== Codex attempt 1 ===" in stderr
+    assert stderr.endswith("diagnostic only\n")
     result = json.loads((remote_logs / "codex_result.json").read_text())
     assert result["status"] == "failed"
     assert result["exit_code"] == 7
@@ -352,6 +370,180 @@ async def test_codex_shell_pipeline_keeps_jsonl_clean_and_propagates_exit(
     assert interrupted_result["trace_complete"] is False
     assert interrupted_result["thread_ids"] == ["thread-killed"]
     assert next(sessions.glob("rollout-*.jsonl")).is_file()
+
+
+async def test_codex_shell_resumes_same_thread_after_direct_http_429(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    remote_root = tmp_path / "remote-retry"
+    remote_logs = remote_root / "logs/agent"
+    remote_home = remote_root / "codex-home"
+    remote_secrets = remote_root / "codex-secrets"
+    monkeypatch.setattr(codex_agent, "REMOTE_LOG_DIR", PurePosixPath(remote_logs))
+    monkeypatch.setattr(TraceSafeCodexAgent, "_REMOTE_CODEX_HOME", PurePosixPath(remote_home))
+    monkeypatch.setattr(
+        TraceSafeCodexAgent,
+        "_REMOTE_CODEX_SECRETS_DIR",
+        PurePosixPath(remote_secrets),
+    )
+    agent = make_agent(
+        tmp_path / "host-retry",
+        transient_retry_attempts=2,
+        transient_retry_base_delay_sec=0,
+        transient_retry_max_delay_sec=0,
+    )
+    environment = FakeEnvironment()
+
+    await agent.run("fix the task", environment, AgentContext())
+
+    run_command = next(
+        call["command"] for call in environment.exec_calls if "codex exec" in call["command"]
+    )
+    sessions = remote_logs / "sessions"
+    sessions.mkdir(parents=True)
+    remote_home.mkdir(parents=True)
+    (remote_home / "sessions").symlink_to(sessions, target_is_directory=True)
+    fake_bin = tmp_path / "retry-bin"
+    fake_bin.mkdir()
+    fake_codex = fake_bin / "codex"
+    fake_codex.write_text(
+        "#!/usr/bin/env bash\n"
+        "count_file=\"$CODEX_HOME/fake-invocations\"\n"
+        "count=$(cat \"$count_file\" 2>/dev/null || echo 0)\n"
+        "count=$((count + 1))\n"
+        "printf '%s\\n' \"$count\" > \"$count_file\"\n"
+        "if [ \"${2:-}\" = resume ]; then\n"
+        "  test \"${3:-}\" = thread-retry || exit 9\n"
+        "  printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-retry\"}'\n"
+        "  printf '%s\\n' '{\"type\":\"turn.started\"}'\n"
+        "  printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"id\":\"m2\","
+        "\"type\":\"agent_message\",\"text\":\"finished after retry\"}}'\n"
+        "  printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{"
+        "\"input_tokens\":7,\"cached_input_tokens\":3,\"output_tokens\":2}}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-retry\"}'\n"
+        "printf '%s\\n' '{\"type\":\"turn.started\"}'\n"
+        "printf '%s\\n' '{\"type\":\"error\",\"message\":"
+        "\"exceeded retry limit, last status: 429 Too Many Requests\"}'\n"
+        "printf '%s\\n' '{\"type\":\"turn.failed\",\"error\":{\"message\":"
+        "\"exceeded retry limit, last status: 429 Too Many Requests\"}}'\n"
+        "printf '%s\\n' '{\"type\":\"session_meta\",\"payload\":{"
+        "\"id\":\"thread-retry\"}}' > \"$CODEX_HOME/sessions/rollout-retry.jsonl\"\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+
+    completed = subprocess.run(
+        ["bash", "-c", run_command],
+        env={
+            **os.environ,
+            "CODEX_HOME": str(remote_home),
+            "HOME": str(fake_home),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (remote_home / "fake-invocations").read_text().strip() == "2"
+    events = [
+        json.loads(line) for line in (remote_logs / "codex_events.jsonl").read_text().splitlines()
+    ]
+    assert [event["type"] for event in events].count("thread.started") == 2
+    assert any(event["type"] == "harness.retry" for event in events)
+    assert events[-1]["type"] == "turn.completed"
+    result = json.loads((remote_logs / "codex_result.json").read_text())
+    assert result == {
+        "schema_version": 1,
+        "status": "completed",
+        "started_at": result["started_at"],
+        "finished_at": result["finished_at"],
+        "exit_code": 0,
+        "attempts": 2,
+        "transient_retries": 1,
+    }
+    assert "=== Codex attempt 1 ===" in (remote_logs / "codex_stderr.log").read_text()
+    assert "=== Codex attempt 2 ===" in (remote_logs / "codex_stderr.log").read_text()
+
+
+async def test_codex_shell_does_not_retry_deterministic_404(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    remote_root = tmp_path / "remote-no-retry"
+    remote_logs = remote_root / "logs/agent"
+    remote_home = remote_root / "codex-home"
+    remote_secrets = remote_root / "codex-secrets"
+    monkeypatch.setattr(codex_agent, "REMOTE_LOG_DIR", PurePosixPath(remote_logs))
+    monkeypatch.setattr(TraceSafeCodexAgent, "_REMOTE_CODEX_HOME", PurePosixPath(remote_home))
+    monkeypatch.setattr(
+        TraceSafeCodexAgent,
+        "_REMOTE_CODEX_SECRETS_DIR",
+        PurePosixPath(remote_secrets),
+    )
+    agent = make_agent(
+        tmp_path / "host-no-retry",
+        transient_retry_attempts=2,
+        transient_retry_base_delay_sec=0,
+        transient_retry_max_delay_sec=0,
+    )
+    environment = FakeEnvironment()
+
+    await agent.run("fix the task", environment, AgentContext())
+
+    run_command = next(
+        call["command"] for call in environment.exec_calls if "codex exec" in call["command"]
+    )
+    sessions = remote_logs / "sessions"
+    sessions.mkdir(parents=True)
+    remote_home.mkdir(parents=True)
+    (remote_home / "sessions").symlink_to(sessions, target_is_directory=True)
+    fake_bin = tmp_path / "no-retry-bin"
+    fake_bin.mkdir()
+    fake_codex = fake_bin / "codex"
+    fake_codex.write_text(
+        "#!/usr/bin/env bash\n"
+        "count_file=\"$CODEX_HOME/fake-invocations\"\n"
+        "count=$(cat \"$count_file\" 2>/dev/null || echo 0)\n"
+        "printf '%s\\n' \"$((count + 1))\" > \"$count_file\"\n"
+        "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-404\"}'\n"
+        "printf '%s\\n' '{\"type\":\"turn.started\"}'\n"
+        "printf '%s\\n' '{\"type\":\"error\",\"message\":\"unexpected status 404 Not Found\"}'\n"
+        "printf '%s\\n' '{\"type\":\"turn.failed\",\"error\":{\"message\":"
+        "\"unexpected status 404 Not Found\"}}'\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    fake_home = tmp_path / "home-no-retry"
+    fake_home.mkdir()
+
+    completed = subprocess.run(
+        ["bash", "-c", run_command],
+        env={
+            **os.environ,
+            "CODEX_HOME": str(remote_home),
+            "HOME": str(fake_home),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert (remote_home / "fake-invocations").read_text().strip() == "1"
+    assert "harness.retry" not in (remote_logs / "codex_events.jsonl").read_text()
+    result = json.loads((remote_logs / "codex_result.json").read_text())
+    assert result["attempts"] == 1
+    assert result["transient_retries"] == 0
 
 
 def test_post_run_writes_manifest_and_metrics_without_trajectory(tmp_path: Path) -> None:
