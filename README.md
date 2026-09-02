@@ -434,6 +434,11 @@ E2B 2.x 的 Dockerfile parser 还会把反斜线续行后的缩进空格保留�
 可完整解析的多行 `ENV` 规范化为等价单行，并把兼容版本加入 template alias；无法完整解析时
 保持原文而不是部分改写。该处理同时作用于 build 和上述 runtime ENV恢复，不修改任务缓存。
 
+Docker 会为多源 `COPY file1 file2 /absolute/dir/` 自动创建目标目录；E2B 2.x 将其拆成多个
+单文件 move 时不会创建目录，首个文件会失败。adapter 对可安全解析、无 `--from` 且目标是绝对
+目录的多源 COPY，在内存中前置幂等 `mkdir -p`，并以独立 alias 隔离旧模板。JSON COPY、相对
+目标、单源及跨 stage COPY 保持原样。
+
 宿主机的 `HTTP_PROXY`/`HTTPS_PROXY` 若指向 `localhost`、回环地址或未指定地址，不会传入
 远程 Agent；E2B 中的 `127.0.0.1` 指向 sandbox 自身，而不是宿主机代理。过滤只发生在
 Agent 执行环境，宿主机上的 E2B SDK 仍可继续使用该代理；具有远程可达主机名或 IP 的代理

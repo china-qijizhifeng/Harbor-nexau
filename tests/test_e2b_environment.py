@@ -26,7 +26,9 @@ from nexau_harbor.e2b_environment import (
     E2B_SANDBOX_TIMEOUT_SEC,
     E2B_START_RAMP_DELAY_ENV,
     NexAUE2BEnvironment,
+    _copy_dir_scoped_template_name,
     _definition_runtime_env,
+    _ensure_e2b_multisource_copy_destinations,
     _export_path_for_command,
     _layout_fonts_scoped_template_name,
     _normalize_e2b_multiline_env,
@@ -221,6 +223,65 @@ RUN pip --version
         "task__abcdef-s10240-envfix1"
     )
     assert dockerfile_path.read_text() == dockerfile
+
+
+def test_creates_absolute_multisource_copy_destination_for_e2b(tmp_path: Path) -> None:
+    dockerfile = """\
+FROM python:3.12-slim
+COPY legacy_app /shared/legacy_app
+COPY test.sh test_scoring.py test_trace_runner.py /tests/
+"""
+    dockerfile_path = tmp_path / "Dockerfile"
+    dockerfile_path.write_text(dockerfile)
+
+    rewritten, rewrite_count = _ensure_e2b_multisource_copy_destinations(dockerfile)
+
+    assert rewrite_count == 1
+    assert (
+        rewritten
+        == """\
+FROM python:3.12-slim
+COPY legacy_app /shared/legacy_app
+RUN mkdir -p /tests
+COPY test.sh test_scoring.py test_trace_runner.py /tests/
+"""
+    )
+    builder = e2b_environment.harbor_e2b.Template(file_context_path=str(tmp_path)).from_dockerfile(
+        rewritten
+    )
+    instructions = builder._template._instructions
+    mkdir_index = next(
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction["type"].value == "RUN" and instruction["args"] == ["mkdir -p /tests"]
+    )
+    copy_indexes = [
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction["type"].value == "COPY" and instruction["args"][1] == "/tests/"
+    ]
+    assert len(copy_indexes) == 3
+    assert mkdir_index < min(copy_indexes)
+    assert _copy_dir_scoped_template_name("vba__abcdef-s20480", dockerfile_path) == (
+        "vba__abcdef-s20480-copydir1"
+    )
+    assert dockerfile_path.read_text() == dockerfile
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "FROM python:3.12\nCOPY test.sh /tests/\n",
+        "FROM python:3.12\nCOPY one two relative/\n",
+        "FROM python:3.12\nCOPY --from=builder one two /tests/\n",
+        'FROM python:3.12\nCOPY ["one", "two", "/tests/"]\n',
+    ],
+)
+def test_does_not_rewrite_unsupported_copy_forms(dockerfile: str) -> None:
+    rewritten, rewrite_count = _ensure_e2b_multisource_copy_destinations(dockerfile)
+
+    assert rewrite_count == 0
+    assert rewritten == dockerfile
 
 
 def test_runtime_virtualenv_modes_and_vllm_base_discovery() -> None:

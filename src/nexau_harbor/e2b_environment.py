@@ -105,6 +105,7 @@ _RUNTIME_VENV_DISCOVERY_ROOTS = (
     "/home",
     "/root",
 )
+_E2B_COPY_DIR_COMPAT_VERSION = "copydir1"
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,72 @@ def _normalized_env_scoped_template_name(
     if rewrite_count == 0:
         return template_name
     return f"{template_name}-envfix1"
+
+
+def _ensure_e2b_multisource_copy_destinations(dockerfile: str) -> tuple[str, int]:
+    """Create absolute destination dirs that Docker multi-source COPY implies."""
+
+    lines = dockerfile.splitlines(keepends=True)
+    output: list[str] = []
+    rewrite_count = 0
+    index = 0
+    while index < len(lines):
+        start = index
+        block = [lines[index]]
+        while block[-1].rstrip("\r\n").rstrip().endswith("\\"):
+            index += 1
+            if index >= len(lines):
+                break
+            block.append(lines[index])
+        index += 1
+
+        logical_lines = _dockerfile_logical_lines("".join(block))
+        stripped = logical_lines[0].lstrip() if len(logical_lines) == 1 else ""
+        if not stripped.upper().startswith("COPY "):
+            output.extend(block)
+            continue
+        try:
+            tokens = shlex.split(stripped[5:].strip(), posix=True, comments=False)
+        except ValueError:
+            output.extend(block)
+            continue
+        if any(token.lower().startswith("--from") for token in tokens):
+            output.extend(block)
+            continue
+        operands = [token for token in tokens if not token.startswith("--")]
+        if len(operands) < 3:
+            output.extend(block)
+            continue
+        destination = operands[-1]
+        if not destination.startswith("/") or not destination.endswith("/"):
+            output.extend(block)
+            continue
+
+        first_line = lines[start]
+        indent = first_line[: len(first_line) - len(first_line.lstrip())]
+        newline = "\r\n" if any(line.endswith("\r\n") for line in block) else "\n"
+        destination_dir = destination.rstrip("/") or "/"
+        output.append(f"{indent}RUN mkdir -p {shlex.quote(destination_dir)}{newline}")
+        output.extend(block)
+        rewrite_count += 1
+
+    return "".join(output), rewrite_count
+
+
+def _copy_dir_scoped_template_name(
+    template_name: str,
+    dockerfile_path: Path | None,
+) -> str:
+    if dockerfile_path is None:
+        return template_name
+    try:
+        dockerfile = dockerfile_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return template_name
+    _, rewrite_count = _ensure_e2b_multisource_copy_destinations(dockerfile)
+    if rewrite_count == 0:
+        return template_name
+    return f"{template_name}-{_E2B_COPY_DIR_COMPAT_VERSION}"
 
 
 def _dockerfile_logical_lines(dockerfile: str) -> tuple[str, ...]:
@@ -670,6 +737,10 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
                 getattr(self, "_environment_definition_path", None),
             )
             self._template_name = _normalized_env_scoped_template_name(
+                self._template_name,
+                getattr(self, "_environment_definition_path", None),
+            )
+            self._template_name = _copy_dir_scoped_template_name(
                 self._template_name,
                 getattr(self, "_environment_definition_path", None),
             )
@@ -1086,6 +1157,14 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
                     "Applied pinned TB3 layout-font fallback: revision=%s, sha256=%s",
                     _LAYOUT_FONTS_FALLBACK_REVISION,
                     _LAYOUT_FONTS_SHA256,
+                )
+            dockerfile, copy_dir_rewrite_count = _ensure_e2b_multisource_copy_destinations(
+                dockerfile
+            )
+            if copy_dir_rewrite_count:
+                self.logger.info(
+                    "Created %s implicit multi-source COPY destination(s) for E2B",
+                    copy_dir_rewrite_count,
                 )
             template = harbor_e2b.Template(
                 file_context_path=str(self.environment_dir),
