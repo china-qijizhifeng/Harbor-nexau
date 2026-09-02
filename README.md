@@ -418,6 +418,17 @@ revision。普通 E2B 只在同时匹配该 revision、repository 和解包命�
 切换到仍可访问的官方 repository commit，并在解包前校验字体归档的固定 SHA-256；兼容版本也会
 进入模板别名，避免误用旧缓存。原始任务目录和 Dockerfile 不会被修改，其他下载地址不会被改写。
 
+E2B 2.x 的 template runtime 可能不恢复 Dockerfile 或基础镜像声明的环境变量；依赖仍安装在
+镜像 virtualenv/Conda 环境中，但 Harbor 命令会落到系统 `python`。普通
+`NexAUE2BEnvironment` 会按 Dockerfile 声明顺序恢复全部显式 `ENV` 并展开变量；若其中声明
+`VIRTUAL_ENV`，还会验证对应 `bin/python` 并前置其 `bin`。对未在 Dockerfile 重申环境的已知
+vLLM 基础镜像，会在 sandbox 启动后验证其镜像级 `/opt/venv`。其他隐式环境可通过
+`runtime_virtualenv=/absolute/path` 明确指定，或用 `runtime_virtualenv=discover` 要求仅在恰好
+发现一个 `pyvenv.cfg` 候选时激活；多候选会 fail closed，不猜测路径。调用方显式传入的
+`PATH`/`VIRTUAL_ENV` 始终具有更高优先级。E2B command service 会忽略 SDK `envs` 中的 PATH，
+因此 adapter 只把 PATH 作为 shell `export` 前缀，其余变量仍走 SDK env channel，避免把 secret
+写入命令文本；原始任务 Dockerfile 不会被修改。
+
 宿主机的 `HTTP_PROXY`/`HTTPS_PROXY` 若指向 `localhost`、回环地址或未指定地址，不会传入
 远程 Agent；E2B 中的 `127.0.0.1` 指向 sandbox 自身，而不是宿主机代理。过滤只发生在
 Agent 执行环境，宿主机上的 E2B SDK 仍可继续使用该代理；具有远程可达主机名或 IP 的代理

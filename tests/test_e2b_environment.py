@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 from pathlib import Path
@@ -25,9 +26,17 @@ from nexau_harbor.e2b_environment import (
     E2B_SANDBOX_TIMEOUT_SEC,
     E2B_START_RAMP_DELAY_ENV,
     NexAUE2BEnvironment,
+    _definition_runtime_env,
+    _export_path_for_command,
     _layout_fonts_scoped_template_name,
+    _parse_dockerfile_runtime_env,
     _parse_root_disk_usage,
+    _parse_runtime_env_probe,
+    _prepend_path_entry,
+    _resolve_runtime_env,
+    _resolve_runtime_virtualenv_mode,
     _rewrite_stale_layout_fonts_download,
+    _runtime_env_probe_command,
     _storage_scoped_template_name,
 )
 
@@ -133,6 +142,183 @@ def test_does_not_partially_rewrite_unknown_layout_font_case(dockerfile: str) ->
 
     assert rewrite_count == 0
     assert rewritten == dockerfile
+
+
+def test_parses_and_expands_general_dockerfile_runtime_env(tmp_path: Path) -> None:
+    dockerfile = """\
+FROM python:3.11
+ENV TOOL_ROOT=/opt/tools \\
+    PATH="${TOOL_ROOT}/bin:${PATH}"
+ENV VIRTUAL_ENV /srv/custom-python
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+"""
+    directives = _parse_dockerfile_runtime_env(dockerfile)
+
+    assert directives == (
+        ("TOOL_ROOT", "/opt/tools"),
+        ("PATH", "${TOOL_ROOT}/bin:${PATH}"),
+        ("VIRTUAL_ENV", "/srv/custom-python"),
+        ("PATH", "${VIRTUAL_ENV}/bin:${PATH}"),
+    )
+    assert _resolve_runtime_env(directives, {"PATH": "/usr/bin:/bin"}) == {
+        "TOOL_ROOT": "/opt/tools",
+        "VIRTUAL_ENV": "/srv/custom-python",
+        "PATH": "/srv/custom-python/bin:/opt/tools/bin:/usr/bin:/bin",
+    }
+
+    dockerfile_path = tmp_path / "Dockerfile"
+    dockerfile_path.write_text(dockerfile)
+    parsed, implicit = _definition_runtime_env(dockerfile_path, None)
+    assert parsed == directives
+    assert implicit is None
+
+    multi_stage = (
+        "FROM python:3.11 AS builder\nENV BUILD_ONLY=yes\nFROM ubuntu:24.04\nENV RUNTIME_ONLY=yes\n"
+    )
+    assert _parse_dockerfile_runtime_env(multi_stage) == (("RUNTIME_ONLY", "yes"),)
+
+
+def test_runtime_virtualenv_modes_and_vllm_base_discovery() -> None:
+    directives, implicit = _definition_runtime_env(
+        None,
+        "vllm/vllm-openai-cpu:v0.21.0",
+    )
+
+    assert directives == ()
+    assert implicit == "/opt/venv"
+    assert _resolve_runtime_virtualenv_mode(None) == "auto"
+    assert _resolve_runtime_virtualenv_mode("discover") == "discover"
+    assert _resolve_runtime_virtualenv_mode("/srv/python-env/") == "/srv/python-env"
+    with pytest.raises(ValueError, match="runtime_virtualenv"):
+        _resolve_runtime_virtualenv_mode("relative/env")
+    assert _prepend_path_entry("/srv/python-env/bin", "/usr/bin:/srv/python-env/bin") == (
+        "/srv/python-env/bin:/usr/bin"
+    )
+    command, env = _export_path_for_command(
+        "python -m pytest",
+        {"PATH": "/srv/python-env/bin:/usr/bin", "TOKEN": "kept-out-of-command"},
+    )
+    assert command == "export PATH=/srv/python-env/bin:/usr/bin\npython -m pytest"
+    assert env == {"TOKEN": "kept-out-of-command"}
+    assert "kept-out-of-command" not in command
+
+
+async def test_restores_general_runtime_env_and_custom_virtualenv() -> None:
+    probe_stdout = """\
+__HARBOR_NEXAU_RUNTIME_ENV__
+PATH=/usr/local/bin:/usr/bin:/bin
+HOME=/root
+__HARBOR_NEXAU_RUNTIME_VENVS__
+/srv/custom-python/pyvenv.cfg
+"""
+    run = AsyncMock(
+        side_effect=(
+            SimpleNamespace(exit_code=0, stdout=probe_stdout, stderr=""),
+            SimpleNamespace(exit_code=0, stdout="", stderr=""),
+        )
+    )
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment._sandbox = SimpleNamespace(commands=SimpleNamespace(run=run))
+    environment._runtime_env_overlay = {}
+    environment._runtime_env_directives = (
+        ("TOOL_ROOT", "/opt/tools"),
+        ("PATH", "${TOOL_ROOT}/bin:${PATH}"),
+        ("VIRTUAL_ENV", "/srv/custom-python"),
+    )
+    environment._runtime_virtualenv_mode = "auto"
+    environment._implicit_runtime_virtualenv = None
+    environment._persistent_env = {"PERSISTENT": "yes"}
+    environment._exec_env_overlays = contextvars.ContextVar(
+        "test_e2b_runtime_env_overlays",
+        default=(),
+    )
+    environment.logger = MagicMock()
+
+    await environment._restore_image_runtime_env()
+
+    assert environment._runtime_env_overlay == {
+        "TOOL_ROOT": "/opt/tools",
+        "VIRTUAL_ENV": "/srv/custom-python",
+        "PATH": "/srv/custom-python/bin:/opt/tools/bin:/usr/local/bin:/usr/bin:/bin",
+    }
+    assert environment._merge_env({"EXPLICIT": "yes"}) == {
+        **environment._runtime_env_overlay,
+        "PERSISTENT": "yes",
+        "EXPLICIT": "yes",
+    }
+    assert environment._merge_env({"PATH": "/caller/bin"})["PATH"] == "/caller/bin"
+    assert run.await_args_list[0].args == (_runtime_env_probe_command(),)
+    assert run.await_args_list[1].args == ("test -x /srv/custom-python/bin/python",)
+
+
+def test_parses_runtime_probe_without_logging_environment_values() -> None:
+    current_env, candidates = _parse_runtime_env_probe(
+        "__HARBOR_NEXAU_RUNTIME_ENV__\n"
+        "PATH=/usr/bin:/bin\n"
+        "SECRET=value-kept-in-memory-only\n"
+        "__HARBOR_NEXAU_RUNTIME_VENVS__\n"
+        "/opt/venv/pyvenv.cfg\n"
+        "/srv/other/pyvenv.cfg\n"
+    )
+
+    assert current_env["PATH"] == "/usr/bin:/bin"
+    assert current_env["SECRET"] == "value-kept-in-memory-only"
+    assert candidates == ("/opt/venv", "/srv/other")
+
+
+async def test_dispatch_exports_path_but_keeps_other_env_on_sdk_channel(
+    monkeypatch,
+) -> None:
+    handle = object()
+    upstream_dispatch = AsyncMock(return_value=handle)
+    monkeypatch.setattr(
+        e2b_environment.harbor_e2b.E2BEnvironment,
+        "_dispatch_command",
+        upstream_dispatch,
+    )
+    environment = object.__new__(NexAUE2BEnvironment)
+
+    result = await environment._dispatch_command(
+        "python -m pytest",
+        cwd="/tests",
+        env={"PATH": "/srv/python/bin:/usr/bin", "SECRET": "sdk-only"},
+        timeout_sec=30,
+        user="root",
+    )
+
+    assert result is handle
+    upstream_dispatch.assert_awaited_once_with(
+        "export PATH=/srv/python/bin:/usr/bin\npython -m pytest",
+        cwd="/tests",
+        env={"SECRET": "sdk-only"},
+        timeout_sec=30,
+        user="root",
+    )
+
+
+async def test_discovery_rejects_multiple_ambiguous_virtualenvs() -> None:
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment._sandbox = SimpleNamespace(
+        commands=SimpleNamespace(
+            run=AsyncMock(
+                return_value=SimpleNamespace(
+                    exit_code=0,
+                    stdout=(
+                        "__HARBOR_NEXAU_RUNTIME_ENV__\nPATH=/usr/bin\n"
+                        "__HARBOR_NEXAU_RUNTIME_VENVS__\n"
+                        "/opt/one/pyvenv.cfg\n/opt/two/pyvenv.cfg\n"
+                    ),
+                    stderr="",
+                )
+            )
+        )
+    )
+    environment._runtime_env_directives = ()
+    environment._runtime_virtualenv_mode = "discover"
+    environment._implicit_runtime_virtualenv = None
+
+    with pytest.raises(RuntimeError, match="exactly one candidate"):
+        await environment._restore_image_runtime_env()
 
 
 def test_environment_scopes_template_name_to_effective_storage(monkeypatch) -> None:

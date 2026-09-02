@@ -82,6 +82,28 @@ _LAYOUT_FONTS_VERIFIED_TAR_STEP = (
     f'    echo "{_LAYOUT_FONTS_SHA256}  /tmp/fonts.tar.xz" | sha256sum -c - && \\\n'
     "    tar -xJf /tmp/fonts.tar.xz -C /tmp/google_fonts_cache"
 )
+_RUNTIME_ENV_MARKER = "__HARBOR_NEXAU_RUNTIME_ENV__"
+_RUNTIME_VENV_MARKER = "__HARBOR_NEXAU_RUNTIME_VENVS__"
+_RUNTIME_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RUNTIME_ENV_REFERENCE_PATTERN = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
+    r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
+)
+_VLLM_BASE_IMAGE_PATTERN = re.compile(
+    r"^[ \t]*FROM(?:[ \t]+--platform=\S+)?[ \t]+"
+    r"(?:docker\.io/)?vllm/vllm-openai(?:-cpu)?(?:[:@][^ \t]+)?",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_RUNTIME_VENV_DISCOVERY_ROOTS = (
+    "/opt",
+    "/usr/local",
+    "/venv",
+    "/env",
+    "/app",
+    "/workspace",
+    "/home",
+    "/root",
+)
 
 
 @dataclass(frozen=True)
@@ -219,6 +241,180 @@ def _layout_fonts_scoped_template_name(
     if rewrite_count == 0:
         return template_name
     return f"{template_name}-lf{_LAYOUT_FONTS_SHA256[:12]}"
+
+
+def _dockerfile_logical_lines(dockerfile: str) -> tuple[str, ...]:
+    logical_lines: list[str] = []
+    current = ""
+    for raw_line in dockerfile.splitlines():
+        line = raw_line.rstrip()
+        if line.endswith("\\"):
+            current += f"{line[:-1]} "
+            continue
+        logical_lines.append(f"{current}{line}")
+        current = ""
+    if current:
+        logical_lines.append(current)
+    return tuple(logical_lines)
+
+
+def _parse_dockerfile_runtime_env(dockerfile: str) -> tuple[tuple[str, str], ...]:
+    directives: list[tuple[str, str]] = []
+    for logical_line in _dockerfile_logical_lines(dockerfile):
+        stripped = logical_line.lstrip()
+        if stripped.upper().startswith("FROM "):
+            directives = []
+            continue
+        if not stripped.upper().startswith("ENV "):
+            continue
+        try:
+            tokens = shlex.split(stripped[4:].strip(), posix=True, comments=False)
+        except ValueError:
+            continue
+        if not tokens:
+            continue
+        if all("=" in token for token in tokens):
+            pairs = (token.split("=", 1) for token in tokens)
+        elif len(tokens) >= 2 and "=" not in tokens[0]:
+            pairs = ((tokens[0], " ".join(tokens[1:])),)
+        else:
+            continue
+        for key, value in pairs:
+            if _RUNTIME_ENV_KEY_PATTERN.fullmatch(key):
+                directives.append((key, value))
+    return tuple(directives)
+
+
+def _final_dockerfile_base_image(dockerfile: str) -> str | None:
+    final_image = None
+    for logical_line in _dockerfile_logical_lines(dockerfile):
+        stripped = logical_line.lstrip()
+        if not stripped.upper().startswith("FROM "):
+            continue
+        try:
+            tokens = shlex.split(stripped[5:].strip(), posix=True, comments=False)
+        except ValueError:
+            continue
+        final_image = next(
+            (token for token in tokens if not token.startswith("--")),
+            None,
+        )
+    return final_image
+
+
+def _expand_runtime_env_value(value: str, env: dict[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        key = match.group("braced") or match.group("plain")
+        return env.get(key, "")
+
+    return _RUNTIME_ENV_REFERENCE_PATTERN.sub(replace, value)
+
+
+def _resolve_runtime_env(
+    directives: tuple[tuple[str, str], ...],
+    current_env: dict[str, str],
+) -> dict[str, str]:
+    expanded_env = dict(current_env)
+    overlay: dict[str, str] = {}
+    for key, raw_value in directives:
+        value = _expand_runtime_env_value(raw_value, expanded_env)
+        expanded_env[key] = value
+        overlay[key] = value
+    return overlay
+
+
+def _definition_runtime_env(
+    dockerfile_path: Path | None,
+    docker_image: str | None,
+) -> tuple[tuple[tuple[str, str], ...], str | None]:
+    implicit_virtualenv = None
+    if docker_image and _VLLM_BASE_IMAGE_PATTERN.search(f"FROM {docker_image}"):
+        implicit_virtualenv = "/opt/venv"
+    if dockerfile_path is None:
+        return (), implicit_virtualenv
+    try:
+        dockerfile = dockerfile_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return (), implicit_virtualenv
+    final_image = _final_dockerfile_base_image(dockerfile)
+    if final_image and _VLLM_BASE_IMAGE_PATTERN.search(f"FROM {final_image}"):
+        implicit_virtualenv = "/opt/venv"
+    return _parse_dockerfile_runtime_env(dockerfile), implicit_virtualenv
+
+
+def _resolve_runtime_virtualenv_mode(configured: str | None) -> str:
+    if configured is None:
+        return "auto"
+    if not isinstance(configured, str):
+        raise ValueError("runtime_virtualenv must be auto, discover, off, or an absolute path")
+    normalized = configured.strip()
+    if normalized.lower() in {"auto", "discover", "off"}:
+        return normalized.lower()
+    if not normalized.startswith("/") or any(char in normalized for char in ("\0", "\n")):
+        raise ValueError("runtime_virtualenv must be auto, discover, off, or an absolute path")
+    return normalized.rstrip("/") or "/"
+
+
+def _prepend_path_entry(entry: str, current_path: str) -> str:
+    components = [component for component in current_path.split(":") if component]
+    return ":".join((entry, *(component for component in components if component != entry)))
+
+
+def _export_path_for_command(
+    command: str,
+    env: dict[str, str] | None,
+) -> tuple[str, dict[str, str] | None]:
+    if not env or "PATH" not in env:
+        return command, env
+    forwarded_env = dict(env)
+    path = forwarded_env.pop("PATH")
+    wrapped_command = f"export PATH={shlex.quote(path)}\n{command}"
+    return wrapped_command, forwarded_env or None
+
+
+def _runtime_env_probe_command(*, discover_virtualenvs: bool = False) -> str:
+    commands = [
+        f"printf '%s\\n' {_RUNTIME_ENV_MARKER};",
+        "env;",
+        f"printf '%s\\n' {_RUNTIME_VENV_MARKER};",
+    ]
+    if discover_virtualenvs:
+        roots = " ".join(shlex.quote(root) for root in _RUNTIME_VENV_DISCOVERY_ROOTS)
+        commands.extend(
+            (
+                f"for harbor_nexau_root in {roots}; do",
+                'if test -d "$harbor_nexau_root"; then',
+                'find "$harbor_nexau_root" -xdev -maxdepth 6 -type f',
+                "-name pyvenv.cfg -print 2>/dev/null || true;",
+                "fi;",
+                "done",
+            )
+        )
+    return " ".join(commands)
+
+
+def _parse_runtime_env_probe(stdout: str) -> tuple[dict[str, str], tuple[str, ...]]:
+    lines = stdout.splitlines()
+    try:
+        env_marker_index = lines.index(_RUNTIME_ENV_MARKER)
+        venv_marker_index = lines.index(_RUNTIME_VENV_MARKER, env_marker_index + 1)
+    except ValueError as exc:
+        raise ValueError("runtime environment probe markers are missing") from exc
+
+    current_env: dict[str, str] = {}
+    for line in lines[env_marker_index + 1 : venv_marker_index]:
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if _RUNTIME_ENV_KEY_PATTERN.fullmatch(key):
+            current_env[key] = value
+
+    candidates = {
+        str(Path(line).parent)
+        for line in lines[venv_marker_index + 1 :]
+        if line.startswith("/") and Path(line).name == "pyvenv.cfg"
+    }
+    return current_env, tuple(sorted(candidates))
 
 
 def _resolve_max_lifetime_sec(configured: int | str | None) -> int:
@@ -378,6 +574,7 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         e2b_start_ramp_delay_sec: int | float | str | None = None,
         e2b_template_build_attempts: int | str | None = None,
         e2b_template_build_timeout_sec: int | float | str | None = None,
+        runtime_virtualenv: str | None = None,
         **kwargs,
     ) -> None:
         _merge_configured_no_proxy_hosts()
@@ -393,6 +590,10 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         self._keepalive_task: asyncio.Task[None] | None = None
         self._keepalive_deadline: float | None = None
         self._pending_agent_log_download: _PendingAgentLogDownload | None = None
+        self._runtime_env_overlay: dict[str, str] = {}
+        self._runtime_env_directives: tuple[tuple[str, str], ...] = ()
+        self._implicit_runtime_virtualenv: str | None = None
+        self._runtime_virtualenv_mode = _resolve_runtime_virtualenv_mode(runtime_virtualenv)
         super().__init__(*args, **kwargs)
         if hasattr(self, "task_env_config") and hasattr(self, "_template_name"):
             self._template_name = _storage_scoped_template_name(
@@ -403,6 +604,21 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
                 self._template_name,
                 getattr(self, "_environment_definition_path", None),
             )
+            (
+                self._runtime_env_directives,
+                self._implicit_runtime_virtualenv,
+            ) = _definition_runtime_env(
+                getattr(self, "_environment_definition_path", None),
+                self.task_env_config.docker_image,
+            )
+
+    @override
+    def _merge_env(self, env: dict[str, str] | None) -> dict[str, str] | None:
+        merged = super()._merge_env(env)
+        runtime_overlay = getattr(self, "_runtime_env_overlay", {})
+        if not runtime_overlay:
+            return merged
+        return {**runtime_overlay, **(merged or {})}
 
     @override
     async def start(self, force_build: bool) -> None:
@@ -600,6 +816,28 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         """Return the user used to read and poll detached command state."""
 
         return command_user
+
+    @override
+    async def _dispatch_command(
+        self,
+        command: str,
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        timeout_sec: int | None,
+        user: str,
+    ):
+        # E2B applies ordinary envs but replaces PATH with its own command-service
+        # default. Export PATH inside the shell while leaving all other values on
+        # the SDK env channel, where secrets do not become command text.
+        command, forwarded_env = _export_path_for_command(command, env)
+        return await super()._dispatch_command(
+            command,
+            cwd=cwd,
+            env=forwarded_env,
+            timeout_sec=timeout_sec,
+            user=user,
+        )
 
     async def _dispatch_detached_command(
         self,
@@ -849,6 +1087,7 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
     )
     @override
     async def _create_sandbox(self) -> None:
+        self._runtime_env_overlay = {}
         ramp_wait_sec = _reserve_sandbox_start_delay(self._e2b_start_ramp_delay_sec)
         if ramp_wait_sec > 0:
             self.logger.info(
@@ -874,6 +1113,12 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
             network=self._sandbox_create_network_options(),
         )
         try:
+            if (
+                getattr(self, "_runtime_env_directives", ())
+                or getattr(self, "_implicit_runtime_virtualenv", None)
+                or getattr(self, "_runtime_virtualenv_mode", "auto") not in {"auto", "off"}
+            ):
+                await self._restore_image_runtime_env()
             await self._validate_sandbox_storage()
         except BaseException:
             try:
@@ -882,6 +1127,84 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
                 self._sandbox = None
             raise
         self._start_keepalive()
+
+    async def _restore_image_runtime_env(self) -> None:
+        if self._sandbox is None:
+            raise RuntimeError("Sandbox not found while restoring E2B image environment")
+
+        mode = getattr(self, "_runtime_virtualenv_mode", "auto")
+        result = await self._sandbox.commands.run(
+            _runtime_env_probe_command(discover_virtualenvs=mode == "discover"),
+            user="root",
+            timeout=30,
+            request_timeout=30,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                "Could not inspect E2B sandbox runtime environment: "
+                f"{result.stderr or result.stdout or 'probe failed'}"
+            )
+
+        try:
+            current_env, discovered_virtualenvs = _parse_runtime_env_probe(result.stdout)
+        except ValueError as exc:
+            raise RuntimeError(f"Could not parse E2B runtime environment: {exc}") from exc
+
+        overlay = _resolve_runtime_env(
+            getattr(self, "_runtime_env_directives", ()),
+            current_env,
+        )
+        selected_virtualenv: str | None = None
+        if mode.startswith("/"):
+            selected_virtualenv = mode
+        else:
+            declared_virtualenv = overlay.get("VIRTUAL_ENV")
+            if declared_virtualenv and declared_virtualenv.startswith("/"):
+                selected_virtualenv = declared_virtualenv.rstrip("/") or "/"
+            elif mode != "off":
+                implicit_virtualenv = getattr(
+                    self,
+                    "_implicit_runtime_virtualenv",
+                    None,
+                )
+                if implicit_virtualenv:
+                    selected_virtualenv = implicit_virtualenv
+                elif mode == "discover":
+                    if len(discovered_virtualenvs) != 1:
+                        raise RuntimeError(
+                            "E2B virtualenv discovery requires exactly one candidate; "
+                            f"found {len(discovered_virtualenvs)}: "
+                            f"{', '.join(discovered_virtualenvs) or 'none'}"
+                        )
+                    selected_virtualenv = discovered_virtualenvs[0]
+
+        if selected_virtualenv is not None:
+            python_path = f"{selected_virtualenv}/bin/python"
+            validation = await self._sandbox.commands.run(
+                f"test -x {shlex.quote(python_path)}",
+                user="root",
+                timeout=30,
+                request_timeout=30,
+            )
+            if validation.exit_code != 0:
+                raise RuntimeError(
+                    "E2B image declares or selects virtualenv "
+                    f"{selected_virtualenv}, but {python_path} is missing"
+                )
+            effective_path = overlay.get("PATH", current_env.get("PATH", ""))
+            overlay["VIRTUAL_ENV"] = selected_virtualenv
+            overlay["PATH"] = _prepend_path_entry(
+                f"{selected_virtualenv}/bin",
+                effective_path,
+            )
+
+        self._runtime_env_overlay = overlay
+        if overlay:
+            self.logger.info(
+                "Restored %s E2B image runtime environment variable(s)%s",
+                len(overlay),
+                (f", virtualenv={selected_virtualenv}" if selected_virtualenv is not None else ""),
+            )
 
     async def _validate_sandbox_storage(self) -> None:
         requested_mb = self._effective_storage_mb
