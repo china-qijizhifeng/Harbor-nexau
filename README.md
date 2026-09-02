@@ -429,6 +429,11 @@ vLLM 基础镜像，会在 sandbox 启动后验证其镜像级 `/opt/venv`。其
 因此 adapter 只把 PATH 作为 shell `export` 前缀，其余变量仍走 SDK env channel，避免把 secret
 写入命令文本；原始任务 Dockerfile 不会被修改。
 
+E2B 2.x 的 Dockerfile parser 还会把反斜线续行后的缩进空格保留进多行 `ENV` 值，例如把
+`PIP_NO_CACHE_DIR=1` 解析成无效的 `"1    "`，使 pip 在下载前 exit 2。adapter 会在内存中将
+可完整解析的多行 `ENV` 规范化为等价单行，并把兼容版本加入 template alias；无法完整解析时
+保持原文而不是部分改写。该处理同时作用于 build 和上述 runtime ENV恢复，不修改任务缓存。
+
 宿主机的 `HTTP_PROXY`/`HTTPS_PROXY` 若指向 `localhost`、回环地址或未指定地址，不会传入
 远程 Agent；E2B 中的 `127.0.0.1` 指向 sandbox 自身，而不是宿主机代理。过滤只发生在
 Agent 执行环境，宿主机上的 E2B SDK 仍可继续使用该代理；具有远程可达主机名或 IP 的代理

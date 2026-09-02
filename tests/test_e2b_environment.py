@@ -29,6 +29,8 @@ from nexau_harbor.e2b_environment import (
     _definition_runtime_env,
     _export_path_for_command,
     _layout_fonts_scoped_template_name,
+    _normalize_e2b_multiline_env,
+    _normalized_env_scoped_template_name,
     _parse_dockerfile_runtime_env,
     _parse_root_disk_usage,
     _parse_runtime_env_probe,
@@ -176,6 +178,49 @@ ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
         "FROM python:3.11 AS builder\nENV BUILD_ONLY=yes\nFROM ubuntu:24.04\nENV RUNTIME_ONLY=yes\n"
     )
     assert _parse_dockerfile_runtime_env(multi_stage) == (("RUNTIME_ONLY", "yes"),)
+
+
+def test_normalizes_multiline_env_before_e2b_parser_without_mutating_source(
+    tmp_path: Path,
+) -> None:
+    dockerfile = """\
+FROM python:3.11-slim-bookworm
+ENV DEBIAN_FRONTEND=noninteractive \\
+    PYTHONDONTWRITEBYTECODE=1 \\
+    PIP_NO_CACHE_DIR=1 \\
+    DISPLAY_NAME="two words"
+RUN pip --version
+"""
+    dockerfile_path = tmp_path / "Dockerfile"
+    dockerfile_path.write_text(dockerfile)
+
+    normalized, rewrite_count = _normalize_e2b_multiline_env(dockerfile)
+
+    assert rewrite_count == 1
+    assert "\\\n" not in normalized
+    assert 'DISPLAY_NAME="two words"' in normalized
+    builder = e2b_environment.harbor_e2b.Template(file_context_path=str(tmp_path)).from_dockerfile(
+        normalized
+    )
+    env_instruction = next(
+        instruction
+        for instruction in builder._template._instructions
+        if instruction["type"].value == "ENV"
+    )
+    assert env_instruction["args"] == [
+        "DEBIAN_FRONTEND",
+        "noninteractive",
+        "PYTHONDONTWRITEBYTECODE",
+        "1",
+        "PIP_NO_CACHE_DIR",
+        "1",
+        "DISPLAY_NAME",
+        "two words",
+    ]
+    assert _normalized_env_scoped_template_name("task__abcdef-s10240", dockerfile_path) == (
+        "task__abcdef-s10240-envfix1"
+    )
+    assert dockerfile_path.read_text() == dockerfile
 
 
 def test_runtime_virtualenv_modes_and_vllm_base_discovery() -> None:

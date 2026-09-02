@@ -85,6 +85,7 @@ _LAYOUT_FONTS_VERIFIED_TAR_STEP = (
 _RUNTIME_ENV_MARKER = "__HARBOR_NEXAU_RUNTIME_ENV__"
 _RUNTIME_VENV_MARKER = "__HARBOR_NEXAU_RUNTIME_VENVS__"
 _RUNTIME_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RUNTIME_ENV_SAFE_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_./:${}@%+,=-]+$")
 _RUNTIME_ENV_REFERENCE_PATTERN = re.compile(
     r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|"
     r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
@@ -243,6 +244,22 @@ def _layout_fonts_scoped_template_name(
     return f"{template_name}-lf{_LAYOUT_FONTS_SHA256[:12]}"
 
 
+def _normalized_env_scoped_template_name(
+    template_name: str,
+    dockerfile_path: Path | None,
+) -> str:
+    if dockerfile_path is None:
+        return template_name
+    try:
+        dockerfile = dockerfile_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return template_name
+    _, rewrite_count = _normalize_e2b_multiline_env(dockerfile)
+    if rewrite_count == 0:
+        return template_name
+    return f"{template_name}-envfix1"
+
+
 def _dockerfile_logical_lines(dockerfile: str) -> tuple[str, ...]:
     logical_lines: list[str] = []
     current = ""
@@ -258,6 +275,22 @@ def _dockerfile_logical_lines(dockerfile: str) -> tuple[str, ...]:
     return tuple(logical_lines)
 
 
+def _parse_dockerfile_env_payload(payload: str) -> tuple[tuple[str, str], ...]:
+    try:
+        tokens = shlex.split(payload.strip(), posix=True, comments=False)
+    except ValueError:
+        return ()
+    if not tokens:
+        return ()
+    if all("=" in token for token in tokens):
+        pairs = (token.split("=", 1) for token in tokens)
+    elif len(tokens) >= 2 and "=" not in tokens[0]:
+        pairs = ((tokens[0], " ".join(tokens[1:])),)
+    else:
+        return ()
+    return tuple((key, value) for key, value in pairs if _RUNTIME_ENV_KEY_PATTERN.fullmatch(key))
+
+
 def _parse_dockerfile_runtime_env(dockerfile: str) -> tuple[tuple[str, str], ...]:
     directives: list[tuple[str, str]] = []
     for logical_line in _dockerfile_logical_lines(dockerfile):
@@ -267,22 +300,54 @@ def _parse_dockerfile_runtime_env(dockerfile: str) -> tuple[tuple[str, str], ...
             continue
         if not stripped.upper().startswith("ENV "):
             continue
-        try:
-            tokens = shlex.split(stripped[4:].strip(), posix=True, comments=False)
-        except ValueError:
-            continue
-        if not tokens:
-            continue
-        if all("=" in token for token in tokens):
-            pairs = (token.split("=", 1) for token in tokens)
-        elif len(tokens) >= 2 and "=" not in tokens[0]:
-            pairs = ((tokens[0], " ".join(tokens[1:])),)
-        else:
-            continue
-        for key, value in pairs:
-            if _RUNTIME_ENV_KEY_PATTERN.fullmatch(key):
-                directives.append((key, value))
+        directives.extend(_parse_dockerfile_env_payload(stripped[4:]))
     return tuple(directives)
+
+
+def _quote_dockerfile_env_value(value: str) -> str:
+    if value and _RUNTIME_ENV_SAFE_VALUE_PATTERN.fullmatch(value):
+        return value
+    return f'"{value.replace("\\", "\\\\").replace(chr(34), r"\"")}"'
+
+
+def _normalize_e2b_multiline_env(dockerfile: str) -> tuple[str, int]:
+    """Remove continuation indentation that E2B 2.x leaks into ENV values."""
+
+    lines = dockerfile.splitlines(keepends=True)
+    normalized: list[str] = []
+    rewrite_count = 0
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.lstrip()
+        if not stripped.upper().startswith("ENV ") or not line.rstrip().endswith("\\"):
+            normalized.append(line)
+            index += 1
+            continue
+
+        end = index
+        while end < len(lines) - 1 and lines[end].rstrip().endswith("\\"):
+            end += 1
+        block = "".join(lines[index : end + 1])
+        logical_lines = _dockerfile_logical_lines(block)
+        pairs = (
+            _parse_dockerfile_env_payload(logical_lines[0].lstrip()[4:])
+            if len(logical_lines) == 1
+            else ()
+        )
+        if not pairs:
+            normalized.extend(lines[index : end + 1])
+            index = end + 1
+            continue
+
+        indent = line[: len(line) - len(stripped)]
+        newline = "\n" if lines[end].endswith("\n") else ""
+        payload = " ".join(f"{key}={_quote_dockerfile_env_value(value)}" for key, value in pairs)
+        normalized.append(f"{indent}ENV {payload}{newline}")
+        rewrite_count += 1
+        index = end + 1
+
+    return "".join(normalized), rewrite_count
 
 
 def _final_dockerfile_base_image(dockerfile: str) -> str | None:
@@ -601,6 +666,10 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
                 self._effective_storage_mb,
             )
             self._template_name = _layout_fonts_scoped_template_name(
+                self._template_name,
+                getattr(self, "_environment_definition_path", None),
+            )
+            self._template_name = _normalized_env_scoped_template_name(
                 self._template_name,
                 getattr(self, "_environment_definition_path", None),
             )
@@ -999,6 +1068,12 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
             )
         else:
             dockerfile = self._environment_definition_path.read_text(encoding="utf-8")
+            dockerfile, env_rewrite_count = _normalize_e2b_multiline_env(dockerfile)
+            if env_rewrite_count:
+                self.logger.info(
+                    "Normalized %s multiline Dockerfile ENV instruction(s) for E2B",
+                    env_rewrite_count,
+                )
             dockerfile, rewrite_count = _rewrite_e2b_incompatible_uv_copy(dockerfile)
             if rewrite_count:
                 self.logger.info(
@@ -1012,7 +1087,6 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
                     _LAYOUT_FONTS_FALLBACK_REVISION,
                     _LAYOUT_FONTS_SHA256,
                 )
-
             template = harbor_e2b.Template(
                 file_context_path=str(self.environment_dir),
             ).from_dockerfile(
