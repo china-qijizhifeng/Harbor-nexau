@@ -67,8 +67,9 @@ Harbor自身已经在 separate verifier模式下创建第二个 environment、�
 引用，通过官方匿名 Bearer token端点读取 manifest/config，逐字节重算两层 digest，并限制 token
 realm为 `auth.docker.io`；内部 Harbor引用仍使用既有 Basic auth。Basestream GPU节点的 containerd
 不使用Pod内 proxy环境，不能直接拉 Docker Hub。验证完成后，provider复用 NexMLTask已经验证的
-固定 Skopeo镜像，从 `m.daocloud.io/docker.io`按源digest执行
-`copy --all --preserve-digests` 到内部 Harbor。目标raw manifest必须仍能以同一个digest读取，且
+固定 Skopeo镜像，通过 CPU egress从 `docker.io`按源digest执行
+`copy --all --preserve-digests` 到内部 Harbor。可选镜像源只有在当前egress路径实测可达时才启用；
+目标raw manifest必须仍能以同一个digest读取，且
 config digest、ENTRYPOINT、USER与WORKDIR必须与官方源完全一致；GPU Job只使用该内部
 `@sha256`。这个步骤是registry间原样复制，不是用空 Dockerfile重建镜像。
 

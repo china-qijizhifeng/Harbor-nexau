@@ -442,10 +442,7 @@ def test_prebuilt_mirror_uses_nexmltask_skopeo_preserve_digest_contract(
     )
     assert container["command"] == ["/usr/bin/skopeo"]
     assert container["args"][:3] == ["copy", "--all", "--preserve-digests"]
-    assert (
-        f"docker://m.daocloud.io/docker.io/harborframework/terminal-bench@{digest}"
-        in (container["args"])
-    )
+    assert f"docker://docker.io/harborframework/terminal-bench@{digest}" in (container["args"])
     assert f"docker://{destination}" in container["args"]
     assert "nvidia.com/gpu" not in container["resources"]["requests"]
     mounts = {item["mountPath"]: item for item in container["volumeMounts"]}
@@ -510,9 +507,7 @@ def test_prebuilt_skopeo_mirror_preserves_source_digest_and_metadata(
     receipt = json.loads((image_dir / "receipt.json").read_text(encoding="utf-8"))
     assert receipt["source"] == "prebuilt-mirror"
     assert receipt["source_ref"] == source
-    assert receipt["copy_source_ref"] == (
-        f"m.daocloud.io/docker.io/harborframework/terminal-bench@{digest}"
-    )
+    assert receipt["copy_source_ref"] == f"docker.io/harborframework/terminal-bench@{digest}"
     assert receipt["digest"] == digest
     assert receipt["immutable_ref"] == internal
     assert receipt["metadata"] == internal_metadata

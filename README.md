@@ -65,9 +65,10 @@ scripts/run_tb4.sh \
   `nexau_harbor.basestream_environment:BasestreamEnvironment`；
 - GPU Agent和 `environment_mode = "separate"` 的 verifier分别创建独立 Volcano Job；
 - 官方 `task.toml` 已声明 Docker Hub镜像时，先逐字节校验 manifest/config digest，再按
-  NexMLTask同一合同用固定 Skopeo执行 `copy --all --preserve-digests`，从 DaoCloud Docker Hub
-  mirror复制到内部 Harbor；源和目标保持相同digest，GPU节点只拉内部 `@sha256`。未声明镜像时
-  才由 CPU Kaniko Job原样构建对应 Dockerfile；
+  NexMLTask同一合同用固定 Skopeo执行 `copy --all --preserve-digests`，通过 CPU egress从官方
+  Docker Hub复制到内部 Harbor；源和目标保持相同digest，GPU节点只拉内部 `@sha256`。未声明
+  镜像时才由 CPU Kaniko Job原样构建对应 Dockerfile。若经实测可达，也可用
+  `HARBOR_BASESTREAM_DOCKER_HUB_MIRROR`指定镜像源；
 - Pod不覆盖镜像 `ENTRYPOINT`，并在启动后校验 H100型号、可用磁盘和 service-account token。
 
 GPU并发默认是 1，可用 `HARBOR_NEXAU_BASESTREAM_CONCURRENCY` 调整。`jax-speedrun-gpu` 会原样

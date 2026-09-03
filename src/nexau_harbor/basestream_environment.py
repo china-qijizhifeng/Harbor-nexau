@@ -448,7 +448,7 @@ class BasestreamEnvironment(BaseEnvironment):
             docker_hub_mirror=(
                 docker_hub_mirror
                 if docker_hub_mirror is not None
-                else _env("HARBOR_BASESTREAM_DOCKER_HUB_MIRROR", "m.daocloud.io/docker.io")
+                else _env("HARBOR_BASESTREAM_DOCKER_HUB_MIRROR", "")
             ).rstrip("/"),
             egress_proxy_url=egress_proxy_url
             or os.environ.get("HARBOR_BASESTREAM_EGRESS_PROXY_URL"),
