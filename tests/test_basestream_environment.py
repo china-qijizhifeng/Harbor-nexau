@@ -190,6 +190,11 @@ def test_build_manifest_is_cpu_only_and_mounts_exact_context(tmp_path: Path) -> 
     assert mounts["/workspace"]["readOnly"] is True
     assert mounts["/kaniko/.docker/config.json"]["readOnly"] is True
     assert pod_spec["automountServiceAccountToken"] is False
+    build_env = {item["name"]: item["value"] for item in container["env"]}
+    assert build_env["HTTPS_PROXY"] == (
+        "http://svc-egress.bg-agentic-coding.svc.cluster.local:7890"
+    )
+    assert "harbor.local.clusters" in build_env["NO_PROXY"].split(",")
 
 
 def test_image_metadata_verifies_digest_entrypoint_user_and_workdir(
@@ -347,7 +352,7 @@ def test_configured_prebuilt_image_writes_verified_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     digest = "sha256:" + "a" * 64
-    image = f"harborframework/terminal-bench:task@{digest}"
+    image = f"harbor.local.clusters/project/task@{digest}"
     environment = _environment(
         tmp_path,
         config=EnvironmentConfig(
@@ -373,6 +378,88 @@ def test_configured_prebuilt_image_writes_verified_receipt(
     assert receipt["source"] == "prebuilt"
     assert receipt["digest"] == digest
     assert receipt["success"] is True
+
+
+def test_docker_hub_prebuilt_image_is_mirrored_before_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    digest = "sha256:" + "a" * 64
+    source = f"harborframework/terminal-bench:task@{digest}"
+    internal = "harbor.local.clusters/project/task@sha256:" + "b" * 64
+    environment = _environment(
+        tmp_path,
+        config=EnvironmentConfig(
+            cpus=4,
+            memory_mb=16384,
+            storage_mb=30720,
+            gpus=1,
+            gpu_types=["H100"],
+            docker_image=source,
+        ),
+    )
+    source_metadata = {
+        "image": source,
+        "entrypoint": ["/opt/nvidia/nvidia_entrypoint.sh"],
+        "user": "agent",
+        "workdir": "/app",
+    }
+    internal_metadata = {**source_metadata, "image": internal}
+    monkeypatch.setattr(environment, "_image_metadata", lambda value: source_metadata)
+    captured: list[tuple[Path, str, dict[str, object]]] = []
+
+    def mirror(image_dir: Path, source_ref: str, metadata: dict[str, object]):
+        captured.append((image_dir, source_ref, metadata))
+        return internal, internal_metadata
+
+    monkeypatch.setattr(environment, "_mirror_prebuilt_image", mirror)
+
+    actual_image, actual_metadata = environment._ensure_image_sync(force_build=False)
+
+    assert actual_image == internal
+    assert actual_metadata == internal_metadata
+    assert captured[0][1:] == (source, source_metadata)
+
+
+def test_prebuilt_mirror_uses_minimal_digest_pinned_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    digest = "sha256:" + "a" * 64
+    source = f"harborframework/terminal-bench:task@{digest}"
+    source_metadata = {
+        "image": source,
+        "entrypoint": ["/opt/nvidia/nvidia_entrypoint.sh"],
+        "user": "agent",
+        "workdir": "/app",
+    }
+    internal = "harbor.local.clusters/project/task@sha256:" + "b" * 64
+    captured: dict[str, object] = {}
+
+    def run_build(**kwargs):
+        captured.update(kwargs)
+        return internal, {**source_metadata, "image": internal}
+
+    monkeypatch.setattr(environment, "_run_kaniko_build", run_build)
+    image_dir = environment.settings.control_root / "images" / environment.environment_id
+    image_dir.mkdir(parents=True)
+
+    actual_image, _ = environment._mirror_prebuilt_image(
+        image_dir,
+        source,
+        source_metadata,
+    )
+
+    assert actual_image == internal
+    context = captured["context_dir"]
+    assert isinstance(context, Path)
+    assert (context / "Dockerfile").read_text(encoding="utf-8") == f"FROM {source}\n"
+    assert captured["receipt_source"] == "prebuilt-mirror"
+    assert captured["expected_metadata"] == source_metadata
+    assert captured["receipt_extra"] == {
+        "source_ref": source,
+        "source_digest": digest,
+        "source_metadata": source_metadata,
+    }
 
 
 def test_image_metadata_rejects_application_entrypoint(

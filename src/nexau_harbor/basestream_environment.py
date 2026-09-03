@@ -216,7 +216,7 @@ def _parse_registry_reference(image_ref: str) -> _RegistryReference:
     last = repository_parts[-1]
     if ":" in last:
         last, tag = last.rsplit(":", 1)
-        if not last or not tag:
+        if not last or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
             raise BasestreamError(f"invalid image tag in reference: {image_ref}")
         repository_parts[-1] = last
     repository = "/".join(repository_parts)
@@ -935,6 +935,7 @@ class BasestreamEnvironment(BaseEnvironment):
         timeout_sec: int,
     ) -> dict[str, Any]:
         registry = self.settings.registry_repository.partition("/")[0]
+        build_environment = self._proxy_environment()
         container = {
             "name": "kaniko",
             "image": self.settings.kaniko_image,
@@ -956,6 +957,9 @@ class BasestreamEnvironment(BaseEnvironment):
                 "--push-retry=5",
                 f"--skip-tls-verify-registry={registry}",
                 "--verbosity=info",
+            ],
+            "env": [
+                {"name": key, "value": value} for key, value in sorted(build_environment.items())
             ],
             "resources": {
                 "limits": {
@@ -1054,21 +1058,50 @@ class BasestreamEnvironment(BaseEnvironment):
             },
         }
 
-    def _build_image(self, image_dir: Path) -> tuple[str, dict[str, Any]]:
-        context_dir = self._stage_build_context(image_dir)
+    def _stage_mirror_context(self, image_dir: Path, source_ref: str) -> Path:
+        _parse_registry_reference(source_ref)
+        context_dir = image_dir / "mirror-context"
+        marker = image_dir / "mirror-context.json"
+        expected = {"source_ref": source_ref}
+        dockerfile_content = f"FROM {source_ref}\n"
+        dockerfile = context_dir / "Dockerfile"
+        if context_dir.is_dir() and marker.is_file() and dockerfile.is_file():
+            try:
+                if (
+                    json.loads(marker.read_text(encoding="utf-8")) == expected
+                    and dockerfile.read_text(encoding="utf-8") == dockerfile_content
+                ):
+                    return context_dir
+            except (OSError, json.JSONDecodeError):
+                pass
+        temporary = image_dir / f"mirror-context-{uuid.uuid4().hex}.tmp"
+        temporary.mkdir(mode=0o700, parents=True)
+        (temporary / "Dockerfile").write_text(dockerfile_content, encoding="utf-8")
+        if context_dir.exists():
+            shutil.rmtree(context_dir)
+        temporary.replace(context_dir)
+        _atomic_json(marker, expected)
+        return context_dir
+
+    def _run_kaniko_build(
+        self,
+        *,
+        image_dir: Path,
+        context_dir: Path,
+        destination: str,
+        timeout_sec: int,
+        alias_kind: str,
+        receipt_source: str,
+        receipt_extra: dict[str, Any] | None = None,
+        expected_metadata: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         attempt_dir = image_dir / "builds" / uuid.uuid4().hex
         attempt_dir.mkdir(mode=0o700, parents=True)
         image_name = _slug(self.environment_name, limit=50)
-        destination = (
-            f"{self.settings.registry_repository.rstrip('/')}/{image_name}:"
-            f"env-{self.environment_id[:24]}"
-        )
         alias = _slug(
-            f"hb-build-{image_name}-{uuid.uuid4().hex[:8]}",
+            f"hb-{alias_kind}-{image_name}-{uuid.uuid4().hex[:8]}",
             limit=63,
         )
-        task_timeout = int(getattr(self.task_env_config, "build_timeout_sec", 0) or 0)
-        timeout_sec = max(self.settings.build_timeout_sec, task_timeout)
         manifest = self._build_job_manifest(
             alias=alias,
             context_dir=context_dir,
@@ -1101,6 +1134,17 @@ class BasestreamEnvironment(BaseEnvironment):
                 )
             immutable = f"{destination.rsplit(':', 1)[0]}@{digest}"
             metadata = self._image_metadata(immutable)
+            if expected_metadata is not None:
+                mismatches = {
+                    key: {"expected": expected_metadata.get(key), "actual": metadata.get(key)}
+                    for key in ("entrypoint", "user", "workdir")
+                    if metadata.get(key) != expected_metadata.get(key)
+                }
+                if mismatches:
+                    raise BasestreamError(
+                        "mirrored image changed runtime config: "
+                        + json.dumps(mismatches, sort_keys=True)
+                    )
             receipt = {
                 "schema_version": "harbor-basestream-image-v1",
                 "environment_id": self.environment_id,
@@ -1109,25 +1153,29 @@ class BasestreamEnvironment(BaseEnvironment):
                 "digest": digest,
                 "job_name": job_name,
                 "metadata": metadata,
-                "source": "kaniko",
+                "source": receipt_source,
                 "success": True,
+                **(receipt_extra or {}),
             }
             _atomic_json(attempt_dir / "receipt.json", receipt)
             _atomic_json(image_dir / "receipt.json", receipt)
             return immutable, metadata
         except BaseException as exc:
-            _atomic_json(
-                attempt_dir / "receipt.json",
-                {
-                    "schema_version": "harbor-basestream-image-v1",
-                    "environment_id": self.environment_id,
-                    "requested_image": destination,
-                    "job_name": job_name or None,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                    "success": False,
-                },
-            )
+            with contextlib.suppress(Exception):
+                _atomic_json(
+                    attempt_dir / "receipt.json",
+                    {
+                        "schema_version": "harbor-basestream-image-v1",
+                        "environment_id": self.environment_id,
+                        "requested_image": destination,
+                        "job_name": job_name or None,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "source": receipt_source,
+                        "success": False,
+                        **(receipt_extra or {}),
+                    },
+                )
             raise
         finally:
             if not job_name:
@@ -1141,7 +1189,61 @@ class BasestreamEnvironment(BaseEnvironment):
                         f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
                     )
 
-    def _reuse_image_receipt(self, receipt_path: Path) -> tuple[str, dict[str, Any]] | None:
+    def _build_image(self, image_dir: Path) -> tuple[str, dict[str, Any]]:
+        context_dir = self._stage_build_context(image_dir)
+        image_name = _slug(self.environment_name, limit=50)
+        destination = (
+            f"{self.settings.registry_repository.rstrip('/')}/{image_name}:"
+            f"env-{self.environment_id[:24]}"
+        )
+        task_timeout = int(getattr(self.task_env_config, "build_timeout_sec", 0) or 0)
+        timeout_sec = max(self.settings.build_timeout_sec, task_timeout)
+        return self._run_kaniko_build(
+            image_dir=image_dir,
+            context_dir=context_dir,
+            destination=destination,
+            timeout_sec=timeout_sec,
+            alias_kind="build",
+            receipt_source="kaniko",
+        )
+
+    def _mirror_prebuilt_image(
+        self,
+        image_dir: Path,
+        source_ref: str,
+        source_metadata: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        context_dir = self._stage_mirror_context(image_dir, source_ref)
+        image_name = _slug(self.environment_name, limit=50)
+        source_digest = _parse_registry_reference(source_ref).digest
+        destination = (
+            f"{self.settings.registry_repository.rstrip('/')}/{image_name}:"
+            f"mirror-{source_digest.removeprefix('sha256:')[:24]}"
+        )
+        task_timeout = int(getattr(self.task_env_config, "build_timeout_sec", 0) or 0)
+        timeout_sec = max(self.settings.build_timeout_sec, task_timeout)
+        return self._run_kaniko_build(
+            image_dir=image_dir,
+            context_dir=context_dir,
+            destination=destination,
+            timeout_sec=timeout_sec,
+            alias_kind="mirror",
+            receipt_source="prebuilt-mirror",
+            receipt_extra={
+                "source_ref": source_ref,
+                "source_digest": source_digest,
+                "source_metadata": source_metadata,
+            },
+            expected_metadata=source_metadata,
+        )
+
+    def _reuse_image_receipt(
+        self,
+        receipt_path: Path,
+        *,
+        required_source: str | None = None,
+        source_ref: str | None = None,
+    ) -> tuple[str, dict[str, Any]] | None:
         if not receipt_path.is_file() or receipt_path.is_symlink():
             return None
         try:
@@ -1153,6 +1255,8 @@ class BasestreamEnvironment(BaseEnvironment):
             or receipt.get("schema_version") != "harbor-basestream-image-v1"
             or receipt.get("environment_id") != self.environment_id
             or receipt.get("success") is not True
+            or (required_source is not None and receipt.get("source") != required_source)
+            or (source_ref is not None and receipt.get("source_ref") != source_ref)
         ):
             return None
         image_ref = receipt.get("immutable_ref")
@@ -1163,12 +1267,23 @@ class BasestreamEnvironment(BaseEnvironment):
 
     def _ensure_image_sync(self, force_build: bool) -> tuple[str, dict[str, Any]]:
         configured = self.task_env_config.docker_image
+        image_dir = self.settings.control_root / "images" / self.environment_id
+        image_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if configured:
             image_ref = str(configured)
             metadata = self._image_metadata(image_ref)
-            image_dir = self.settings.control_root / "images" / self.environment_id
-            image_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            reference = _parse_registry_reference(image_ref)
             with _file_lock(image_dir / ".lock"):
+                if reference.registry in {"docker.io", "index.docker.io"}:
+                    if not force_build:
+                        reused = self._reuse_image_receipt(
+                            image_dir / "receipt.json",
+                            required_source="prebuilt-mirror",
+                            source_ref=image_ref,
+                        )
+                        if reused is not None:
+                            return reused
+                    return self._mirror_prebuilt_image(image_dir, image_ref, metadata)
                 receipt = {
                     "schema_version": "harbor-basestream-image-v1",
                     "environment_id": self.environment_id,
@@ -1182,8 +1297,6 @@ class BasestreamEnvironment(BaseEnvironment):
                 }
                 _atomic_json(image_dir / "receipt.json", receipt)
             return image_ref, metadata
-        image_dir = self.settings.control_root / "images" / self.environment_id
-        image_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         with _file_lock(image_dir / ".lock"):
             if not force_build:
                 reused = self._reuse_image_receipt(image_dir / "receipt.json")
@@ -1220,21 +1333,27 @@ class BasestreamEnvironment(BaseEnvironment):
             raise BasestreamError(f"unsafe Basestream egress proxy URL: {value!r}")
         return value.rstrip("/")
 
+    def _proxy_environment(self) -> dict[str, str]:
+        proxy = self._egress_proxy_url()
+        registry = self.settings.registry_repository.partition("/")[0]
+        registry_host = registry.rsplit(":", 1)[0]
+        no_proxy = (
+            "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,"
+            f"192.168.0.0/16,.svc,.cluster.local,{registry_host}"
+        )
+        return {
+            **{name: proxy for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")},
+            "no_proxy": no_proxy,
+            "NO_PROXY": no_proxy,
+        }
+
     def _network_environment(self) -> dict[str, str]:
         names = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
         if self.network_policy.network_mode == NetworkMode.NO_NETWORK:
             return {name: "" for name in names}
         if self.network_policy.network_mode != NetworkMode.PUBLIC:
             raise BasestreamError("BasestreamEnvironment does not support network allowlists")
-        proxy = self._egress_proxy_url()
-        no_proxy = (
-            "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.svc,.cluster.local"
-        )
-        return {
-            **{name: proxy for name in names},
-            "no_proxy": no_proxy,
-            "NO_PROXY": no_proxy,
-        }
+        return self._proxy_environment()
 
     def _runtime_mounts(self) -> list[dict[str, Any]]:
         mounts: list[dict[str, Any]] = [

@@ -45,8 +45,8 @@ H100与 B300，任务不能只申请通用 `nvidia.com/gpu` 后假设型号正�
 ```text
 Harbor Trial on basestream-cpu
   ├─ Agent BasestreamEnvironment
-  │   ├─ verify official prebuilt digest, or stage environment/ to GPFS
-  │   ├─ when needed: CPU Kaniko Volcano Job -> immutable task image
+  │   ├─ verify official prebuilt digest, then mirror through CPU egress
+  │   ├─ CPU Kaniko Volcano Job -> immutable internal task image
   │   ├─ GPU Volcano Job -> long-lived main container
   │   ├─ kubectl exec/upload/download
   │   └─ collect declared artifacts, then delete Job
@@ -65,11 +65,15 @@ Harbor自身已经在 separate verifier模式下创建第二个 environment、�
 
 当 task.toml提供 `docker_image@sha256` 时，provider必须识别无显式 registry前缀的 Docker Hub
 引用，通过官方匿名 Bearer token端点读取 manifest/config，逐字节重算两层 digest，并限制 token
-realm为 `auth.docker.io`；内部 Harbor引用仍使用既有 Basic auth。只有任务未声明镜像时，环境内容
-hash才决定内部 Harbor tag，实际运行只使用 Kaniko写回的 `@sha256` 引用。构建上下文与输出目录
-位于 provider控制的 GPFS根目录，Kaniko只读挂载当前 context、可写挂载当前 output和只读挂载
-Harbor auth。并发构建同一 hash时使用 host file lock；已有 receipt只有在 task hash、镜像引用和
-registry manifest全部一致时才复用。
+realm为 `auth.docker.io`；内部 Harbor引用仍使用既有 Basic auth。Basestream GPU节点的 containerd
+不使用Pod内 proxy环境，不能直接拉 Docker Hub。验证完成后，provider生成只含 digest-pinned
+`FROM` 的最小上下文，由 CPU Kaniko Job通过既有 egress service拉取并零改动镜像化到内部 Harbor；
+再次验证 ENTRYPOINT、USER与WORKDIR未改变后，GPU Job只使用内部 `@sha256`。
+
+任务未声明镜像时，环境内容 hash决定内部 Harbor tag，同样只运行 Kaniko写回的 `@sha256` 引用。
+构建上下文与输出目录位于 provider控制的 GPFS根目录，Kaniko只读挂载当前 context、可写挂载当前
+output和只读挂载 Harbor auth。并发构建同一 hash时使用 host file lock；已有 receipt只有在 task
+hash、源镜像引用和 registry manifest全部一致时才复用。
 
 镜像 config用于记录原始 `User`。运行 Pod以 root启动以支持 Harbor installed-agent的可信安装
 步骤；普通 Agent命令在未显式指定 user时通过 `su`降到镜像原始用户。若镜像用户非 root但
