@@ -2,7 +2,7 @@
 
 ## 状态
 
-实现中。
+已实现，真实集群验证中。
 
 ## 背景
 
@@ -20,7 +20,8 @@ H100与 B300，任务不能只申请通用 `nvidia.com/gpu` 后假设型号正�
 
 - 新增可通过导入路径选择的 `BasestreamEnvironment`；
 - Harbor控制器直接运行在 `basestream-cpu`；
-- 原样构建任务的 `environment/Dockerfile` 或 `tests/Dockerfile`，不修改 TB4任务；
+- 优先校验并使用任务声明的官方不可变镜像；未声明镜像时原样构建
+  `environment/Dockerfile` 或 `tests/Dockerfile`，不修改 TB4任务；
 - Agent与 separate verifier各使用独立的 Volcano GPU Job；
 - 严格申请 task.toml中的 CPU、内存、GPU与 ephemeral storage；
 - H100调度同时使用节点排除规则和运行时型号校验；
@@ -44,8 +45,8 @@ H100与 B300，任务不能只申请通用 `nvidia.com/gpu` 后假设型号正�
 ```text
 Harbor Trial on basestream-cpu
   ├─ Agent BasestreamEnvironment
-  │   ├─ stage environment/ to an exact GPFS build context
-  │   ├─ CPU Kaniko Volcano Job -> immutable task image
+  │   ├─ verify official prebuilt digest, or stage environment/ to GPFS
+  │   ├─ when needed: CPU Kaniko Volcano Job -> immutable task image
   │   ├─ GPU Volcano Job -> long-lived main container
   │   ├─ kubectl exec/upload/download
   │   └─ collect declared artifacts, then delete Job
@@ -62,10 +63,13 @@ Harbor自身已经在 separate verifier模式下创建第二个 environment、�
 
 ## 镜像构建
 
-环境内容 hash决定内部 Harbor tag；实际运行只使用 Kaniko写回的 `@sha256` 引用。构建上下文
-与输出目录位于 provider控制的 GPFS根目录，Kaniko只读挂载当前 context、可写挂载当前 output
-和只读挂载 Harbor auth。并发构建同一 hash时使用 host file lock；已有 receipt只有在 task hash、
-镜像引用和 registry manifest全部一致时才复用。
+当 task.toml提供 `docker_image@sha256` 时，provider必须识别无显式 registry前缀的 Docker Hub
+引用，通过官方匿名 Bearer token端点读取 manifest/config，逐字节重算两层 digest，并限制 token
+realm为 `auth.docker.io`；内部 Harbor引用仍使用既有 Basic auth。只有任务未声明镜像时，环境内容
+hash才决定内部 Harbor tag，实际运行只使用 Kaniko写回的 `@sha256` 引用。构建上下文与输出目录
+位于 provider控制的 GPFS根目录，Kaniko只读挂载当前 context、可写挂载当前 output和只读挂载
+Harbor auth。并发构建同一 hash时使用 host file lock；已有 receipt只有在 task hash、镜像引用和
+registry manifest全部一致时才复用。
 
 镜像 config用于记录原始 `User`。运行 Pod以 root启动以支持 Harbor installed-agent的可信安装
 步骤；普通 Agent命令在未显式指定 user时通过 `su`降到镜像原始用户。若镜像用户非 root但

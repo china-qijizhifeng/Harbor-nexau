@@ -19,6 +19,7 @@ from nexau_harbor.basestream_environment import (
     BasestreamEnvironment,
     BasestreamError,
     _NorthJobClient,
+    _parse_registry_reference,
 )
 
 
@@ -225,6 +226,108 @@ def test_image_metadata_verifies_digest_entrypoint_user_and_workdir(
     assert metadata["user"] == "agent"
     assert metadata["workdir"] == "/app"
     assert metadata["config_digest"] == config_digest
+
+
+def test_parse_official_docker_hub_reference_removes_tag_from_api_path() -> None:
+    digest = "sha256:" + "a" * 64
+
+    reference = _parse_registry_reference(
+        f"harborframework/terminal-bench:fp8-environment@{digest}"
+    )
+
+    assert reference.registry == "docker.io"
+    assert reference.api_registry == "registry-1.docker.io"
+    assert reference.repository == "harborframework/terminal-bench"
+    assert reference.digest == digest
+
+
+def test_image_metadata_verifies_official_docker_hub_image_without_private_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    config = {
+        "config": {
+            "Entrypoint": ["/opt/nvidia/nvidia_entrypoint.sh"],
+            "User": "agent",
+            "WorkingDir": "/app",
+        }
+    }
+    config_bytes = json.dumps(config, separators=(",", ":")).encode()
+    config_digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+    manifest_bytes = json.dumps(
+        {"schemaVersion": 2, "config": {"digest": config_digest}},
+        separators=(",", ":"),
+    ).encode()
+    digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+    requested_paths: list[str] = []
+
+    def request(reference, path: str, *, accept: str | None = None):
+        del accept
+        assert reference.repository == "harborframework/terminal-bench"
+        requested_paths.append(path)
+        if path.startswith("manifests/"):
+            return manifest_bytes, {"Docker-Content-Digest": digest}
+        return config_bytes, {}
+
+    monkeypatch.setattr(environment, "_docker_hub_request", request)
+    monkeypatch.setattr(
+        environment,
+        "_registry_auth",
+        lambda registry: pytest.fail(f"private auth used for public registry {registry}"),
+    )
+
+    metadata = environment._image_metadata(
+        f"harborframework/terminal-bench:fp8-environment@{digest}"
+    )
+
+    assert requested_paths == [f"manifests/{digest}", f"blobs/{config_digest}"]
+    assert metadata["user"] == "agent"
+    assert metadata["entrypoint"] == ["/opt/nvidia/nvidia_entrypoint.sh"]
+
+
+def test_docker_hub_auth_challenge_is_restricted_to_official_token_service() -> None:
+    parameters = BasestreamEnvironment._docker_hub_auth_parameters(
+        'Bearer realm="https://auth.docker.io/token",service="registry.docker.io",'
+        'scope="repository:harborframework/terminal-bench:pull"'
+    )
+    assert parameters["service"] == "registry.docker.io"
+
+    with pytest.raises(BasestreamError, match="unsafe token realm"):
+        BasestreamEnvironment._docker_hub_auth_parameters(
+            'Bearer realm="https://attacker.example/token",service="registry.docker.io"'
+        )
+
+
+def test_configured_prebuilt_image_writes_verified_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    digest = "sha256:" + "a" * 64
+    image = f"harborframework/terminal-bench:task@{digest}"
+    environment = _environment(
+        tmp_path,
+        config=EnvironmentConfig(
+            cpus=4,
+            memory_mb=16384,
+            storage_mb=30720,
+            gpus=1,
+            gpu_types=["H100"],
+            docker_image=image,
+        ),
+    )
+    metadata = {"image": image, "entrypoint": [], "user": "root", "workdir": "/app"}
+    monkeypatch.setattr(environment, "_image_metadata", lambda value: metadata)
+
+    actual_image, actual_metadata = environment._ensure_image_sync(force_build=False)
+
+    assert actual_image == image
+    assert actual_metadata == metadata
+    receipt_path = (
+        environment.settings.control_root / "images" / environment.environment_id / "receipt.json"
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["source"] == "prebuilt"
+    assert receipt["digest"] == digest
+    assert receipt["success"] is True
 
 
 def test_image_metadata_rejects_application_entrypoint(

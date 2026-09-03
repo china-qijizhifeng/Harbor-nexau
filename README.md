@@ -64,8 +64,8 @@ scripts/run_tb4.sh \
 - 请求 H100的单容器题进入
   `nexau_harbor.basestream_environment:BasestreamEnvironment`；
 - GPU Agent和 `environment_mode = "separate"` 的 verifier分别创建独立 Volcano Job；
-- 官方 `environment/Dockerfile` 与 `tests/Dockerfile` 由 CPU Kaniko Job原样构建，运行时使用
-  registry返回的不可变 `@sha256`；
+- 官方 `task.toml` 已声明镜像时，逐字节校验 Docker Hub manifest/config digest后直接使用该
+  `@sha256`；未声明镜像时才由 CPU Kaniko Job原样构建对应 Dockerfile并使用内部 Harbor digest；
 - Pod不覆盖镜像 `ENTRYPOINT`，并在启动后校验 H100型号、可用磁盘和 service-account token。
 
 GPU并发默认是 1，可用 `HARBOR_NEXAU_BASESTREAM_CONCURRENCY` 调整。`jax-speedrun-gpu` 会原样

@@ -187,6 +187,54 @@ class BasestreamSettings:
         return resolved.relative_to(root).as_posix()
 
 
+@dataclass(frozen=True)
+class _RegistryReference:
+    registry: str
+    api_registry: str
+    repository: str
+    digest: str
+
+
+def _parse_registry_reference(image_ref: str) -> _RegistryReference:
+    if "@" not in image_ref:
+        raise BasestreamError(f"runtime image is not immutable: {image_ref}")
+    name, digest = image_ref.rsplit("@", 1)
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise BasestreamError(f"runtime image has an invalid digest: {image_ref}")
+    components = name.split("/")
+    first = components[0]
+    if "." in first or ":" in first or first == "localhost":
+        registry = first.lower()
+        repository_parts = components[1:]
+    else:
+        registry = "docker.io"
+        repository_parts = components
+    if not repository_parts:
+        raise BasestreamError(f"invalid image reference: {image_ref}")
+    if len(repository_parts) == 1:
+        repository_parts.insert(0, "library")
+    last = repository_parts[-1]
+    if ":" in last:
+        last, tag = last.rsplit(":", 1)
+        if not last or not tag:
+            raise BasestreamError(f"invalid image tag in reference: {image_ref}")
+        repository_parts[-1] = last
+    repository = "/".join(repository_parts)
+    if not re.fullmatch(
+        r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+", repository
+    ):
+        raise BasestreamError(f"invalid image repository: {image_ref}")
+    api_registry = (
+        "registry-1.docker.io" if registry in {"docker.io", "index.docker.io"} else registry
+    )
+    return _RegistryReference(
+        registry=registry,
+        api_registry=api_registry,
+        repository=repository,
+        digest=digest,
+    )
+
+
 class _NorthJobClient:
     def __init__(self, settings: BasestreamSettings):
         self.settings = settings
@@ -697,28 +745,118 @@ class BasestreamEnvironment(BaseEnvironment):
         except (urllib.error.HTTPError, urllib.error.URLError) as exc:
             raise BasestreamError(f"registry request failed for {url}: {exc}") from exc
 
-    def _image_metadata(self, image_ref: str) -> dict[str, Any]:
-        if "@sha256:" not in image_ref:
-            raise BasestreamError(f"runtime image is not immutable: {image_ref}")
-        repository, expected_digest = image_ref.rsplit("@", 1)
-        registry, separator, repository_path = repository.partition("/")
-        if not separator or not repository_path:
-            raise BasestreamError(f"invalid image reference: {image_ref}")
-        auth = self._registry_auth(registry)
-        base = f"https://{registry}/v2/{repository_path}"
-        manifest_bytes, headers = self._registry_request(
-            f"{base}/manifests/{expected_digest}",
-            auth=auth,
-            accept=(
-                "application/vnd.oci.image.manifest.v1+json,"
-                "application/vnd.docker.distribution.manifest.v2+json"
-            ),
+    @staticmethod
+    def _docker_hub_auth_parameters(challenge: str) -> dict[str, str]:
+        scheme, separator, raw_parameters = challenge.partition(" ")
+        if not separator or scheme.lower() != "bearer":
+            raise BasestreamError("Docker Hub returned an unsupported auth challenge")
+        try:
+            parameters = urllib.request.parse_keqv_list(
+                urllib.request.parse_http_list(raw_parameters)
+            )
+        except (TypeError, ValueError) as exc:
+            raise BasestreamError("Docker Hub returned an invalid auth challenge") from exc
+        realm = parameters.get("realm")
+        parsed_realm = urllib.parse.urlsplit(realm or "")
+        if (
+            parsed_realm.scheme != "https"
+            or parsed_realm.hostname != "auth.docker.io"
+            or parsed_realm.username is not None
+            or parsed_realm.password is not None
+        ):
+            raise BasestreamError(f"Docker Hub returned an unsafe token realm: {realm!r}")
+        return {str(key): str(value) for key, value in parameters.items()}
+
+    @staticmethod
+    def _verified_https_request(
+        request: urllib.request.Request,
+        *,
+        timeout: int = 30,
+    ) -> tuple[bytes, Any]:
+        try:
+            with urllib.request.urlopen(
+                request,
+                context=ssl.create_default_context(),
+                timeout=timeout,
+            ) as response:
+                return response.read(), response.headers
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            raise BasestreamError(
+                f"public registry request failed for {request.full_url}: {exc}"
+            ) from exc
+
+    def _docker_hub_request(
+        self,
+        reference: _RegistryReference,
+        path: str,
+        *,
+        accept: str | None = None,
+    ) -> tuple[bytes, Any]:
+        url = f"https://{reference.api_registry}/v2/{reference.repository}/{path}"
+        headers = {"Accept": accept} if accept else {}
+        anonymous_request = urllib.request.Request(url, headers=headers)
+        try:
+            return self._verified_https_request(anonymous_request)
+        except BasestreamError as wrapped:
+            cause = wrapped.__cause__
+            if not isinstance(cause, urllib.error.HTTPError) or cause.code != 401:
+                raise
+            challenge = cause.headers.get("WWW-Authenticate", "")
+
+        parameters = self._docker_hub_auth_parameters(challenge)
+        query = {
+            key: value for key, value in parameters.items() if key in {"service", "scope"} and value
+        }
+        expected_scope = f"repository:{reference.repository}:pull"
+        if query.get("scope") not in {None, expected_scope}:
+            raise BasestreamError(
+                f"Docker Hub returned an unexpected token scope: {query.get('scope')!r}"
+            )
+        query["scope"] = expected_scope
+        realm = parameters["realm"]
+        separator = "&" if urllib.parse.urlsplit(realm).query else "?"
+        token_request = urllib.request.Request(f"{realm}{separator}{urllib.parse.urlencode(query)}")
+        token_bytes, _ = self._verified_https_request(token_request)
+        try:
+            token_payload = json.loads(token_bytes)
+            token = token_payload.get("token") or token_payload.get("access_token")
+        except (json.JSONDecodeError, AttributeError) as exc:
+            raise BasestreamError("Docker Hub token response is invalid") from exc
+        if not isinstance(token, str) or not token:
+            raise BasestreamError("Docker Hub token response contains no token")
+        authenticated_request = urllib.request.Request(
+            url,
+            headers={**headers, "Authorization": f"Bearer {token}"},
         )
+        return self._verified_https_request(authenticated_request)
+
+    def _image_metadata(self, image_ref: str) -> dict[str, Any]:
+        reference = _parse_registry_reference(image_ref)
+        internal_registry = self.settings.registry_repository.partition("/")[0].lower()
+        accept = (
+            "application/vnd.oci.image.manifest.v1+json,"
+            "application/vnd.docker.distribution.manifest.v2+json"
+        )
+        if reference.registry in {"docker.io", "index.docker.io"}:
+
+            def request(path: str, accept: str | None = None) -> tuple[bytes, Any]:
+                return self._docker_hub_request(reference, path, accept=accept)
+
+        elif reference.registry == internal_registry:
+            auth = self._registry_auth(reference.registry)
+            base = f"https://{reference.api_registry}/v2/{reference.repository}"
+
+            def request(path: str, accept: str | None = None) -> tuple[bytes, Any]:
+                return self._registry_request(f"{base}/{path}", auth=auth, accept=accept)
+
+        else:
+            raise BasestreamError(f"runtime image registry is not approved: {reference.registry}")
+        manifest_bytes, headers = request(f"manifests/{reference.digest}", accept=accept)
         calculated = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
         header_digest = headers.get("Docker-Content-Digest")
-        if calculated != expected_digest or header_digest != expected_digest:
+        if calculated != reference.digest or header_digest != reference.digest:
             raise BasestreamError(
-                f"registry manifest digest mismatch: expected={expected_digest} "
+                f"registry manifest digest mismatch: expected={reference.digest} "
                 f"header={header_digest} calculated={calculated}"
             )
         try:
@@ -726,7 +864,15 @@ class BasestreamEnvironment(BaseEnvironment):
             config_digest = manifest["config"]["digest"]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             raise BasestreamError("registry manifest has no image config") from exc
-        config_bytes, _ = self._registry_request(f"{base}/blobs/{config_digest}", auth=auth)
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", config_digest):
+            raise BasestreamError("registry manifest has an invalid image config digest")
+        config_bytes, _ = request(f"blobs/{config_digest}")
+        calculated_config_digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+        if calculated_config_digest != config_digest:
+            raise BasestreamError(
+                f"registry image config digest mismatch: expected={config_digest} "
+                f"calculated={calculated_config_digest}"
+            )
         try:
             image_config = json.loads(config_bytes)
             config = image_config.get("config") or {}
@@ -962,6 +1108,7 @@ class BasestreamEnvironment(BaseEnvironment):
                 "digest": digest,
                 "job_name": job_name,
                 "metadata": metadata,
+                "source": "kaniko",
                 "success": True,
             }
             _atomic_json(attempt_dir / "receipt.json", receipt)
@@ -1016,8 +1163,24 @@ class BasestreamEnvironment(BaseEnvironment):
     def _ensure_image_sync(self, force_build: bool) -> tuple[str, dict[str, Any]]:
         configured = self.task_env_config.docker_image
         if configured:
-            metadata = self._image_metadata(str(configured))
-            return str(configured), metadata
+            image_ref = str(configured)
+            metadata = self._image_metadata(image_ref)
+            image_dir = self.settings.control_root / "images" / self.environment_id
+            image_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with _file_lock(image_dir / ".lock"):
+                receipt = {
+                    "schema_version": "harbor-basestream-image-v1",
+                    "environment_id": self.environment_id,
+                    "immutable_ref": image_ref,
+                    "requested_image": image_ref,
+                    "digest": _parse_registry_reference(image_ref).digest,
+                    "job_name": None,
+                    "metadata": metadata,
+                    "source": "prebuilt",
+                    "success": True,
+                }
+                _atomic_json(image_dir / "receipt.json", receipt)
+            return image_ref, metadata
         image_dir = self.settings.control_root / "images" / self.environment_id
         image_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         with _file_lock(image_dir / ".lock"):
