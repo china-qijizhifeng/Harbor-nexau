@@ -9,6 +9,7 @@ htmlcov/
 dist/
 build/
 jobs/
+.basestream/
 .env
 .env.*
 !.env.example

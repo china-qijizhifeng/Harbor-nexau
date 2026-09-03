@@ -5,6 +5,7 @@ import io
 import json
 import subprocess
 import tarfile
+import urllib.request
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -296,6 +297,50 @@ def test_docker_hub_auth_challenge_is_restricted_to_official_token_service() -> 
         BasestreamEnvironment._docker_hub_auth_parameters(
             'Bearer realm="https://attacker.example/token",service="registry.docker.io"'
         )
+
+
+def test_public_registry_requests_use_managed_egress_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    captured_handlers: list[tuple[object, ...]] = []
+
+    class Response:
+        headers = {"Docker-Content-Digest": "sha256:" + "a" * 64}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        @staticmethod
+        def read() -> bytes:
+            return b"body"
+
+    class Opener:
+        @staticmethod
+        def open(request: urllib.request.Request, timeout: int):
+            del request, timeout
+            return Response()
+
+    def build_opener(*handlers: object):
+        captured_handlers.append(handlers)
+        return Opener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+
+    body, _ = environment._verified_https_request(
+        urllib.request.Request("https://registry-1.docker.io/v2/")
+    )
+
+    assert body == b"body"
+    proxy_handler = captured_handlers[0][0]
+    assert isinstance(proxy_handler, urllib.request.ProxyHandler)
+    assert proxy_handler.proxies == {
+        "http": "http://svc-egress.bg-agentic-coding.svc.cluster.local:7890",
+        "https": "http://svc-egress.bg-agentic-coding.svc.cluster.local:7890",
+    }
 
 
 def test_configured_prebuilt_image_writes_verified_receipt(

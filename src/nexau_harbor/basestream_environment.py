@@ -767,18 +767,19 @@ class BasestreamEnvironment(BaseEnvironment):
             raise BasestreamError(f"Docker Hub returned an unsafe token realm: {realm!r}")
         return {str(key): str(value) for key, value in parameters.items()}
 
-    @staticmethod
     def _verified_https_request(
+        self,
         request: urllib.request.Request,
         *,
         timeout: int = 30,
     ) -> tuple[bytes, Any]:
+        proxy = self._egress_proxy_url()
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+        )
         try:
-            with urllib.request.urlopen(
-                request,
-                context=ssl.create_default_context(),
-                timeout=timeout,
-            ) as response:
+            with opener.open(request, timeout=timeout) as response:
                 return response.read(), response.headers
         except (urllib.error.HTTPError, urllib.error.URLError) as exc:
             raise BasestreamError(
