@@ -420,26 +420,81 @@ def test_docker_hub_prebuilt_image_is_mirrored_before_runtime(
     assert captured[0][1:] == (source, source_metadata)
 
 
-def test_prebuilt_mirror_uses_minimal_digest_pinned_context(
+def test_prebuilt_mirror_uses_nexmltask_skopeo_preserve_digest_contract(
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    digest = "sha256:" + "a" * 64
+    source = f"harborframework/terminal-bench:task@{digest}"
+    destination = "harbor.local.clusters/project/task:mirror"
+
+    manifest = environment._mirror_job_manifest(
+        alias="mirror-test",
+        source_ref=source,
+        destination=destination,
+        timeout_sec=600,
+    )
+
+    pod_spec = manifest["spec"]["tasks"][0]["template"]["spec"]
+    container = pod_spec["containers"][0]
+    assert container["image"].endswith(
+        "@sha256:47853bb9fb24202af9110531ebd6e43c5f97701254ca290596640290d17942f4"
+    )
+    assert container["command"] == ["/usr/bin/skopeo"]
+    assert container["args"][:3] == ["copy", "--all", "--preserve-digests"]
+    assert (
+        f"docker://m.daocloud.io/docker.io/harborframework/terminal-bench@{digest}"
+        in (container["args"])
+    )
+    assert f"docker://{destination}" in container["args"]
+    assert "nvidia.com/gpu" not in container["resources"]["requests"]
+    mounts = {item["mountPath"]: item for item in container["volumeMounts"]}
+    assert mounts["/auth/config.json"]["readOnly"] is True
+    assert pod_spec["automountServiceAccountToken"] is False
+
+
+def test_prebuilt_skopeo_mirror_preserves_source_digest_and_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     environment = _environment(tmp_path)
     digest = "sha256:" + "a" * 64
     source = f"harborframework/terminal-bench:task@{digest}"
+    internal = (
+        "harbor.local.clusters/zhangguoqiang/harbor-tb4/terminal-bench-fp8-rmsnorm-gemm@" + digest
+    )
     source_metadata = {
+        "config_digest": "sha256:" + "c" * 64,
         "image": source,
         "entrypoint": ["/opt/nvidia/nvidia_entrypoint.sh"],
         "user": "agent",
         "workdir": "/app",
     }
-    internal = "harbor.local.clusters/project/task@sha256:" + "b" * 64
-    captured: dict[str, object] = {}
-
-    def run_build(**kwargs):
-        captured.update(kwargs)
-        return internal, {**source_metadata, "image": internal}
-
-    monkeypatch.setattr(environment, "_run_kaniko_build", run_build)
+    internal_metadata = {**source_metadata, "image": internal}
+    submitted: list[dict[str, object]] = []
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        _NorthJobClient,
+        "submit",
+        lambda self, manifest: submitted.append(manifest),
+    )
+    monkeypatch.setattr(
+        _NorthJobClient,
+        "delete",
+        lambda self, job_name: deleted.append(job_name),
+    )
+    monkeypatch.setattr(
+        environment,
+        "_wait_for_job",
+        lambda alias, **kwargs: (
+            {
+                "metadata": {"name": "job-mirror"},
+                "status": {"state": {"phase": "Completed"}},
+            },
+            {"metadata": {"name": "pod-mirror"}},
+        ),
+    )
+    monkeypatch.setattr(environment, "_job_logs", lambda pod, container: "copied\n")
+    monkeypatch.setattr(environment, "_image_metadata", lambda image: internal_metadata)
     image_dir = environment.settings.control_root / "images" / environment.environment_id
     image_dir.mkdir(parents=True)
 
@@ -450,16 +505,17 @@ def test_prebuilt_mirror_uses_minimal_digest_pinned_context(
     )
 
     assert actual_image == internal
-    context = captured["context_dir"]
-    assert isinstance(context, Path)
-    assert (context / "Dockerfile").read_text(encoding="utf-8") == f"FROM {source}\n"
-    assert captured["receipt_source"] == "prebuilt-mirror"
-    assert captured["expected_metadata"] == source_metadata
-    assert captured["receipt_extra"] == {
-        "source_ref": source,
-        "source_digest": digest,
-        "source_metadata": source_metadata,
-    }
+    assert len(submitted) == 1
+    assert deleted == ["job-mirror"]
+    receipt = json.loads((image_dir / "receipt.json").read_text(encoding="utf-8"))
+    assert receipt["source"] == "prebuilt-mirror"
+    assert receipt["source_ref"] == source
+    assert receipt["copy_source_ref"] == (
+        f"m.daocloud.io/docker.io/harborframework/terminal-bench@{digest}"
+    )
+    assert receipt["digest"] == digest
+    assert receipt["immutable_ref"] == internal
+    assert receipt["metadata"] == internal_metadata
 
 
 def test_image_metadata_rejects_application_entrypoint(

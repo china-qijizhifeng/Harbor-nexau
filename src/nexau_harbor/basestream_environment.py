@@ -163,6 +163,8 @@ class BasestreamSettings:
     harbor_host_ip: str | None
     kaniko_image: str
     kaniko_cache_repository: str
+    skopeo_image: str
+    docker_hub_mirror: str
     egress_proxy_url: str | None
     egress_state_path: Path
     excluded_gpu_nodes: tuple[str, ...]
@@ -351,6 +353,8 @@ class BasestreamEnvironment(BaseEnvironment):
         harbor_host_ip: str | None = None,
         kaniko_image: str | None = None,
         kaniko_cache_repository: str | None = None,
+        skopeo_image: str | None = None,
+        docker_hub_mirror: str | None = None,
         egress_proxy_url: str | None = None,
         egress_state_path: str | Path | None = None,
         excluded_gpu_nodes: str | tuple[str, ...] | list[str] | None = None,
@@ -435,6 +439,17 @@ class BasestreamEnvironment(BaseEnvironment):
                 "HARBOR_BASESTREAM_KANIKO_CACHE_REPOSITORY",
                 "harbor.local.clusters/zhangguoqiang/harbor-tb4-cache",
             ),
+            skopeo_image=skopeo_image
+            or _env(
+                "HARBOR_BASESTREAM_SKOPEO_IMAGE",
+                "m.daocloud.io/quay.io/skopeo/stable@"
+                "sha256:47853bb9fb24202af9110531ebd6e43c5f97701254ca290596640290d17942f4",
+            ),
+            docker_hub_mirror=(
+                docker_hub_mirror
+                if docker_hub_mirror is not None
+                else _env("HARBOR_BASESTREAM_DOCKER_HUB_MIRROR", "m.daocloud.io/docker.io")
+            ).rstrip("/"),
             egress_proxy_url=egress_proxy_url
             or os.environ.get("HARBOR_BASESTREAM_EGRESS_PROXY_URL"),
             egress_state_path=Path(
@@ -494,6 +509,16 @@ class BasestreamEnvironment(BaseEnvironment):
             raise ValueError("control_root must be a child of pvc_host_root")
         if not self.settings.registry_repository or "@" in self.settings.registry_repository:
             raise ValueError("registry_repository must be a taggable repository prefix")
+        if "@sha256:" not in self.settings.skopeo_image:
+            raise ValueError("skopeo_image must be pinned by sha256 digest")
+        if self.settings.docker_hub_mirror and (
+            "://" in self.settings.docker_hub_mirror
+            or not re.fullmatch(
+                r"[A-Za-z0-9.-]+(?::[0-9]+)?(?:/[A-Za-z0-9._-]+)*",
+                self.settings.docker_hub_mirror,
+            )
+        ):
+            raise ValueError("docker_hub_mirror must be an image path without a URL scheme")
         if not re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]+)?", self.settings.api_host):
             raise ValueError("api_host must be host:port without a URL scheme")
         for value, label in (
@@ -1058,30 +1083,139 @@ class BasestreamEnvironment(BaseEnvironment):
             },
         }
 
-    def _stage_mirror_context(self, image_dir: Path, source_ref: str) -> Path:
-        _parse_registry_reference(source_ref)
-        context_dir = image_dir / "mirror-context"
-        marker = image_dir / "mirror-context.json"
-        expected = {"source_ref": source_ref}
-        dockerfile_content = f"FROM {source_ref}\n"
-        dockerfile = context_dir / "Dockerfile"
-        if context_dir.is_dir() and marker.is_file() and dockerfile.is_file():
-            try:
-                if (
-                    json.loads(marker.read_text(encoding="utf-8")) == expected
-                    and dockerfile.read_text(encoding="utf-8") == dockerfile_content
-                ):
-                    return context_dir
-            except (OSError, json.JSONDecodeError):
-                pass
-        temporary = image_dir / f"mirror-context-{uuid.uuid4().hex}.tmp"
-        temporary.mkdir(mode=0o700, parents=True)
-        (temporary / "Dockerfile").write_text(dockerfile_content, encoding="utf-8")
-        if context_dir.exists():
-            shutil.rmtree(context_dir)
-        temporary.replace(context_dir)
-        _atomic_json(marker, expected)
-        return context_dir
+    def _mirror_copy_source(self, source_ref: str) -> str:
+        reference = _parse_registry_reference(source_ref)
+        if reference.registry not in {"docker.io", "index.docker.io"}:
+            raise BasestreamError(
+                f"Skopeo mirroring currently supports Docker Hub only: {source_ref}"
+            )
+        prefix = self.settings.docker_hub_mirror or "docker.io"
+        return f"{prefix}/{reference.repository}@{reference.digest}"
+
+    def _mirror_job_manifest(
+        self,
+        *,
+        alias: str,
+        source_ref: str,
+        destination: str,
+        timeout_sec: int,
+    ) -> dict[str, Any]:
+        registry = self.settings.registry_repository.partition("/")[0]
+        container = {
+            "name": "skopeo",
+            "image": self.settings.skopeo_image,
+            "imagePullPolicy": "IfNotPresent",
+            "command": ["/usr/bin/skopeo"],
+            "args": [
+                "copy",
+                "--all",
+                "--preserve-digests",
+                "--retry-times=5",
+                "--src-tls-verify=true",
+                "--dest-tls-verify=false",
+                "--dest-authfile=/auth/config.json",
+                f"docker://{self._mirror_copy_source(source_ref)}",
+                f"docker://{destination}",
+            ],
+            "env": [
+                {"name": key, "value": value}
+                for key, value in sorted(
+                    {
+                        **self._proxy_environment(),
+                        "HOME": "/tmp",
+                        "TMPDIR": "/tmp",
+                    }.items()
+                )
+            ],
+            "resources": {
+                "limits": {
+                    "cpu": self.settings.build_cpu,
+                    "memory": self.settings.build_memory,
+                    "ephemeral-storage": self.settings.build_storage,
+                },
+                "requests": {
+                    "cpu": self.settings.build_cpu,
+                    "memory": self.settings.build_memory,
+                    "ephemeral-storage": self.settings.build_storage,
+                },
+            },
+            "securityContext": {
+                "allowPrivilegeEscalation": False,
+                "runAsGroup": 0,
+                "runAsUser": 0,
+            },
+            "volumeMounts": [
+                {
+                    "mountPath": "/auth/config.json",
+                    "name": "user-pvc",
+                    "readOnly": True,
+                    "subPath": self.settings.registry_auth_subpath,
+                },
+                {"mountPath": "/tmp", "name": "mirror-tmp"},
+                {"mountPath": "/var/tmp", "name": "mirror-var"},
+                {"mountPath": "/var/lib/containers", "name": "mirror-storage"},
+            ],
+        }
+        pod_spec: dict[str, Any] = {
+            "automountServiceAccountToken": False,
+            "containers": [container],
+            "restartPolicy": "Never",
+            "terminationGracePeriodSeconds": 30,
+            "volumes": [
+                {
+                    "name": "user-pvc",
+                    "persistentVolumeClaim": {"claimName": self.settings.pvc_name},
+                },
+                {"name": "mirror-tmp", "emptyDir": {}},
+                {"name": "mirror-var", "emptyDir": {}},
+                {"name": "mirror-storage", "emptyDir": {}},
+            ],
+        }
+        if self.settings.harbor_host_ip:
+            pod_spec["hostAliases"] = [
+                {
+                    "hostnames": [registry],
+                    "ip": self.settings.harbor_host_ip,
+                }
+            ]
+        return {
+            "apiVersion": "batch.volcano.sh/v1alpha1",
+            "kind": "Job",
+            "metadata": {
+                "name": alias,
+                "namespace": self.settings.namespace,
+                "annotations": {
+                    "JobAlias": alias,
+                    "scheduling.volcano.sh/queue-name": self.settings.queue,
+                },
+                "labels": {
+                    "app": "harbor-basestream-image-mirror",
+                    "reclaimableByVolcano": "true",
+                },
+            },
+            "spec": {
+                "activeDeadlineSeconds": timeout_sec,
+                "maxRetry": 1,
+                "minAvailable": 1,
+                "plugins": {"env": []},
+                "policies": [{"action": "RestartJob", "events": ["PodEvicted"]}],
+                "priorityClassName": self.settings.priority_class,
+                "queue": self.settings.queue,
+                "schedulerName": "volcano",
+                "tasks": [
+                    {
+                        "minAvailable": 1,
+                        "name": "mirror",
+                        "replicas": 1,
+                        "template": {
+                            "metadata": {"labels": {"app": "harbor-basestream-image-mirror"}},
+                            "spec": pod_spec,
+                        },
+                    }
+                ],
+                "ttlSecondsAfterFinished": 600,
+            },
+        }
 
     def _run_kaniko_build(
         self,
@@ -1090,16 +1224,12 @@ class BasestreamEnvironment(BaseEnvironment):
         context_dir: Path,
         destination: str,
         timeout_sec: int,
-        alias_kind: str,
-        receipt_source: str,
-        receipt_extra: dict[str, Any] | None = None,
-        expected_metadata: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         attempt_dir = image_dir / "builds" / uuid.uuid4().hex
         attempt_dir.mkdir(mode=0o700, parents=True)
         image_name = _slug(self.environment_name, limit=50)
         alias = _slug(
-            f"hb-{alias_kind}-{image_name}-{uuid.uuid4().hex[:8]}",
+            f"hb-build-{image_name}-{uuid.uuid4().hex[:8]}",
             limit=63,
         )
         manifest = self._build_job_manifest(
@@ -1134,17 +1264,6 @@ class BasestreamEnvironment(BaseEnvironment):
                 )
             immutable = f"{destination.rsplit(':', 1)[0]}@{digest}"
             metadata = self._image_metadata(immutable)
-            if expected_metadata is not None:
-                mismatches = {
-                    key: {"expected": expected_metadata.get(key), "actual": metadata.get(key)}
-                    for key in ("entrypoint", "user", "workdir")
-                    if metadata.get(key) != expected_metadata.get(key)
-                }
-                if mismatches:
-                    raise BasestreamError(
-                        "mirrored image changed runtime config: "
-                        + json.dumps(mismatches, sort_keys=True)
-                    )
             receipt = {
                 "schema_version": "harbor-basestream-image-v1",
                 "environment_id": self.environment_id,
@@ -1153,9 +1272,8 @@ class BasestreamEnvironment(BaseEnvironment):
                 "digest": digest,
                 "job_name": job_name,
                 "metadata": metadata,
-                "source": receipt_source,
+                "source": "kaniko",
                 "success": True,
-                **(receipt_extra or {}),
             }
             _atomic_json(attempt_dir / "receipt.json", receipt)
             _atomic_json(image_dir / "receipt.json", receipt)
@@ -1171,9 +1289,8 @@ class BasestreamEnvironment(BaseEnvironment):
                         "job_name": job_name or None,
                         "error_type": type(exc).__name__,
                         "error": str(exc),
-                        "source": receipt_source,
+                        "source": "kaniko",
                         "success": False,
-                        **(receipt_extra or {}),
                     },
                 )
             raise
@@ -1203,8 +1320,6 @@ class BasestreamEnvironment(BaseEnvironment):
             context_dir=context_dir,
             destination=destination,
             timeout_sec=timeout_sec,
-            alias_kind="build",
-            receipt_source="kaniko",
         )
 
     def _mirror_prebuilt_image(
@@ -1213,29 +1328,106 @@ class BasestreamEnvironment(BaseEnvironment):
         source_ref: str,
         source_metadata: dict[str, Any],
     ) -> tuple[str, dict[str, Any]]:
-        context_dir = self._stage_mirror_context(image_dir, source_ref)
+        reference = _parse_registry_reference(source_ref)
         image_name = _slug(self.environment_name, limit=50)
-        source_digest = _parse_registry_reference(source_ref).digest
         destination = (
             f"{self.settings.registry_repository.rstrip('/')}/{image_name}:"
-            f"mirror-{source_digest.removeprefix('sha256:')[:24]}"
+            f"mirror-{reference.digest.removeprefix('sha256:')[:24]}"
         )
         task_timeout = int(getattr(self.task_env_config, "build_timeout_sec", 0) or 0)
         timeout_sec = max(self.settings.build_timeout_sec, task_timeout)
-        return self._run_kaniko_build(
-            image_dir=image_dir,
-            context_dir=context_dir,
+        attempt_dir = image_dir / "mirrors" / uuid.uuid4().hex
+        attempt_dir.mkdir(mode=0o700, parents=True)
+        alias = _slug(
+            f"hb-mirror-{image_name}-{uuid.uuid4().hex[:8]}",
+            limit=63,
+        )
+        manifest = self._mirror_job_manifest(
+            alias=alias,
+            source_ref=source_ref,
             destination=destination,
             timeout_sec=timeout_sec,
-            alias_kind="mirror",
-            receipt_source="prebuilt-mirror",
-            receipt_extra={
-                "source_ref": source_ref,
-                "source_digest": source_digest,
-                "source_metadata": source_metadata,
-            },
-            expected_metadata=source_metadata,
         )
+        _atomic_json(attempt_dir / "job-manifest.json", manifest)
+        receipt_context = {
+            "source": "prebuilt-mirror",
+            "source_ref": source_ref,
+            "copy_source_ref": self._mirror_copy_source(source_ref),
+            "source_digest": reference.digest,
+            "source_metadata": source_metadata,
+            "mirror_tool_image": self.settings.skopeo_image,
+        }
+        client = _NorthJobClient(self.settings)
+        job_name = ""
+        try:
+            client.submit(manifest)
+            job, pod = self._wait_for_job(
+                alias,
+                timeout_sec=timeout_sec + 180,
+                require_terminal=True,
+            )
+            job_name = self._extract_job_name(job)
+            pod_name = str((pod or {}).get("metadata", {}).get("name") or "")
+            logs = self._job_logs(pod_name, "skopeo")
+            (attempt_dir / "job.log").write_text(logs, encoding="utf-8")
+            phase = self._job_phase(job)
+            if phase not in _SUCCESS_PHASES:
+                raise SandboxBuildFailedError(
+                    f"Basestream Skopeo mirror failed: phase={phase} logs={_tail(logs)}"
+                )
+            immutable = f"{destination.rsplit(':', 1)[0]}@{reference.digest}"
+            metadata = self._image_metadata(immutable)
+            mismatches = {
+                key: {"expected": source_metadata.get(key), "actual": metadata.get(key)}
+                for key in ("config_digest", "entrypoint", "user", "workdir")
+                if metadata.get(key) != source_metadata.get(key)
+            }
+            if mismatches:
+                raise BasestreamError(
+                    "Skopeo mirror changed image metadata: "
+                    + json.dumps(mismatches, sort_keys=True)
+                )
+            receipt = {
+                "schema_version": "harbor-basestream-image-v1",
+                "environment_id": self.environment_id,
+                "immutable_ref": immutable,
+                "requested_image": destination,
+                "digest": reference.digest,
+                "job_name": job_name,
+                "metadata": metadata,
+                "success": True,
+                **receipt_context,
+            }
+            _atomic_json(attempt_dir / "receipt.json", receipt)
+            _atomic_json(image_dir / "receipt.json", receipt)
+            return immutable, metadata
+        except BaseException as exc:
+            with contextlib.suppress(Exception):
+                _atomic_json(
+                    attempt_dir / "receipt.json",
+                    {
+                        "schema_version": "harbor-basestream-image-v1",
+                        "environment_id": self.environment_id,
+                        "requested_image": destination,
+                        "job_name": job_name or None,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "success": False,
+                        **receipt_context,
+                    },
+                )
+            raise
+        finally:
+            if not job_name:
+                job = self._find_job(alias)
+                job_name = self._extract_job_name(job) if job else ""
+            if job_name:
+                try:
+                    _NorthJobClient(self.settings).delete(job_name)
+                except Exception as exc:  # noqa: BLE001 - preserve primary mirror result
+                    (attempt_dir / "cleanup-error.log").write_text(
+                        f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+                    )
 
     def _reuse_image_receipt(
         self,
