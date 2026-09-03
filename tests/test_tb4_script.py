@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).parents[1]
@@ -55,7 +56,7 @@ for ((index = 1; index <= $#; index++)); do
 done
 if [[ "$module" == "nexau_harbor.tb4_routing" ]]; then
   args=("$@")
-  exec "{_PROJECT_ROOT / ".venv/bin/python"}" "${{args[@]:$python_index}}"
+  exec "{sys.executable}" "${{args[@]:$python_index}}"
 fi
 if [[ "$module" == "nexau_harbor.e2b_preflight" ]]; then
   dataset=""
