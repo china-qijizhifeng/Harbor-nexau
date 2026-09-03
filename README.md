@@ -33,6 +33,47 @@ uv sync --locked
 uv sync --locked --extra cloud
 ```
 
+## 运行 TB4（E2B CPU + Basestream H100）
+
+TB4 的混合运行入口是 `scripts/run_tb4.sh`。控制器必须在 `basestream-cpu` 上运行，因为 GPU
+provider需要同时访问 NorthJob、集群内 Harbor、`kubectl exec` 和用户 GPFS PVC。先把官方
+数据集以 export模式放进 GPFS：
+
+```bash
+ssh basestream-cpu
+cd /gpfs/users/i-zhangguoqiang/terminal-code/Harbor-nexau
+
+uv run harbor download terminal-bench/terminal-bench@4.0.0 \
+  --export \
+  --output-dir /gpfs/users/i-zhangguoqiang/datasets/tb4-4.0.0
+```
+
+下载后的直接任务目录是
+`/gpfs/users/i-zhangguoqiang/datasets/tb4-4.0.0/terminal-bench`。全量运行示例：
+
+```bash
+scripts/run_tb4.sh \
+  --path /gpfs/users/i-zhangguoqiang/datasets/tb4-4.0.0/terminal-bench \
+  --trace-mode \
+  --job-name nexau-tb4
+```
+
+入口会解析每道题的 `task.toml` 并生成审计 plan，不按题名硬编码，也不修改数据集：
+
+- CPU题继续交给现有 auto-partition，真实预检后进入普通 E2B或 E2B DinD；
+- 请求 H100的单容器题进入
+  `nexau_harbor.basestream_environment:BasestreamEnvironment`；
+- GPU Agent和 `environment_mode = "separate"` 的 verifier分别创建独立 Volcano Job；
+- 官方 `environment/Dockerfile` 与 `tests/Dockerfile` 由 CPU Kaniko Job原样构建，运行时使用
+  registry返回的不可变 `@sha256`；
+- Pod不覆盖镜像 `ENTRYPOINT`，并在启动后校验 H100型号、可用磁盘和 service-account token。
+
+GPU并发默认是 1，可用 `HARBOR_NEXAU_BASESTREAM_CONCURRENCY` 调整。`jax-speedrun-gpu` 会原样
+申请 `16 CPU / 32 GiB / 1024000 MiB ephemeral-storage / 1 H100`；如果集群没有满足条件的空闲
+节点，它会保持排队而不是静默降配。数据集、jobs目录以及 GPU任务实际解析到的路径都必须位于
+`HARBOR_BASESTREAM_PVC_HOST_ROOT` 下。完整设计与安全边界见
+[`docs/rfcs/0001-basestream-gpu-environment.md`](docs/rfcs/0001-basestream-gpu-environment.md)。
+
 ## 运行 TB3 smoke test
 
 以 OpenAI Responses API 为例：

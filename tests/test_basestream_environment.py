@@ -1,0 +1,444 @@
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import subprocess
+import tarfile
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+from harbor.environments.base import ExecResult
+from harbor.models.task.config import EnvironmentConfig
+from harbor.models.trial.config import ServiceVolumeConfig
+from harbor.models.trial.paths import TrialPaths
+from harbor.utils.import_path import import_class
+
+from nexau_harbor.basestream_environment import (
+    BasestreamEnvironment,
+    BasestreamError,
+    _NorthJobClient,
+)
+
+
+def _environment(
+    tmp_path: Path,
+    *,
+    config: EnvironmentConfig | None = None,
+    image_user: str = "root",
+) -> BasestreamEnvironment:
+    pvc_root = tmp_path / "pvc"
+    environment_dir = pvc_root / "dataset" / "environment"
+    environment_dir.mkdir(parents=True)
+    (environment_dir / "Dockerfile").write_text(
+        "FROM nvidia/cuda:13.2.1-devel-ubuntu22.04\nWORKDIR /app\n",
+        encoding="utf-8",
+    )
+    trial_paths = TrialPaths(pvc_root / "jobs" / "trial")
+    trial_paths.mkdir()
+    credentials = tmp_path / "northjob.json"
+    credentials.write_text('{"username":"u","password":"p"}\n', encoding="utf-8")
+    registry_auth = pvc_root / "info" / "registry.json"
+    registry_auth.parent.mkdir(parents=True)
+    registry_auth.write_text(
+        json.dumps({"auths": {"harbor.local.clusters": {"auth": "dTpw"}}}),
+        encoding="utf-8",
+    )
+    mounts = [
+        ServiceVolumeConfig(
+            type="bind",
+            source=trial_paths.agent_dir.as_posix(),
+            target="/logs/agent",
+        )
+    ]
+    environment = BasestreamEnvironment(
+        environment_dir=environment_dir,
+        environment_name="terminal-bench/fp8-rmsnorm-gemm",
+        session_id="fp8__abc__env",
+        trial_paths=trial_paths,
+        task_env_config=config
+        or EnvironmentConfig(
+            cpus=16,
+            memory_mb=32768,
+            storage_mb=1024000,
+            gpus=1,
+            gpu_types=["H100"],
+        ),
+        mounts=mounts,
+        pvc_host_root=pvc_root,
+        control_root=pvc_root / "control",
+        credentials_path=credentials,
+        registry_auth_path=registry_auth,
+        registry_auth_subpath="info/registry.json",
+        egress_proxy_url=("http://svc-egress.bg-agentic-coding.svc.cluster.local:7890"),
+    )
+    environment._image_user = image_user
+    environment._image_workdir = "/app"
+    environment._session_dir.mkdir(mode=0o700, parents=True)
+    return environment
+
+
+def test_custom_environment_import_path_is_loadable() -> None:
+    environment_class = import_class(
+        "nexau_harbor.basestream_environment:BasestreamEnvironment",
+        label="environment",
+    )
+
+    assert environment_class is BasestreamEnvironment
+
+
+def test_provider_declares_gpu_mounted_and_resource_capabilities(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+
+    assert environment.capabilities.gpus
+    assert environment.capabilities.mounted
+    assert environment.capabilities.disable_internet
+    assert not environment.capabilities.docker_compose
+    assert environment.resource_capabilities().model_dump() == {
+        "cpu_limit": True,
+        "cpu_request": True,
+        "memory_limit": True,
+        "memory_request": True,
+    }
+
+
+def test_runtime_manifest_preserves_entrypoint_and_requests_exact_jax_resources(
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    image = "harbor.local.clusters/project/jax@sha256:" + "a" * 64
+
+    manifest = environment._runtime_manifest(alias="jax-env", image_ref=image)
+
+    pod_spec = manifest["spec"]["tasks"][0]["template"]["spec"]
+    container = pod_spec["containers"][0]
+    assert "command" not in container
+    assert container["args"][:3] == ["/bin/bash", "--norc", "-lc"]
+    assert container["image"] == image
+    assert container["resources"]["requests"] == {
+        "cpu": "16",
+        "memory": "32768Mi",
+        "ephemeral-storage": "1024000Mi",
+        "nvidia.com/gpu": "1",
+    }
+    assert container["resources"]["limits"] == container["resources"]["requests"]
+    assert pod_spec["automountServiceAccountToken"] is False
+    expression = pod_spec["affinity"]["nodeAffinity"][
+        "requiredDuringSchedulingIgnoredDuringExecution"
+    ]["nodeSelectorTerms"][0]["matchExpressions"][0]
+    assert expression["key"] == "kubernetes.io/hostname"
+    assert expression["operator"] == "NotIn"
+    assert expression["values"] == [f"node-b300-{index:03d}" for index in range(1, 9)]
+    env = {item["name"]: item["value"] for item in container["env"]}
+    assert env["HTTPS_PROXY"] == ("http://svc-egress.bg-agentic-coding.svc.cluster.local:7890")
+
+
+def test_runtime_manifest_rejects_non_h100(tmp_path: Path) -> None:
+    environment = _environment(
+        tmp_path,
+        config=EnvironmentConfig(
+            cpus=4,
+            memory_mb=16384,
+            storage_mb=30720,
+            gpus=1,
+            gpu_types=["B300"],
+        ),
+    )
+
+    with pytest.raises(BasestreamError, match="only H100"):
+        environment._runtime_manifest(alias="bad-gpu", image_ref="registry/x@sha256:" + "a" * 64)
+
+
+def test_runtime_mount_rejects_source_outside_pvc_before_creating_it(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    outside = tmp_path / "outside" / "logs"
+    environment._mounts.append(
+        ServiceVolumeConfig(type="bind", source=str(outside), target="/logs/outside")
+    )
+
+    with pytest.raises(BasestreamError, match="outside the trial PVC"):
+        environment._runtime_mounts()
+
+    assert not outside.exists()
+
+
+def test_build_manifest_is_cpu_only_and_mounts_exact_context(tmp_path: Path) -> None:
+    environment = _environment(tmp_path)
+    context = environment.settings.control_root / "images" / "hash" / "context"
+    output = environment.settings.control_root / "images" / "hash" / "output"
+    context.mkdir(parents=True)
+    output.mkdir(parents=True)
+
+    manifest = environment._build_job_manifest(
+        alias="build-test",
+        context_dir=context,
+        output_dir=output,
+        destination="harbor.local.clusters/project/task:hash",
+        timeout_sec=600,
+    )
+
+    pod_spec = manifest["spec"]["tasks"][0]["template"]["spec"]
+    container = pod_spec["containers"][0]
+    assert container["command"] == ["/kaniko/executor"]
+    assert "nvidia.com/gpu" not in container["resources"]["requests"]
+    assert container["resources"]["requests"]["ephemeral-storage"] == "100Gi"
+    mounts = {item["mountPath"]: item for item in container["volumeMounts"]}
+    assert mounts["/workspace"]["subPath"].endswith("/context")
+    assert mounts["/workspace"]["readOnly"] is True
+    assert mounts["/kaniko/.docker/config.json"]["readOnly"] is True
+    assert pod_spec["automountServiceAccountToken"] is False
+
+
+def test_image_metadata_verifies_digest_entrypoint_user_and_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    config = {
+        "config": {
+            "Entrypoint": ["/opt/nvidia/nvidia_entrypoint.sh"],
+            "User": "agent",
+            "WorkingDir": "/app",
+        }
+    }
+    config_bytes = json.dumps(config, separators=(",", ":")).encode()
+    config_digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+    manifest_bytes = json.dumps(
+        {"schemaVersion": 2, "config": {"digest": config_digest}},
+        separators=(",", ":"),
+    ).encode()
+    digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+
+    monkeypatch.setattr(environment, "_registry_auth", lambda registry: "auth")
+
+    def request(url: str, *, auth: str, accept: str | None = None):
+        del auth, accept
+        if "/manifests/" in url:
+            return manifest_bytes, {"Docker-Content-Digest": digest}
+        return config_bytes, {}
+
+    monkeypatch.setattr(environment, "_registry_request", request)
+
+    metadata = environment._image_metadata(f"harbor.local.clusters/project/task@{digest}")
+
+    assert metadata["entrypoint"] == ["/opt/nvidia/nvidia_entrypoint.sh"]
+    assert metadata["user"] == "agent"
+    assert metadata["workdir"] == "/app"
+    assert metadata["config_digest"] == config_digest
+
+
+def test_image_metadata_rejects_application_entrypoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    config_bytes = b'{"config":{"Entrypoint":["/app/server"]}}'
+    config_digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+    manifest_bytes = json.dumps({"config": {"digest": config_digest}}).encode()
+    digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+    monkeypatch.setattr(environment, "_registry_auth", lambda registry: "auth")
+    monkeypatch.setattr(
+        environment,
+        "_registry_request",
+        lambda url, **kwargs: (
+            (manifest_bytes, {"Docker-Content-Digest": digest})
+            if "/manifests/" in url
+            else (config_bytes, {})
+        ),
+    )
+
+    with pytest.raises(BasestreamError, match="cannot safely receive"):
+        environment._image_metadata(f"harbor.local.clusters/project/task@{digest}")
+
+
+@pytest.mark.asyncio
+async def test_exec_defaults_to_image_user_and_forces_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path, image_user="agent")
+    environment._pod_name = "pod-test"
+    captured: list[str] = []
+
+    def run(args: list[str], **kwargs):
+        del kwargs
+        captured.extend(args)
+        return subprocess.CompletedProcess(args, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(environment, "_run_text", run)
+
+    result = await environment.exec("pwd", timeout_sec=10)
+
+    assert result == ExecResult(stdout="ok\n", stderr="", return_code=0)
+    rendered = " ".join(captured)
+    assert "su agent" in rendered
+    assert "cd /app" in rendered
+    assert "HTTPS_PROXY" in rendered
+
+
+@pytest.mark.asyncio
+async def test_runtime_validation_rejects_wrong_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    environment._pod_name = "pod-test"
+    monkeypatch.setattr(
+        environment,
+        "exec",
+        AsyncMock(
+            side_effect=[
+                ExecResult(stdout="", stderr="", return_code=0),
+                ExecResult(stdout="NVIDIA B300 SXM6 AC\n", stderr="", return_code=0),
+            ]
+        ),
+    )
+
+    with pytest.raises(BasestreamError, match="non-H100"):
+        await environment._validate_runtime()
+
+
+@pytest.mark.asyncio
+async def test_runtime_validation_accepts_exact_h100_and_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    environment._pod_name = "pod-test"
+    exec_mock = AsyncMock(
+        side_effect=[
+            ExecResult(stdout="", stderr="", return_code=0),
+            ExecResult(stdout="NVIDIA H100 80GB HBM3\n", stderr="", return_code=0),
+            ExecResult(
+                stdout="overlay 1300000 1000 1299000 1% /\n",
+                stderr="",
+                return_code=0,
+            ),
+        ]
+    )
+    monkeypatch.setattr(environment, "exec", exec_mock)
+
+    await environment._validate_runtime()
+
+    assert exec_mock.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_start_submits_runtime_job_and_stop_deletes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    image = "harbor.local.clusters/project/task@sha256:" + "a" * 64
+    monkeypatch.setattr(
+        environment,
+        "_ensure_image",
+        AsyncMock(
+            return_value=(
+                image,
+                {
+                    "entrypoint": ["/opt/nvidia/nvidia_entrypoint.sh"],
+                    "user": "agent",
+                    "workdir": "/app",
+                },
+            )
+        ),
+    )
+    submitted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        _NorthJobClient,
+        "submit",
+        lambda self, manifest: submitted.append(manifest),
+    )
+    monkeypatch.setattr(
+        environment,
+        "_wait_for_job",
+        lambda alias, **kwargs: (
+            {"metadata": {"name": "job-runtime"}, "status": {"state": {"phase": "Running"}}},
+            {"metadata": {"name": "pod-runtime"}, "status": {"phase": "Running"}},
+        ),
+    )
+    monkeypatch.setattr(environment, "_validate_runtime", AsyncMock())
+    deleted: list[str] = []
+    monkeypatch.setattr(environment, "_delete_job", lambda name: deleted.append(name))
+
+    await environment.start(force_build=False)
+
+    assert len(submitted) == 1
+    container = submitted[0]["spec"]["tasks"][0]["template"]["spec"]["containers"][0]
+    assert "command" not in container
+    assert environment._runtime_job_name == "job-runtime"
+    assert environment._pod_name == "pod-runtime"
+    assert environment._image_user == "agent"
+    runtime_receipt = json.loads(
+        (environment._session_dir / "runtime-receipt.json").read_text(encoding="utf-8")
+    )
+    assert runtime_receipt["success"] is True
+    assert runtime_receipt["job_name"] == "job-runtime"
+
+    await environment.stop(delete=True)
+
+    assert deleted == ["job-runtime"]
+    assert environment._runtime_job_name is None
+    assert environment._pod_name is None
+    stop_receipt = json.loads(
+        (environment._session_dir / "stop-receipt.json").read_text(encoding="utf-8")
+    )
+    assert stop_receipt["delete"] is True
+
+
+@pytest.mark.asyncio
+async def test_start_cleans_up_job_when_runtime_validation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    image = "harbor.local.clusters/project/task@sha256:" + "a" * 64
+    monkeypatch.setattr(
+        environment,
+        "_ensure_image",
+        AsyncMock(return_value=(image, {"entrypoint": [], "user": "root", "workdir": None})),
+    )
+    monkeypatch.setattr(_NorthJobClient, "submit", lambda self, manifest: None)
+    monkeypatch.setattr(
+        environment,
+        "_wait_for_job",
+        lambda alias, **kwargs: (
+            {"metadata": {"name": "job-invalid"}},
+            {"metadata": {"name": "pod-invalid"}, "status": {"phase": "Running"}},
+        ),
+    )
+    monkeypatch.setattr(
+        environment,
+        "_validate_runtime",
+        AsyncMock(side_effect=BasestreamError("wrong GPU")),
+    )
+    deleted: list[str] = []
+    monkeypatch.setattr(environment, "_delete_job", lambda name: deleted.append(name))
+
+    with pytest.raises(BasestreamError, match="wrong GPU"):
+        await environment.start(force_build=False)
+
+    assert deleted == ["job-invalid"]
+    receipt = json.loads(
+        (environment._session_dir / "runtime-receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["success"] is False
+    assert receipt["error_type"] == "BasestreamError"
+
+
+def test_upload_tar_rejects_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("secret", encoding="utf-8")
+    (source / "link").symlink_to(outside)
+
+    with pytest.raises(BasestreamError, match="symlink"):
+        BasestreamEnvironment._write_safe_tar(source, tmp_path / "upload.tar")
+
+
+def test_download_tar_rejects_link_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "download.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        member = tarfile.TarInfo("escape")
+        member.type = tarfile.SYMTYPE
+        member.linkname = "../../outside"
+        archive.addfile(member, io.BytesIO())
+
+    with pytest.raises(BasestreamError, match="unsafe artifact"):
+        BasestreamEnvironment._extract_safe_tar(archive_path, tmp_path / "target")
