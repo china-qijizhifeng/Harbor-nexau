@@ -623,9 +623,15 @@ async def test_runtime_validation_accepts_exact_h100_and_disk(
     )
     monkeypatch.setattr(environment, "exec", exec_mock)
 
-    await environment._validate_runtime()
+    validation = await environment._validate_runtime()
 
     assert exec_mock.await_count == 3
+    assert validation == {
+        "service_account_token_absent": True,
+        "gpu_names": ["NVIDIA H100 80GB HBM3"],
+        "available_storage_mb": 1299000,
+        "effective_image_user": "root",
+    }
 
 
 @pytest.mark.asyncio
@@ -659,10 +665,24 @@ async def test_start_submits_runtime_job_and_stop_deletes_it(
         "_wait_for_job",
         lambda alias, **kwargs: (
             {"metadata": {"name": "job-runtime"}, "status": {"state": {"phase": "Running"}}},
-            {"metadata": {"name": "pod-runtime"}, "status": {"phase": "Running"}},
+            {
+                "metadata": {"name": "pod-runtime"},
+                "spec": {"nodeName": "node-h100-001"},
+                "status": {"phase": "Running"},
+            },
         ),
     )
-    monkeypatch.setattr(environment, "_validate_runtime", AsyncMock())
+    validation = {
+        "service_account_token_absent": True,
+        "gpu_names": ["NVIDIA H100 80GB HBM3"],
+        "available_storage_mb": 40000,
+        "effective_image_user": "agent",
+    }
+    monkeypatch.setattr(
+        environment,
+        "_validate_runtime",
+        AsyncMock(return_value=validation),
+    )
     deleted: list[str] = []
     monkeypatch.setattr(environment, "_delete_job", lambda name: deleted.append(name))
 
@@ -679,6 +699,8 @@ async def test_start_submits_runtime_job_and_stop_deletes_it(
     )
     assert runtime_receipt["success"] is True
     assert runtime_receipt["job_name"] == "job-runtime"
+    assert runtime_receipt["node_name"] == "node-h100-001"
+    assert runtime_receipt["validation"] == validation
 
     await environment.stop(delete=True)
 

@@ -1857,7 +1857,8 @@ class BasestreamEnvironment(BaseEnvironment):
             *remote,
         ]
 
-    async def _validate_runtime(self) -> None:
+    async def _validate_runtime(self) -> dict[str, Any]:
+        validation: dict[str, Any] = {}
         token = await self.exec(
             "test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token",
             user="root",
@@ -1865,6 +1866,7 @@ class BasestreamEnvironment(BaseEnvironment):
         )
         if token.return_code != 0:
             raise BasestreamError("Kubernetes service-account token is visible in runtime")
+        validation["service_account_token_absent"] = True
         gpu = await self.exec(
             "nvidia-smi --query-gpu=name --format=csv,noheader",
             user="root",
@@ -1877,6 +1879,7 @@ class BasestreamEnvironment(BaseEnvironment):
             )
         if any("H100" not in name for name in names):
             raise BasestreamError(f"Basestream scheduled a non-H100 GPU: {names!r}")
+        validation["gpu_names"] = names
         storage_mb = int(self._effective_storage_mb or 0)
         if storage_mb:
             disk = await self.exec("df -Pm / | tail -n 1", user="root", timeout_sec=30)
@@ -1891,6 +1894,7 @@ class BasestreamEnvironment(BaseEnvironment):
                     f"runtime disk is below task request: requested={storage_mb}MB "
                     f"available={available_mb}MB"
                 )
+            validation["available_storage_mb"] = available_mb
         image_user = self._effective_image_user(None)
         if image_user not in {"0", "root"}:
             user_check = await self.exec(
@@ -1902,6 +1906,8 @@ class BasestreamEnvironment(BaseEnvironment):
                 raise BasestreamError(
                     f"image USER {image_user!r} cannot be selected with su/getent"
                 )
+        validation["effective_image_user"] = image_user
+        return validation
 
     @override
     async def start(self, force_build: bool) -> None:
@@ -1925,7 +1931,7 @@ class BasestreamEnvironment(BaseEnvironment):
             )
             self._runtime_job_name = self._extract_job_name(job)
             self._pod_name = str((pod or {}).get("metadata", {}).get("name") or "")
-            await self._validate_runtime()
+            validation = await self._validate_runtime()
             _atomic_json(
                 self._session_dir / "runtime-receipt.json",
                 {
@@ -1935,7 +1941,9 @@ class BasestreamEnvironment(BaseEnvironment):
                     "job_alias": alias,
                     "job_name": self._runtime_job_name,
                     "pod_name": self._pod_name,
+                    "node_name": str((pod or {}).get("spec", {}).get("nodeName") or ""),
                     "image": image_ref,
+                    "validation": validation,
                     "resources": manifest["spec"]["tasks"][0]["template"]["spec"]["containers"][0][
                         "resources"
                     ],
