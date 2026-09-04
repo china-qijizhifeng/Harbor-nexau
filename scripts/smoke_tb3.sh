@@ -413,8 +413,14 @@ if [[ "$task_partition" == "auto" ]]; then
   }
   trap cleanup_auto_route_files EXIT
 
-  preflight_args=(
+  preflight_command=(
     uv run --project "$project_root" python -m nexau_harbor.e2b_preflight
+  )
+  if [[ "${_HARBOR_NEXAU_DOTENV_LOADED:-0}" == "1" ]]; then
+    preflight_command=(python -m nexau_harbor.e2b_preflight)
+  fi
+  preflight_args=(
+    "${preflight_command[@]}"
     --dataset "$auto_dataset_path"
     --output "$auto_plan_path"
     --selectors-output "$auto_selectors_path"

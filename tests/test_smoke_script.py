@@ -30,6 +30,10 @@ def _run_with_fake_uv(
     fake_uv.write_text(
         """#!/usr/bin/env bash
 set -euo pipefail
+if [[ "${FAIL_IF_UV:-0}" == "1" && "${0##*/}" == "uv" ]]; then
+  printf '%s\n' 'uv must not be called after dotenv has already loaded' >&2
+  exit 97
+fi
 is_preflight=0
 is_prewarm=0
 for argument in "$@"; do
@@ -98,6 +102,9 @@ printf "%s\\n" "$@"
 """
     )
     fake_uv.chmod(0o755)
+    fake_python = bin_dir / "python"
+    fake_python.write_text(fake_uv.read_text(encoding="utf-8"), encoding="utf-8")
+    fake_python.chmod(0o755)
 
     env = os.environ.copy()
     env.update(
@@ -690,6 +697,31 @@ def test_smoke_script_auto_partitions_local_dataset_into_concurrent_jobs(
     assert "--exclude-task-name" not in dind_arguments
     assert dind_arguments[dind_arguments.index("--include-task-name") + 1] == "compose-digest"
     assert "Auto partition selected 2 plain E2B and 1 DinD task(s)" in result.stderr
+
+
+def test_auto_partition_reuses_loaded_python_without_invoking_uv(tmp_path: Path) -> None:
+    dataset = _create_auto_partition_dataset(tmp_path)
+    invocation_capture_dir = tmp_path / "invocations"
+
+    result = _run_with_fake_uv(
+        tmp_path,
+        "--auto-partition",
+        "--path",
+        str(dataset),
+        "--job-name",
+        "loaded-run",
+        invocation_capture_dir=invocation_capture_dir,
+        extra_env={
+            "_HARBOR_NEXAU_DOTENV_LOADED": "1",
+            "FAIL_IF_UV": "1",
+            "HARBOR_NEXAU_DIND_PREWARM": "false",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    invocations = [path.read_text().splitlines() for path in invocation_capture_dir.iterdir()]
+    assert len(invocations) == 2
+    assert all("nexau_harbor.harbor_cli" in arguments for arguments in invocations)
 
 
 def test_auto_partition_interrupt_stops_both_process_groups(tmp_path: Path) -> None:
