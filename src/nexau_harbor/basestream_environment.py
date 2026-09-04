@@ -1709,7 +1709,6 @@ class BasestreamEnvironment(BaseEnvironment):
         environment.update(
             {
                 "HARBOR_BASESTREAM_SESSION": self.session_id,
-                "NVIDIA_VISIBLE_DEVICES": "all",
             }
         )
         container: dict[str, Any] = {
@@ -1954,9 +1953,17 @@ class BasestreamEnvironment(BaseEnvironment):
             if not self._runtime_job_name:
                 job = await _offload(self._find_job, alias)
                 self._runtime_job_name = self._extract_job_name(job) if job else None
-            if self._runtime_job_name:
-                with contextlib.suppress(Exception):
-                    await _offload(self._delete_job, self._runtime_job_name)
+            failed_job_name = self._runtime_job_name
+            failed_pod_name = self._pod_name
+            cleanup_error: str | None = None
+            if failed_job_name:
+                try:
+                    await _offload(self._delete_job, failed_job_name)
+                except Exception as cleanup_exc:  # noqa: BLE001 - preserve primary failure
+                    cleanup_error = f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                else:
+                    self._runtime_job_name = None
+                    self._pod_name = None
             with contextlib.suppress(Exception):
                 _atomic_json(
                     self._session_dir / "runtime-receipt.json",
@@ -1965,11 +1972,12 @@ class BasestreamEnvironment(BaseEnvironment):
                         "success": False,
                         "session_id": self.session_id,
                         "job_alias": alias,
-                        "job_name": self._runtime_job_name,
-                        "pod_name": self._pod_name,
+                        "job_name": failed_job_name,
+                        "pod_name": failed_pod_name,
                         "image": image_ref,
                         "error_type": type(exc).__name__,
                         "error": str(exc),
+                        "cleanup_error": cleanup_error,
                         "failed_at_unix": time.time(),
                     },
                 )

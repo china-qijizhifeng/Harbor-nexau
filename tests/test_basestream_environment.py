@@ -134,6 +134,7 @@ def test_runtime_manifest_preserves_entrypoint_and_requests_exact_jax_resources(
     assert expression["values"] == [f"node-b300-{index:03d}" for index in range(1, 9)]
     env = {item["name"]: item["value"] for item in container["env"]}
     assert env["HTTPS_PROXY"] == ("http://svc-egress.bg-agentic-coding.svc.cluster.local:7890")
+    assert "NVIDIA_VISIBLE_DEVICES" not in env
 
 
 def test_runtime_manifest_rejects_non_h100(tmp_path: Path) -> None:
@@ -745,11 +746,59 @@ async def test_start_cleans_up_job_when_runtime_validation_fails(
         await environment.start(force_build=False)
 
     assert deleted == ["job-invalid"]
+    assert environment._runtime_job_name is None
+    assert environment._pod_name is None
     receipt = json.loads(
         (environment._session_dir / "runtime-receipt.json").read_text(encoding="utf-8")
     )
     assert receipt["success"] is False
     assert receipt["error_type"] == "BasestreamError"
+    assert receipt["job_name"] == "job-invalid"
+    assert receipt["pod_name"] == "pod-invalid"
+    assert receipt["cleanup_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_start_preserves_job_handle_when_failure_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    image = "harbor.local.clusters/project/task@sha256:" + "a" * 64
+    monkeypatch.setattr(
+        environment,
+        "_ensure_image",
+        AsyncMock(return_value=(image, {"entrypoint": [], "user": "root", "workdir": None})),
+    )
+    monkeypatch.setattr(_NorthJobClient, "submit", lambda self, manifest: None)
+    monkeypatch.setattr(
+        environment,
+        "_wait_for_job",
+        lambda alias, **kwargs: (
+            {"metadata": {"name": "job-retry-cleanup"}},
+            {"metadata": {"name": "pod-retry-cleanup"}, "status": {"phase": "Running"}},
+        ),
+    )
+    monkeypatch.setattr(
+        environment,
+        "_validate_runtime",
+        AsyncMock(side_effect=BasestreamError("wrong GPU")),
+    )
+
+    def fail_delete(name: str) -> None:
+        del name
+        raise BasestreamError("delete denied")
+
+    monkeypatch.setattr(environment, "_delete_job", fail_delete)
+
+    with pytest.raises(BasestreamError, match="wrong GPU"):
+        await environment.start(force_build=False)
+
+    assert environment._runtime_job_name == "job-retry-cleanup"
+    assert environment._pod_name == "pod-retry-cleanup"
+    receipt = json.loads(
+        (environment._session_dir / "runtime-receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["cleanup_error"] == "BasestreamError: delete denied"
 
 
 def test_upload_tar_rejects_symlink(tmp_path: Path) -> None:
