@@ -58,6 +58,21 @@ scripts/run_tb4.sh \
   --job-name nexau-tb4
 ```
 
+从另一台主机提交长任务时，不要让本地monitor长期托管 `ssh basestream-cpu ...`：jumpserver可能在
+远端结果已经写完后仍不关闭SSH channel。应让SSH只提交远端本机monitor并立即返回，例如：
+
+```bash
+ssh basestream-cpu \
+  "python3 /root/.codex/skills/monitor-long-task/scripts/long_task_monitor.py launch \
+    --project 'Harbor TB4' --summary 'TB4全量评测' \
+    --cwd '/gpfs/users/i-zhangguoqiang/terminal-code/Harbor-nexau' \
+    --state-dir '/gpfs/users/i-zhangguoqiang/terminal-code/Harbor-nexau/.basestream/monitors' \
+    --timeout-minutes 1440 -- \
+    scripts/run_tb4.sh --path \
+      /gpfs/users/i-zhangguoqiang/datasets/tb4-4.0.0/terminal-bench \
+      --trace-mode --job-name nexau-tb4"
+```
+
 入口会解析每道题的 `task.toml` 并生成审计 plan，不按题名硬编码，也不修改数据集：
 
 - CPU题继续交给现有 auto-partition，真实预检后进入普通 E2B或 E2B DinD；
