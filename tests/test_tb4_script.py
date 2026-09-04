@@ -185,3 +185,55 @@ def test_tb4_script_rejects_gpu_jobs_outside_pvc(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "must be under the Basestream PVC host root" in result.stderr
+
+
+def test_tb4_script_delegates_remote_gpfs_path_from_development_host(tmp_path: Path) -> None:
+    capture = tmp_path / "submit-args.json"
+    submit = tmp_path / "submit-tb4"
+    submit.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+Path(os.environ["SUBMIT_CAPTURE"]).write_text(
+    json.dumps(sys.argv[1:]),
+    encoding="utf-8",
+)
+""",
+        encoding="utf-8",
+    )
+    submit.chmod(0o755)
+    remote_dataset = "/gpfs/remote-only/tb4/terminal-bench"
+    env = os.environ.copy()
+    env.update(
+        {
+            "HARBOR_NEXAU_ENV_FILE": str(tmp_path / "missing.env"),
+            "HARBOR_NEXAU_TB4_SUBMIT_SCRIPT": str(submit),
+            "HARBOR_BASESTREAM_PVC_HOST_ROOT": str(tmp_path / "missing-pvc"),
+            "SUBMIT_CAPTURE": str(capture),
+        }
+    )
+
+    arguments = [
+        "--path",
+        remote_dataset,
+        "--trace-mode",
+        "--job-name",
+        "tb4-from-dev",
+        "--yes",
+    ]
+    result = subprocess.run(
+        [str(_SCRIPT), *arguments],
+        cwd=_PROJECT_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Local Basestream/GPFS control plane is unavailable" in result.stderr
+    assert json.loads(capture.read_text(encoding="utf-8")) == arguments

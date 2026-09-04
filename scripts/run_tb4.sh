@@ -3,6 +3,7 @@ set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 dotenv_file="${HARBOR_NEXAU_ENV_FILE:-$project_root/.env}"
+original_args=("$@")
 
 if [[ -f "$dotenv_file" && "${_HARBOR_NEXAU_DOTENV_LOADED:-0}" != "1" ]]; then
   exec env _HARBOR_NEXAU_DOTENV_LOADED=1 \
@@ -93,6 +94,25 @@ if [[ -z "$dataset_path" ]]; then
   exit 2
 fi
 if [[ ! -d "$dataset_path" ]]; then
+  auto_submit="${HARBOR_NEXAU_TB4_AUTO_SUBMIT:-true}"
+  pvc_host_root="${HARBOR_BASESTREAM_PVC_HOST_ROOT:-/gpfs/users/i-zhangguoqiang}"
+  submit_script="${HARBOR_NEXAU_TB4_SUBMIT_SCRIPT:-$project_root/scripts/submit_tb4.sh}"
+  if [[ "$auto_submit" != "true" && "$auto_submit" != "false" ]]; then
+    printf 'HARBOR_NEXAU_TB4_AUTO_SUBMIT must be true or false, got: %s\n' \
+      "$auto_submit" >&2
+    exit 2
+  fi
+  if [[ "$auto_submit" == "true" && "$dataset_path" == /gpfs/* ]] && \
+    { ! command -v kubectl >/dev/null 2>&1 || [[ ! -d "$pvc_host_root" ]]; }
+  then
+    if [[ ! -x "$submit_script" ]]; then
+      printf 'TB4 remote submit entrypoint is unavailable: %s\n' "$submit_script" >&2
+      exit 2
+    fi
+    printf 'Local Basestream/GPFS control plane is unavailable; submitting via %s.\n' \
+      "$submit_script" >&2
+    exec "$submit_script" "${original_args[@]}"
+  fi
   printf 'TB4 dataset directory not found: %s\n' "$dataset_path" >&2
   printf '%s\n' \
     'When submitting from a machine without GPFS, use scripts/submit_tb4.sh instead.' >&2
