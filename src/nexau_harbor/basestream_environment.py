@@ -164,6 +164,7 @@ class BasestreamSettings:
     kaniko_image: str
     kaniko_cache_repository: str
     skopeo_image: str
+    skopeo_parallel_copies: int
     docker_hub_mirror: str
     egress_proxy_url: str | None
     egress_state_path: Path
@@ -354,6 +355,7 @@ class BasestreamEnvironment(BaseEnvironment):
         kaniko_image: str | None = None,
         kaniko_cache_repository: str | None = None,
         skopeo_image: str | None = None,
+        skopeo_parallel_copies: int | str | None = None,
         docker_hub_mirror: str | None = None,
         egress_proxy_url: str | None = None,
         egress_state_path: str | Path | None = None,
@@ -444,6 +446,10 @@ class BasestreamEnvironment(BaseEnvironment):
                 "HARBOR_BASESTREAM_SKOPEO_IMAGE",
                 "m.daocloud.io/quay.io/skopeo/stable@"
                 "sha256:47853bb9fb24202af9110531ebd6e43c5f97701254ca290596640290d17942f4",
+            ),
+            skopeo_parallel_copies=_as_int(
+                skopeo_parallel_copies or _env("HARBOR_BASESTREAM_SKOPEO_PARALLEL_COPIES", "1"),
+                name="skopeo_parallel_copies",
             ),
             docker_hub_mirror=(
                 docker_hub_mirror
@@ -1110,7 +1116,8 @@ class BasestreamEnvironment(BaseEnvironment):
                 "copy",
                 "--all",
                 "--preserve-digests",
-                "--retry-times=5",
+                "--retry-times=10",
+                f"--image-parallel-copies={self.settings.skopeo_parallel_copies}",
                 "--src-tls-verify=true",
                 "--dest-tls-verify=false",
                 "--dest-authfile=/auth/config.json",

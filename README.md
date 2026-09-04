@@ -84,6 +84,8 @@ ssh basestream-cpu \
   Docker Hub复制到内部 Harbor；源和目标保持相同digest，GPU节点只拉内部 `@sha256`。未声明
   镜像时才由 CPU Kaniko Job原样构建对应 Dockerfile。若经实测可达，也可用
   `HARBOR_BASESTREAM_DOCKER_HUB_MIRROR`指定镜像源；
+- Skopeo默认通过 `HARBOR_BASESTREAM_SKOPEO_PARALLEL_COPIES=1` 串行复制layer，避免多个大层
+  同时穿过单路SSH egress时相互取消；单层断流最多重试10次；
 - Pod不覆盖镜像 `ENTRYPOINT`，并在启动后校验 H100型号、可用磁盘和 service-account token。
 
 GPU并发默认是 1，可用 `HARBOR_NEXAU_BASESTREAM_CONCURRENCY` 调整。`jax-speedrun-gpu` 会原样

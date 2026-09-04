@@ -442,6 +442,8 @@ def test_prebuilt_mirror_uses_nexmltask_skopeo_preserve_digest_contract(
     )
     assert container["command"] == ["/usr/bin/skopeo"]
     assert container["args"][:3] == ["copy", "--all", "--preserve-digests"]
+    assert "--retry-times=10" in container["args"]
+    assert "--image-parallel-copies=1" in container["args"]
     assert f"docker://docker.io/harborframework/terminal-bench@{digest}" in (container["args"])
     assert f"docker://{destination}" in container["args"]
     assert "nvidia.com/gpu" not in container["resources"]["requests"]
