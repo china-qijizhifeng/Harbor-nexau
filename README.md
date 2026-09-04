@@ -35,7 +35,9 @@ uv sync --locked --extra cloud
 
 ## 运行 TB4（E2B CPU + Basestream H100）
 
-TB4 的混合运行入口是 `scripts/run_tb4.sh`。控制器必须在 `basestream-cpu` 上运行，因为 GPU
+从普通开发机发起评测时使用 `scripts/submit_tb4.sh`。它只通过短连接SSH在
+`basestream-cpu`本机启动长任务monitor，收到任务ID后立即返回；Harbor控制器不会依赖SSH连接
+存活。实际控制器入口仍是 `scripts/run_tb4.sh`，且必须在 `basestream-cpu` 上运行，因为 GPU
 provider需要同时访问 NorthJob、集群内 Harbor、`kubectl exec` 和用户 GPFS PVC。先把官方
 数据集以 export模式放进 GPFS：
 
@@ -49,28 +51,28 @@ uv run harbor download terminal-bench/terminal-bench@4.0.0 \
 ```
 
 下载后的直接任务目录是
-`/gpfs/users/i-zhangguoqiang/datasets/tb4-4.0.0/terminal-bench`。全量运行示例：
+`/gpfs/users/i-zhangguoqiang/datasets/tb4-4.0.0/terminal-bench`。在普通开发机上的全量提交命令是：
+
+```bash
+scripts/submit_tb4.sh \
+  --path /gpfs/users/i-zhangguoqiang/datasets/tb4-4.0.0/terminal-bench \
+  --trace-mode \
+  --e2b-start-ramp-delay-sec 5 \
+  --job-name nexau-tb4
+```
+
+提交脚本自动附加`--yes`，并拒绝与正在运行的monitor或已有结果目录同名的任务。远端checkout、
+运行时venv、Codex目录和72小时monitor上限可分别通过
+`HARBOR_NEXAU_TB4_REMOTE_PROJECT_ROOT`、`HARBOR_NEXAU_TB4_REMOTE_RUNTIME_ROOT`、
+`HARBOR_NEXAU_TB4_REMOTE_CODEX_HOME`和`HARBOR_NEXAU_TB4_MONITOR_TIMEOUT_MINUTES`覆盖。
+如需在`basestream-cpu`本机直接调试控制器，才使用：
 
 ```bash
 scripts/run_tb4.sh \
   --path /gpfs/users/i-zhangguoqiang/datasets/tb4-4.0.0/terminal-bench \
   --trace-mode \
-  --job-name nexau-tb4
-```
-
-从另一台主机提交长任务时，不要让本地monitor长期托管 `ssh basestream-cpu ...`：jumpserver可能在
-远端结果已经写完后仍不关闭SSH channel。应让SSH只提交远端本机monitor并立即返回，例如：
-
-```bash
-ssh basestream-cpu \
-  "python3 /root/.codex/skills/monitor-long-task/scripts/long_task_monitor.py launch \
-    --project 'Harbor TB4' --summary 'TB4全量评测' \
-    --cwd '/gpfs/users/i-zhangguoqiang/terminal-code/Harbor-nexau' \
-    --state-dir '/gpfs/users/i-zhangguoqiang/terminal-code/Harbor-nexau/.basestream/monitors' \
-    --timeout-minutes 1440 -- \
-    scripts/run_tb4.sh --path \
-      /gpfs/users/i-zhangguoqiang/datasets/tb4-4.0.0/terminal-bench \
-      --trace-mode --job-name nexau-tb4"
+  --job-name nexau-tb4 \
+  --yes
 ```
 
 入口会解析每道题的 `task.toml` 并生成审计 plan，不按题名硬编码，也不修改数据集：

@@ -94,6 +94,8 @@ if [[ -z "$dataset_path" ]]; then
 fi
 if [[ ! -d "$dataset_path" ]]; then
   printf 'TB4 dataset directory not found: %s\n' "$dataset_path" >&2
+  printf '%s\n' \
+    'When submitting from a machine without GPFS, use scripts/submit_tb4.sh instead.' >&2
   exit 2
 fi
 if [[ -z "$job_name" ]]; then
