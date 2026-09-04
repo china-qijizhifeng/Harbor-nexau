@@ -71,9 +71,11 @@ realm为 `auth.docker.io`；内部 Harbor引用仍使用既有 Basic auth。Base
 `copy --all --preserve-digests` 到内部 Harbor。可选镜像源只有在当前egress路径实测可达时才启用；
 目标raw manifest必须仍能以同一个digest读取，且
 config digest、ENTRYPOINT、USER与WORKDIR必须与官方源完全一致；GPU Job只使用该内部
-`@sha256`。这个步骤是registry间原样复制，不是用空 Dockerfile重建镜像。当前egress由单路SSH
-stdio承载，因此Skopeo一次只复制一个layer并增加整次重试预算；默认并行复制会在多个大层同时
-断流时取消目标upload，留下 `unexpected EOF` / `use of closed network connection`。
+`@sha256`。这个步骤不是用空 Dockerfile重建镜像。当前egress由单路SSH stdio承载，直接做
+registry-to-registry流式复制时，源端Range重连会关闭仍在进行的Harbor PATCH。provider因此先将
+源manifest与layer串行写到当前environment hash专属的GPFS `dir:` transport，逐字节重算manifest
+digest后，再从本地staging推送Harbor；两个网络阶段完全解耦。成功后删除staging，失败时保留完整
+blob供下一attempt复用；默认每阶段最多3次外层尝试、每次Skopeo内部10次重试。
 
 任务未声明镜像时，环境内容 hash决定内部 Harbor tag，同样只运行 Kaniko写回的 `@sha256` 引用。
 构建上下文与输出目录位于 provider控制的 GPFS根目录，Kaniko只读挂载当前 context、可写挂载当前

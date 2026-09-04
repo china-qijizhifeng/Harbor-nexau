@@ -50,6 +50,78 @@ _ALLOWED_ENTRYPOINTS = {(), ("/opt/nvidia/nvidia_entrypoint.sh",)}
 _DEFAULT_B300_NODES = tuple(f"node-b300-{index:03d}" for index in range(1, 9))
 _BUILD_LOCKS: dict[str, asyncio.Lock] = {}
 _IO_EXECUTOR = ThreadPoolExecutor(max_workers=64, thread_name_prefix="harbor-basestream")
+_SKOPEO_STAGED_MIRROR_SCRIPT = """\
+set -eu
+source_image=$1
+destination_image=$2
+expected_digest=$3
+parallel_copies=$4
+image_dir=/mirror/image
+complete_marker=/mirror/download.complete
+
+download_complete=0
+if [ -f "$complete_marker" ] && [ -f "$image_dir/manifest.json" ]; then
+  recorded_digest=$(cat "$complete_marker")
+  actual_digest="sha256:$(sha256sum "$image_dir/manifest.json" | awk '{print $1}')"
+  if [ "$recorded_digest" = "$expected_digest" ] && [ "$actual_digest" = "$expected_digest" ]; then
+    download_complete=1
+    echo "Reusing verified local dir transport: $expected_digest"
+  fi
+fi
+
+if [ "$download_complete" -ne 1 ]; then
+  rm -f "$complete_marker"
+  mkdir -p "$image_dir"
+  download_attempt=1
+  while [ "$download_attempt" -le 3 ]; do
+    echo "Downloading source image to local dir transport (attempt $download_attempt/3)"
+    if /usr/bin/skopeo copy \
+      --preserve-digests \
+      --retry-times=10 \
+      --image-parallel-copies="$parallel_copies" \
+      --src-tls-verify=true \
+      "$source_image" "dir:$image_dir"; then
+      download_complete=1
+      break
+    fi
+    sleep $((download_attempt * 5))
+    download_attempt=$((download_attempt + 1))
+  done
+  if [ "$download_complete" -ne 1 ]; then
+    echo "Source image download did not complete" >&2
+    exit 1
+  fi
+  actual_digest="sha256:$(sha256sum "$image_dir/manifest.json" | awk '{print $1}')"
+  if [ "$actual_digest" != "$expected_digest" ]; then
+    echo "Downloaded manifest digest mismatch: $actual_digest" >&2
+    exit 1
+  fi
+  printf '%s\n' "$actual_digest" > "$complete_marker"
+fi
+
+push_complete=0
+push_attempt=1
+while [ "$push_attempt" -le 3 ]; do
+  echo "Pushing verified local dir transport to Harbor (attempt $push_attempt/3)"
+  if /usr/bin/skopeo copy \
+    --preserve-digests \
+    --retry-times=10 \
+    --image-parallel-copies="$parallel_copies" \
+    --dest-precompute-digests \
+    --dest-tls-verify=false \
+    --dest-authfile=/auth/config.json \
+    "dir:$image_dir" "$destination_image"; then
+    push_complete=1
+    break
+  fi
+  sleep $((push_attempt * 5))
+  push_attempt=$((push_attempt + 1))
+done
+if [ "$push_complete" -ne 1 ]; then
+  echo "Internal Harbor push did not complete" >&2
+  exit 1
+fi
+"""
 
 
 class BasestreamError(RuntimeError):
@@ -1104,25 +1176,23 @@ class BasestreamEnvironment(BaseEnvironment):
         alias: str,
         source_ref: str,
         destination: str,
+        staging_dir: Path,
         timeout_sec: int,
     ) -> dict[str, Any]:
         registry = self.settings.registry_repository.partition("/")[0]
+        source_digest = _parse_registry_reference(source_ref).digest
         container = {
             "name": "skopeo",
             "image": self.settings.skopeo_image,
             "imagePullPolicy": "IfNotPresent",
-            "command": ["/usr/bin/skopeo"],
+            "command": ["/bin/sh", "-ceu"],
             "args": [
-                "copy",
-                "--all",
-                "--preserve-digests",
-                "--retry-times=10",
-                f"--image-parallel-copies={self.settings.skopeo_parallel_copies}",
-                "--src-tls-verify=true",
-                "--dest-tls-verify=false",
-                "--dest-authfile=/auth/config.json",
+                _SKOPEO_STAGED_MIRROR_SCRIPT,
+                "--",
                 f"docker://{self._mirror_copy_source(source_ref)}",
                 f"docker://{destination}",
+                source_digest,
+                str(self.settings.skopeo_parallel_copies),
             ],
             "env": [
                 {"name": key, "value": value}
@@ -1157,6 +1227,11 @@ class BasestreamEnvironment(BaseEnvironment):
                     "name": "user-pvc",
                     "readOnly": True,
                     "subPath": self.settings.registry_auth_subpath,
+                },
+                {
+                    "mountPath": "/mirror",
+                    "name": "user-pvc",
+                    "subPath": self.settings.pvc_subpath(staging_dir),
                 },
                 {"mountPath": "/tmp", "name": "mirror-tmp"},
                 {"mountPath": "/var/tmp", "name": "mirror-var"},
@@ -1343,6 +1418,11 @@ class BasestreamEnvironment(BaseEnvironment):
         )
         task_timeout = int(getattr(self.task_env_config, "build_timeout_sec", 0) or 0)
         timeout_sec = max(self.settings.build_timeout_sec, task_timeout)
+        staging_dir = image_dir / "mirror-staging"
+        if staging_dir.is_symlink():
+            raise BasestreamError(f"mirror staging directory cannot be a symlink: {staging_dir}")
+        staging_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staging_dir.chmod(0o700)
         attempt_dir = image_dir / "mirrors" / uuid.uuid4().hex
         attempt_dir.mkdir(mode=0o700, parents=True)
         alias = _slug(
@@ -1353,6 +1433,7 @@ class BasestreamEnvironment(BaseEnvironment):
             alias=alias,
             source_ref=source_ref,
             destination=destination,
+            staging_dir=staging_dir,
             timeout_sec=timeout_sec,
         )
         _atomic_json(attempt_dir / "job-manifest.json", manifest)
@@ -1363,6 +1444,7 @@ class BasestreamEnvironment(BaseEnvironment):
             "source_digest": reference.digest,
             "source_metadata": source_metadata,
             "mirror_tool_image": self.settings.skopeo_image,
+            "mirror_mode": "staged-dir-v1",
         }
         client = _NorthJobClient(self.settings)
         job_name = ""
@@ -1407,6 +1489,12 @@ class BasestreamEnvironment(BaseEnvironment):
             }
             _atomic_json(attempt_dir / "receipt.json", receipt)
             _atomic_json(image_dir / "receipt.json", receipt)
+            try:
+                shutil.rmtree(staging_dir)
+            except OSError as exc:
+                (attempt_dir / "staging-cleanup-error.log").write_text(
+                    f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+                )
             return immutable, metadata
         except BaseException as exc:
             with contextlib.suppress(Exception):

@@ -427,11 +427,14 @@ def test_prebuilt_mirror_uses_nexmltask_skopeo_preserve_digest_contract(
     digest = "sha256:" + "a" * 64
     source = f"harborframework/terminal-bench:task@{digest}"
     destination = "harbor.local.clusters/project/task:mirror"
+    staging = environment.settings.control_root / "images" / "hash" / "mirror-staging"
+    staging.mkdir(parents=True)
 
     manifest = environment._mirror_job_manifest(
         alias="mirror-test",
         source_ref=source,
         destination=destination,
+        staging_dir=staging,
         timeout_sec=600,
     )
 
@@ -440,15 +443,31 @@ def test_prebuilt_mirror_uses_nexmltask_skopeo_preserve_digest_contract(
     assert container["image"].endswith(
         "@sha256:47853bb9fb24202af9110531ebd6e43c5f97701254ca290596640290d17942f4"
     )
-    assert container["command"] == ["/usr/bin/skopeo"]
-    assert container["args"][:3] == ["copy", "--all", "--preserve-digests"]
-    assert "--retry-times=10" in container["args"]
-    assert "--image-parallel-copies=1" in container["args"]
-    assert f"docker://docker.io/harborframework/terminal-bench@{digest}" in (container["args"])
-    assert f"docker://{destination}" in container["args"]
+    assert container["command"] == ["/bin/sh", "-ceu"]
+    script = container["args"][0]
+    syntax = subprocess.run(
+        ["/bin/sh", "-n"],
+        input=script,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    assert '"dir:$image_dir"' in script
+    assert "--dest-precompute-digests" in script
+    assert "--retry-times=10" in script
+    assert '--image-parallel-copies="$parallel_copies"' in script
+    assert container["args"][1:] == [
+        "--",
+        f"docker://docker.io/harborframework/terminal-bench@{digest}",
+        f"docker://{destination}",
+        digest,
+        "1",
+    ]
     assert "nvidia.com/gpu" not in container["resources"]["requests"]
     mounts = {item["mountPath"]: item for item in container["volumeMounts"]}
     assert mounts["/auth/config.json"]["readOnly"] is True
+    assert mounts["/mirror"]["subPath"].endswith("/mirror-staging")
     assert pod_spec["automountServiceAccountToken"] is False
 
 
@@ -508,11 +527,13 @@ def test_prebuilt_skopeo_mirror_preserves_source_digest_and_metadata(
     assert deleted == ["job-mirror"]
     receipt = json.loads((image_dir / "receipt.json").read_text(encoding="utf-8"))
     assert receipt["source"] == "prebuilt-mirror"
+    assert receipt["mirror_mode"] == "staged-dir-v1"
     assert receipt["source_ref"] == source
     assert receipt["copy_source_ref"] == f"docker.io/harborframework/terminal-bench@{digest}"
     assert receipt["digest"] == digest
     assert receipt["immutable_ref"] == internal
     assert receipt["metadata"] == internal_metadata
+    assert not (image_dir / "mirror-staging").exists()
 
 
 def test_image_metadata_rejects_application_entrypoint(
