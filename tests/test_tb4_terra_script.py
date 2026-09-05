@@ -151,6 +151,7 @@ def test_terra_script_builds_cpu_and_gpu_monitors_without_exposing_key(
     assert "HARBOR_CODEX_CODE_MODE_ONLY=true" in remote_command
     assert "HARBOR_CODEX_RESPONSES_BRIDGE=false" in remote_command
     assert "HARBOR_BASESTREAM_BUILD_TIMEOUT_SEC=\"$gpu_mirror_timeout\"" in remote_command
+    assert "HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER=20" in remote_command
     assert remote_command.count("--include-task-name") == 3
     assert "--auto-partition" not in remote_command
 

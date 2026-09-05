@@ -73,7 +73,7 @@ remote_dataset="${HARBOR_TB4_TERRA_REMOTE_DATASET:-/gpfs/users/i-zhangguoqiang/d
 remote_egress_state="${HARBOR_TB4_TERRA_REMOTE_EGRESS_STATE:-/gpfs/users/i-zhangguoqiang/terminal-code/NexMLTask/gpu_manager/deploy/basestream/.state.json}"
 cpu_monitor_timeout="${HARBOR_TB4_TERRA_CPU_MONITOR_TIMEOUT_MINUTES:-2880}"
 gpu_monitor_timeout="${HARBOR_TB4_TERRA_GPU_MONITOR_TIMEOUT_MINUTES:-4320}"
-gpu_mirror_timeout="${HARBOR_TB4_TERRA_GPU_MIRROR_TIMEOUT_SEC:-28800}"
+gpu_mirror_timeout="${HARBOR_TB4_TERRA_GPU_MIRROR_TIMEOUT_SEC:-57600}"
 origin_thread_id="${CODEX_THREAD_ID:-}"
 
 for value in "$cpu_monitor_timeout" "$gpu_monitor_timeout" "$gpu_mirror_timeout"; do
@@ -308,6 +308,7 @@ python3 "$monitor" launch \
       HARBOR_CODEX_REASONING_EFFORT=max \
       HARBOR_CODEX_REASONING_SUMMARY=detailed \
       HARBOR_BASESTREAM_BUILD_TIMEOUT_SEC="$gpu_mirror_timeout" \
+      HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER=20 \
       HARBOR_BASESTREAM_CONTROL_ROOT="$control_root" \
       HARBOR_NEXAU_ENV=nexau_harbor.basestream_environment:BasestreamEnvironment \
       bash "$remote_work/scripts/smoke_tb3.sh" \
