@@ -35,6 +35,21 @@ uv sync --locked --extra cloud
 
 ## 运行 TB4（E2B CPU + Basestream H100）
 
+### gpt-5.6-terra 一键入口
+
+从当前开发机运行Terra全量评测时，使用专用入口：
+
+```bash
+scripts/run_tb4_terra.sh
+```
+
+它从`NexTask-rfc0012/.env`读取已验证的`Codex_API_KEY`，先在本机和Basestream egress各做一次
+`gpt-5.6-terra`最小请求，再启动两个独立monitor：本机63道CPU题使用E2B，远端3道GPU题使用
+Basestream/H100。Key仅通过进程环境和SSH stdin传递，不写进monitor request、命令行或远端文件。
+Terra工具协议固定为Codex 0.148、reasoning=max、272000 context、code-mode-only，关闭
+unified-exec和Responses bridge；DinD固定使用已验证的16 CPU模板，GPU外部镜像复制上限为8小时。
+可用`--job-name NAME`指定共同前缀，或用`--dry-run`只核验本地数据集路由而不调用API和启动任务。
+
 从普通开发机仍可直接调用`scripts/run_tb4.sh`：当参数是远端`/gpfs`路径且本机没有
 Basestream/GPFS控制面时，它会自动转给`scripts/submit_tb4.sh`。提交脚本只通过短连接SSH在
 `basestream-cpu`本机启动长任务monitor，收到任务ID后立即返回；Harbor控制器不会依赖SSH连接
