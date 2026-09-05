@@ -1558,7 +1558,6 @@ class BasestreamEnvironment(BaseEnvironment):
         image_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if configured:
             image_ref = str(configured)
-            metadata = self._image_metadata(image_ref)
             reference = _parse_registry_reference(image_ref)
             with _file_lock(image_dir / ".lock"):
                 if reference.registry in {"docker.io", "index.docker.io"}:
@@ -1570,7 +1569,9 @@ class BasestreamEnvironment(BaseEnvironment):
                         )
                         if reused is not None:
                             return reused
+                    metadata = self._image_metadata(image_ref)
                     return self._mirror_prebuilt_image(image_dir, image_ref, metadata)
+                metadata = self._image_metadata(image_ref)
                 receipt = {
                     "schema_version": "harbor-basestream-image-v1",
                     "environment_id": self.environment_id,

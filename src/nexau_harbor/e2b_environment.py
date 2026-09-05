@@ -11,7 +11,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import override
+from typing import Any, override
 from uuid import uuid4
 
 from harbor.environments import e2b as harbor_e2b
@@ -41,6 +41,8 @@ E2B_NO_PROXY_HOSTS_ENV = "HARBOR_NEXAU_NO_PROXY_HOSTS"
 E2B_START_RAMP_DELAY_ENV = "HARBOR_NEXAU_E2B_START_RAMP_DELAY_SEC"
 E2B_DETACHED_POLL_INTERVAL_SEC = 30
 E2B_DETACHED_REQUEST_TIMEOUT_SEC = 30
+E2B_STARTUP_REQUEST_TIMEOUT_SEC = 120
+E2B_STARTUP_COMMAND_ATTEMPTS = 3
 E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS = 5
 E2B_DEFAULT_TEMPLATE_BUILD_ATTEMPTS = 2
 E2B_TEMPLATE_BUILD_LOG_MAX_ENTRIES = 256
@@ -1286,11 +1288,8 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
             raise RuntimeError("Sandbox not found while restoring E2B image environment")
 
         mode = getattr(self, "_runtime_virtualenv_mode", "auto")
-        result = await self._sandbox.commands.run(
+        result = await self._run_startup_control_command(
             _runtime_env_probe_command(discover_virtualenvs=mode == "discover"),
-            user="root",
-            timeout=30,
-            request_timeout=30,
         )
         if result.exit_code != 0:
             raise RuntimeError(
@@ -1333,11 +1332,8 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
 
         if selected_virtualenv is not None:
             python_path = f"{selected_virtualenv}/bin/python"
-            validation = await self._sandbox.commands.run(
+            validation = await self._run_startup_control_command(
                 f"test -x {shlex.quote(python_path)}",
-                user="root",
-                timeout=30,
-                request_timeout=30,
             )
             if validation.exit_code != 0:
                 raise RuntimeError(
@@ -1359,6 +1355,23 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
                 (f", virtualenv={selected_virtualenv}" if selected_virtualenv is not None else ""),
             )
 
+    @retry(
+        stop=stop_after_attempt(E2B_STARTUP_COMMAND_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        reraise=True,
+    )
+    async def _run_startup_control_command(self, command: str) -> Any:
+        """Run an idempotent startup probe with control-plane retry headroom."""
+
+        if self._sandbox is None:
+            raise RuntimeError("Sandbox not found while running E2B startup probe")
+        return await self._sandbox.commands.run(
+            command,
+            user="root",
+            timeout=30,
+            request_timeout=E2B_STARTUP_REQUEST_TIMEOUT_SEC,
+        )
+
     async def _validate_sandbox_storage(self) -> None:
         requested_mb = self._effective_storage_mb
         if requested_mb is None:
@@ -1366,12 +1379,7 @@ class NexAUE2BEnvironment(harbor_e2b.E2BEnvironment):
         if self._sandbox is None:
             raise RuntimeError("Sandbox not found while validating E2B storage")
 
-        result = await self._sandbox.commands.run(
-            "df -Pk / | tail -n 1",
-            user="root",
-            timeout=30,
-            request_timeout=30,
-        )
+        result = await self._run_startup_control_command("df -Pk / | tail -n 1")
         if result.exit_code != 0:
             raise RuntimeError(
                 "Could not validate E2B sandbox storage: "

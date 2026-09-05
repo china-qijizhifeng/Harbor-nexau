@@ -421,6 +421,62 @@ def test_docker_hub_prebuilt_image_is_mirrored_before_runtime(
     assert captured[0][1:] == (source, source_metadata)
 
 
+def test_docker_hub_mirror_receipt_reuses_internal_image_without_source_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    digest = "sha256:" + "a" * 64
+    source = f"harborframework/terminal-bench:task@{digest}"
+    internal = f"harbor.local.clusters/project/task@{digest}"
+    environment = _environment(
+        tmp_path,
+        config=EnvironmentConfig(
+            cpus=4,
+            memory_mb=16384,
+            storage_mb=30720,
+            gpus=1,
+            gpu_types=["H100"],
+            docker_image=source,
+        ),
+    )
+    receipt_path = (
+        environment.settings.control_root
+        / "images"
+        / environment.environment_id
+        / "receipt.json"
+    )
+    receipt_path.parent.mkdir(mode=0o700, parents=True)
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "harbor-basestream-image-v1",
+                "environment_id": environment.environment_id,
+                "immutable_ref": internal,
+                "source": "prebuilt-mirror",
+                "source_ref": source,
+                "success": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    metadata = {
+        "image": internal,
+        "entrypoint": [],
+        "user": "root",
+        "workdir": "/app",
+    }
+
+    def internal_metadata_only(image_ref: str) -> dict[str, object]:
+        assert image_ref == internal
+        return metadata
+
+    monkeypatch.setattr(environment, "_image_metadata", internal_metadata_only)
+
+    actual_image, actual_metadata = environment._ensure_image_sync(force_build=False)
+
+    assert actual_image == internal
+    assert actual_metadata == metadata
+
+
 def test_prebuilt_mirror_uses_nexmltask_skopeo_preserve_digest_contract(
     tmp_path: Path,
 ) -> None:

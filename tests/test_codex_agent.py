@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -372,9 +373,18 @@ async def test_codex_shell_pipeline_keeps_jsonl_clean_and_propagates_exit(
     assert next(sessions.glob("rollout-*.jsonl")).is_file()
 
 
-async def test_codex_shell_resumes_same_thread_after_direct_http_429(
+@pytest.mark.parametrize(
+    "failure_message",
+    (
+        "exceeded retry limit, last status: 429 Too Many Requests",
+        "当前分组上游负载已饱和，请稍后再试",
+        "encrypted content in item 7 could not be verified or decrypted",
+    ),
+)
+async def test_codex_shell_resumes_same_thread_after_transient_gateway_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    failure_message: str,
 ) -> None:
     remote_root = tmp_path / "remote-retry"
     remote_logs = remote_root / "logs/agent"
@@ -407,6 +417,16 @@ async def test_codex_shell_resumes_same_thread_after_direct_http_429(
     fake_bin = tmp_path / "retry-bin"
     fake_bin.mkdir()
     fake_codex = fake_bin / "codex"
+    error_event = json.dumps(
+        {"type": "error", "message": failure_message},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    failed_event = json.dumps(
+        {"type": "turn.failed", "error": {"message": failure_message}},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     fake_codex.write_text(
         "#!/usr/bin/env bash\n"
         "count_file=\"$CODEX_HOME/fake-invocations\"\n"
@@ -425,10 +445,8 @@ async def test_codex_shell_resumes_same_thread_after_direct_http_429(
         "fi\n"
         "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-retry\"}'\n"
         "printf '%s\\n' '{\"type\":\"turn.started\"}'\n"
-        "printf '%s\\n' '{\"type\":\"error\",\"message\":"
-        "\"exceeded retry limit, last status: 429 Too Many Requests\"}'\n"
-        "printf '%s\\n' '{\"type\":\"turn.failed\",\"error\":{\"message\":"
-        "\"exceeded retry limit, last status: 429 Too Many Requests\"}}'\n"
+        f"printf '%s\\n' {shlex.quote(error_event)}\n"
+        f"printf '%s\\n' {shlex.quote(failed_event)}\n"
         "printf '%s\\n' '{\"type\":\"session_meta\",\"payload\":{"
         "\"id\":\"thread-retry\"}}' > \"$CODEX_HOME/sessions/rollout-retry.jsonl\"\n"
         "exit 1\n",

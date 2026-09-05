@@ -355,6 +355,33 @@ __HARBOR_NEXAU_RUNTIME_VENVS__
     assert environment._merge_env({"PATH": "/caller/bin"})["PATH"] == "/caller/bin"
     assert run.await_args_list[0].args == (_runtime_env_probe_command(),)
     assert run.await_args_list[1].args == ("test -x /srv/custom-python/bin/python",)
+    assert all(call.kwargs["request_timeout"] == 120 for call in run.await_args_list)
+
+
+async def test_runtime_env_probe_retries_control_plane_timeout() -> None:
+    probe_stdout = """\
+__HARBOR_NEXAU_RUNTIME_ENV__
+PATH=/usr/local/bin:/usr/bin:/bin
+__HARBOR_NEXAU_RUNTIME_VENVS__
+"""
+    run = AsyncMock(
+        side_effect=(
+            TimeoutError("command stream did not open"),
+            SimpleNamespace(exit_code=0, stdout=probe_stdout, stderr=""),
+        )
+    )
+    environment = object.__new__(NexAUE2BEnvironment)
+    environment._sandbox = SimpleNamespace(commands=SimpleNamespace(run=run))
+    environment._runtime_env_overlay = {}
+    environment._runtime_env_directives = (("PATH", "${PATH}"),)
+    environment._runtime_virtualenv_mode = "off"
+    environment._implicit_runtime_virtualenv = None
+    environment.logger = MagicMock()
+
+    await environment._restore_image_runtime_env()
+
+    assert run.await_count == 2
+    assert all(call.kwargs["request_timeout"] == 120 for call in run.await_args_list)
 
 
 def test_parses_runtime_probe_without_logging_environment_values() -> None:
@@ -466,7 +493,7 @@ async def test_validate_sandbox_storage_checks_root_capacity() -> None:
         "df -Pk / | tail -n 1",
         user="root",
         timeout=30,
-        request_timeout=30,
+        request_timeout=120,
     )
     environment.logger.info.assert_called_once_with(
         "E2B sandbox storage verified: requested=%s MB, total=%s MB, available=%s MB",

@@ -632,7 +632,9 @@ class TraceSafeCodexAgent(Codex):
             "500 Internal Server Error|502 Bad Gateway|503 Service Unavailable|"
             "504 Gateway Timeout|request (timed out|timeout)|stream (disconnected|error)|"
             "connection (reset|closed|failed)|error sending request|transport error|"
-            "server overloaded"
+            "server overloaded|当前分组上游负载已饱和|此模型并发不足负载严重|"
+            "encrypted content.*(verify|decrypt|parse)|"
+            "(verify|decrypt|parse).*encrypted content"
         )
         run_command = (
             "set +e\n"
