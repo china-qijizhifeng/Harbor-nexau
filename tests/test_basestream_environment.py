@@ -235,6 +235,51 @@ def test_image_metadata_verifies_digest_entrypoint_user_and_workdir(
     assert metadata["config_digest"] == config_digest
 
 
+def test_internal_registry_request_bypasses_process_proxy_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    environment = _environment(tmp_path)
+    captured_handlers: list[tuple[object, ...]] = []
+    captured_request: list[urllib.request.Request] = []
+
+    class Response:
+        headers = {"Docker-Content-Digest": "sha256:" + "a" * 64}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        @staticmethod
+        def read() -> bytes:
+            return b"internal"
+
+    class Opener:
+        @staticmethod
+        def open(request: urllib.request.Request, timeout: int):
+            assert timeout == 30
+            captured_request.append(request)
+            return Response()
+
+    def build_opener(*handlers: object):
+        captured_handlers.append(handlers)
+        return Opener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+
+    body, _ = environment._registry_request(
+        "https://harbor.local.clusters/v2/project/task/manifests/digest",
+        auth="encoded-credentials",
+    )
+
+    assert body == b"internal"
+    proxy_handler = captured_handlers[0][0]
+    assert isinstance(proxy_handler, urllib.request.ProxyHandler)
+    assert proxy_handler.proxies == {}
+    assert captured_request[0].get_header("Authorization") == "Basic encoded-credentials"
+
+
 def test_parse_official_docker_hub_reference_removes_tag_from_api_path() -> None:
     digest = "sha256:" + "a" * 64
 

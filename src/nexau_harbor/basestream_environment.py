@@ -842,8 +842,12 @@ class BasestreamEnvironment(BaseEnvironment):
             if self.settings.registry_tls_verify
             else ssl._create_unverified_context()
         )
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=context),
+        )
         try:
-            with urllib.request.urlopen(request, context=context, timeout=30) as response:
+            with opener.open(request, timeout=30) as response:
                 return response.read(), response.headers
         except (urllib.error.HTTPError, urllib.error.URLError) as exc:
             raise BasestreamError(f"registry request failed for {url}: {exc}") from exc
