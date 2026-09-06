@@ -232,10 +232,13 @@ monitor="$remote_codex_home/skills/monitor-long-task/scripts/long_task_monitor.p
 webhook="$remote_codex_home/secrets/feishu-long-task-webhook"
 monitor_state="$remote_work/.basestream/monitors"
 control_root="$remote_work/.basestream"
+gpu_audit="$remote_work/scripts/audit_harbor_job.py"
+gpu_result_dir="$remote_work/jobs/$gpu_job"
 
 test -x "$runtime_python"
 test -f "$runtime_env"
 test -x "$remote_work/scripts/smoke_tb3.sh"
+test -f "$gpu_audit"
 test -d "$remote_dataset"
 test -f "$remote_egress_state"
 test -f "$monitor"
@@ -282,6 +285,15 @@ if response.status != "completed":
 print("Basestream Terra API preflight: OK")
 PY
 
+for dependency_url in \
+  https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh \
+  https://registry.npmjs.org/@openai%2fcodex
+do
+  curl --fail --silent --show-error --location \
+    --connect-timeout 15 --max-time 60 --output /dev/null "$dependency_url"
+done
+printf '%s\n' 'Basestream Agent dependency egress preflight: OK'
+
 mkdir -p -- "$monitor_state"
 python3 "$monitor" launch \
   --project 'Harbor TB4 Terra GPU' \
@@ -291,38 +303,51 @@ python3 "$monitor" launch \
   --webhook-file "$webhook" \
   --timeout-minutes "$gpu_monitor_timeout" \
   -- \
-  "$runtime_python" -m dotenv \
-    --file "$runtime_env" run --no-override -- \
-    /usr/bin/env \
-      _HARBOR_NEXAU_DOTENV_LOADED=1 \
-      PYTHONPATH="$remote_work/src" \
-      PATH="$remote_runtime/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-      HARBOR_NEXAU_MODEL=gpt-5.6-terra \
-      HARBOR_NEXAU_HARNESS=codex \
-      HARBOR_CODEX_UNIFIED_EXEC=false \
-      HARBOR_CODEX_CODE_MODE=true \
-      HARBOR_CODEX_CODE_MODE_ONLY=true \
-      HARBOR_CODEX_MULTI_AGENT=false \
-      HARBOR_CODEX_RESPONSES_BRIDGE=false \
-      HARBOR_CODEX_CONTEXT_WINDOW=272000 \
-      HARBOR_CODEX_REASONING_EFFORT=max \
-      HARBOR_CODEX_REASONING_SUMMARY=detailed \
-      HARBOR_BASESTREAM_BUILD_TIMEOUT_SEC="$gpu_mirror_timeout" \
-      HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER=20 \
-      HARBOR_BASESTREAM_CONTROL_ROOT="$control_root" \
-      HARBOR_NEXAU_ENV=nexau_harbor.basestream_environment:BasestreamEnvironment \
-      bash "$remote_work/scripts/smoke_tb3.sh" \
-        --path "$remote_dataset" \
-        --include-task-name fp8-rmsnorm-gemm \
-        --include-task-name jax-speedrun-gpu \
-        --include-task-name math-eval-grader \
-        --jobs-dir "$remote_work/jobs" \
-        --trace-mode \
-        --harness codex \
-        --n-tasks 3 \
-        --n-concurrent 1 \
-        --job-name "$gpu_job" \
-        --yes
+  /bin/bash -c 'set -euo pipefail
+runtime_python=$1
+gpu_audit=$2
+gpu_result_dir=$3
+shift 3
+"$@"
+"$runtime_python" "$gpu_audit" \
+  --job-dir "$gpu_result_dir" \
+  --expected-trials 3 \
+  --expected-task fp8-rmsnorm-gemm \
+  --expected-task jax-speedrun-gpu \
+  --expected-task math-eval-grader' \
+    bash "$runtime_python" "$gpu_audit" "$gpu_result_dir" \
+    "$runtime_python" -m dotenv \
+      --file "$runtime_env" run --no-override -- \
+      /usr/bin/env \
+        _HARBOR_NEXAU_DOTENV_LOADED=1 \
+        PYTHONPATH="$remote_work/src" \
+        PATH="$remote_runtime/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        HARBOR_NEXAU_MODEL=gpt-5.6-terra \
+        HARBOR_NEXAU_HARNESS=codex \
+        HARBOR_CODEX_UNIFIED_EXEC=false \
+        HARBOR_CODEX_CODE_MODE=true \
+        HARBOR_CODEX_CODE_MODE_ONLY=true \
+        HARBOR_CODEX_MULTI_AGENT=false \
+        HARBOR_CODEX_RESPONSES_BRIDGE=false \
+        HARBOR_CODEX_CONTEXT_WINDOW=272000 \
+        HARBOR_CODEX_REASONING_EFFORT=max \
+        HARBOR_CODEX_REASONING_SUMMARY=detailed \
+        HARBOR_BASESTREAM_BUILD_TIMEOUT_SEC="$gpu_mirror_timeout" \
+        HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER=20 \
+        HARBOR_BASESTREAM_CONTROL_ROOT="$control_root" \
+        HARBOR_NEXAU_ENV=nexau_harbor.basestream_environment:BasestreamEnvironment \
+        bash "$remote_work/scripts/smoke_tb3.sh" \
+          --path "$remote_dataset" \
+          --include-task-name fp8-rmsnorm-gemm \
+          --include-task-name jax-speedrun-gpu \
+          --include-task-name math-eval-grader \
+          --jobs-dir "$remote_work/jobs" \
+          --trace-mode \
+          --harness codex \
+          --n-tasks 3 \
+          --n-concurrent 1 \
+          --job-name "$gpu_job" \
+          --yes
 REMOTE
 
 remote_command=""
