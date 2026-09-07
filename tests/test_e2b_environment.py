@@ -925,8 +925,33 @@ async def test_detached_exec_retries_transient_poll_failure(monkeypatch) -> None
 
     assert result.return_code == 0
     assert command_run.await_count == 3
-    assert E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS == 5
+    assert E2B_DETACHED_MAX_CONSECUTIVE_POLL_ERRORS == 20
     assert E2B_DETACHED_POLL_INTERVAL_SEC == 30
+
+
+async def test_detached_exec_tolerates_extended_control_plane_outage(monkeypatch) -> None:
+    handle = SimpleNamespace(pid=247, disconnect=AsyncMock())
+    command_run = AsyncMock(
+        side_effect=[
+            handle,
+            *[ConnectionError("temporary poll failure") for _ in range(19)],
+            SimpleNamespace(stdout="__HARBOR_NEXAU_STATUS__:DONE:0\n"),
+        ]
+    )
+    file_read = AsyncMock(side_effect=["", ""])
+    environment, _ = _detached_test_environment(command_run, file_read)
+    monkeypatch.setattr(e2b_environment, "E2B_DETACHED_POLL_INTERVAL_SEC", 0)
+
+    result = await environment._exec_detached(
+        "long-agent",
+        cwd=None,
+        env=None,
+        timeout_sec=None,
+        user="root",
+    )
+
+    assert result.return_code == 0
+    assert command_run.await_count == 21
 
 
 async def test_detached_exec_kills_remote_process_when_cancelled(monkeypatch) -> None:
