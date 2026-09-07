@@ -29,6 +29,7 @@ def _environment(
     *,
     config: EnvironmentConfig | None = None,
     image_user: str = "root",
+    codex_bundle_path: Path | None = None,
 ) -> BasestreamEnvironment:
     pvc_root = tmp_path / "pvc"
     environment_dir = pvc_root / "dataset" / "environment"
@@ -74,6 +75,7 @@ def _environment(
         registry_auth_path=registry_auth,
         registry_auth_subpath="info/registry.json",
         egress_proxy_url=("http://svc-egress.bg-agentic-coding.svc.cluster.local:7890"),
+        codex_bundle_path=codex_bundle_path,
     )
     environment._image_user = image_user
     environment._image_workdir = "/app"
@@ -135,6 +137,41 @@ def test_runtime_manifest_preserves_entrypoint_and_requests_exact_jax_resources(
     env = {item["name"]: item["value"] for item in container["env"]}
     assert env["HTTPS_PROXY"] == ("http://svc-egress.bg-agentic-coding.svc.cluster.local:7890")
     assert "NVIDIA_VISIBLE_DEVICES" not in env
+
+
+def test_runtime_manifest_mounts_preinstalled_codex_bundle(tmp_path: Path) -> None:
+    bundle = tmp_path / "pvc/codex-bundles/0.148.0-x86_64-unknown-linux-musl"
+    bundle.mkdir(parents=True)
+    environment = _environment(tmp_path, codex_bundle_path=bundle)
+
+    manifest = environment._runtime_manifest(
+        alias="codex-bundle",
+        image_ref="harbor.local.clusters/project/task@sha256:" + "a" * 64,
+    )
+
+    container = manifest["spec"]["tasks"][0]["template"]["spec"]["containers"][0]
+    mount = next(
+        item
+        for item in container["volumeMounts"]
+        if item["mountPath"] == "/opt/harbor-nexau/codex"
+    )
+    assert mount == {
+        "mountPath": "/opt/harbor-nexau/codex",
+        "name": "user-pvc",
+        "readOnly": True,
+        "subPath": "codex-bundles/0.148.0-x86_64-unknown-linux-musl",
+    }
+    assert environment.preinstalled_codex_path == "/opt/harbor-nexau/codex/bin/codex"
+    assert environment.preinstalled_ripgrep_path == "/opt/harbor-nexau/codex/codex-path/rg"
+
+
+def test_host_layout_rejects_incomplete_codex_bundle(tmp_path: Path) -> None:
+    bundle = tmp_path / "pvc/codex-bundles/incomplete"
+    bundle.mkdir(parents=True)
+    environment = _environment(tmp_path, codex_bundle_path=bundle)
+
+    with pytest.raises(BasestreamError, match="Codex bundle file is missing"):
+        environment._ensure_host_layout()
 
 
 def test_runtime_manifest_rejects_non_h100(tmp_path: Path) -> None:

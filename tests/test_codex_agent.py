@@ -246,6 +246,30 @@ async def test_codex_install_uses_detached_e2b_execution(tmp_path: Path) -> None
     assert dependency_call["env"]["DEBIAN_FRONTEND"] == "noninteractive"
 
 
+async def test_codex_install_uses_exact_preinstalled_bundle_without_network(
+    tmp_path: Path,
+) -> None:
+    agent = make_agent(tmp_path)
+    environment = FakeEnvironment(missing_system_dependencies=True)
+    environment.preinstalled_codex_path = "/opt/harbor-nexau/codex/bin/codex"
+    environment.preinstalled_ripgrep_path = "/opt/harbor-nexau/codex/codex-path/rg"
+
+    await agent.install(environment)
+
+    assert len(environment.exec_calls) == 1
+    call = environment.exec_calls[0]
+    assert "codex-cli 0.148.0" in call["command"]
+    assert "ln -sf /opt/harbor-nexau/codex/bin/codex /usr/local/bin/codex" in call[
+        "command"
+    ]
+    assert "ln -sf /opt/harbor-nexau/codex/codex-path/rg /usr/local/bin/rg" in call[
+        "command"
+    ]
+    assert "apt-get" not in call["command"]
+    assert "npm" not in call["command"]
+    assert call["env"][NEXAU_DETACHED_EXEC_ENV] == "1"
+
+
 async def test_codex_root_execution_outside_install_stays_attached(tmp_path: Path) -> None:
     agent = make_agent(tmp_path)
     environment = FakeEnvironment()

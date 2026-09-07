@@ -342,6 +342,30 @@ class TraceSafeCodexAgent(Codex):
     async def install(self, environment: BaseEnvironment) -> None:
         self._northgate_detached_install = True
         try:
+            bundled_codex = getattr(environment, "preinstalled_codex_path", None)
+            if bundled_codex:
+                bundled_rg = getattr(environment, "preinstalled_ripgrep_path", None)
+                expected_version = f"codex-cli {self.version()}"
+                commands = [
+                    "set -e",
+                    f"test -x {shlex.quote(str(bundled_codex))}",
+                    f"actual_version=$({shlex.quote(str(bundled_codex))} --version)",
+                    f"if [ \"$actual_version\" != {shlex.quote(expected_version)} ]; then",
+                    '  printf \'Codex bundle version mismatch: %s\\n\' "$actual_version" >&2',
+                    "  exit 42",
+                    "fi",
+                    f"ln -sf {shlex.quote(str(bundled_codex))} /usr/local/bin/codex",
+                ]
+                if bundled_rg:
+                    commands.extend(
+                        (
+                            f"test -x {shlex.quote(str(bundled_rg))}",
+                            f"ln -sf {shlex.quote(str(bundled_rg))} /usr/local/bin/rg",
+                        )
+                    )
+                commands.append("codex --version")
+                await self.exec_as_root(environment, command="\n".join(commands))
+                return
             await self.exec_as_root(
                 environment,
                 command=PREPARE_DEBIAN_CA_CERTIFICATES_JAVA,

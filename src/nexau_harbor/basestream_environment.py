@@ -44,6 +44,7 @@ from harbor.models.trial.paths import TrialPaths
 
 _TERMINAL_PHASES = {"Aborted", "Completed", "Failed", "Succeeded", "Terminated"}
 _SUCCESS_PHASES = {"Completed", "Succeeded"}
+_CODEX_BUNDLE_MOUNT = PurePosixPath("/opt/harbor-nexau/codex")
 _SAFE_LABEL = re.compile(r"[^a-z0-9-]+")
 _SAFE_USER = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_.-]*|[0-9]+)(?::[0-9]+)?")
 _ALLOWED_ENTRYPOINTS = {(), ("/opt/nvidia/nvidia_entrypoint.sh",)}
@@ -240,6 +241,7 @@ class BasestreamSettings:
     docker_hub_mirror: str
     egress_proxy_url: str | None
     egress_state_path: Path
+    codex_bundle_path: Path | None
     excluded_gpu_nodes: tuple[str, ...]
     kubectl: str
     build_timeout_sec: int
@@ -431,6 +433,7 @@ class BasestreamEnvironment(BaseEnvironment):
         docker_hub_mirror: str | None = None,
         egress_proxy_url: str | None = None,
         egress_state_path: str | Path | None = None,
+        codex_bundle_path: str | Path | None = None,
         excluded_gpu_nodes: str | tuple[str, ...] | list[str] | None = None,
         kubectl: str | None = None,
         build_timeout_sec: int | str | None = None,
@@ -461,6 +464,11 @@ class BasestreamEnvironment(BaseEnvironment):
             _as_bool(registry_tls_verify)
             if registry_tls_verify is not None
             else _as_bool(_env("HARBOR_BASESTREAM_REGISTRY_TLS_VERIFY", "false"))
+        )
+        configured_codex_bundle = (
+            codex_bundle_path
+            if codex_bundle_path is not None
+            else os.environ.get("HARBOR_BASESTREAM_CODEX_BUNDLE_PATH")
         )
         self.settings = BasestreamSettings(
             namespace=namespace or _env("HARBOR_BASESTREAM_NAMESPACE", "bg-agentic-coding"),
@@ -538,6 +546,11 @@ class BasestreamEnvironment(BaseEnvironment):
                     "gpu_manager/deploy/basestream/.state.json",
                 )
             ).expanduser(),
+            codex_bundle_path=(
+                Path(configured_codex_bundle).expanduser()
+                if configured_codex_bundle
+                else None
+            ),
             excluded_gpu_nodes=_csv(configured_exclusions),
             kubectl=kubectl or _env("HARBOR_BASESTREAM_KUBECTL", "kubectl"),
             build_timeout_sec=_as_int(
@@ -585,6 +598,10 @@ class BasestreamEnvironment(BaseEnvironment):
         control_root = self.settings.control_root.resolve()
         if not _is_relative_to(control_root, host_root) or control_root == host_root:
             raise ValueError("control_root must be a child of pvc_host_root")
+        if self.settings.codex_bundle_path is not None:
+            bundle = self.settings.codex_bundle_path.resolve()
+            if bundle == host_root or not _is_relative_to(bundle, host_root):
+                raise ValueError("codex_bundle_path must be a child of pvc_host_root")
         if not self.settings.registry_repository or "@" in self.settings.registry_repository:
             raise ValueError("registry_repository must be a taggable repository prefix")
         if "@sha256:" not in self.settings.skopeo_image:
@@ -629,6 +646,18 @@ class BasestreamEnvironment(BaseEnvironment):
         return EnvironmentCapabilities(gpus=True, disable_internet=True, mounted=True)
 
     @property
+    def preinstalled_codex_path(self) -> str | None:
+        if self.settings.codex_bundle_path is None:
+            return None
+        return (_CODEX_BUNDLE_MOUNT / "bin/codex").as_posix()
+
+    @property
+    def preinstalled_ripgrep_path(self) -> str | None:
+        if self.settings.codex_bundle_path is None:
+            return None
+        return (_CODEX_BUNDLE_MOUNT / "codex-path/rg").as_posix()
+
+    @property
     def _dockerfile_path(self) -> Path:
         return self.environment_dir / "Dockerfile"
 
@@ -670,6 +699,24 @@ class BasestreamEnvironment(BaseEnvironment):
             raise BasestreamError(
                 f"Harbor registry auth is missing: {self.settings.registry_auth_path}"
             )
+        bundle = self.settings.codex_bundle_path
+        if bundle is not None:
+            if bundle.is_symlink() or not bundle.is_dir():
+                raise BasestreamError(f"Codex bundle is not a safe directory: {bundle}")
+            required_files = {
+                "bin/codex": True,
+                "bin/codex-code-mode-host": True,
+                "codex-path/rg": True,
+                "codex-resources/bwrap": True,
+                "codex-resources/zsh/bin/zsh": True,
+                "codex-package.json": False,
+            }
+            for relative, executable in required_files.items():
+                path = bundle / relative
+                if path.is_symlink() or not path.is_file():
+                    raise BasestreamError(f"Codex bundle file is missing or unsafe: {path}")
+                if executable and not os.access(path, os.X_OK):
+                    raise BasestreamError(f"Codex bundle file is not executable: {path}")
 
     def _kubectl_command(self, *args: str) -> list[str]:
         return [self.settings.kubectl, *args, "-n", self.settings.namespace]
@@ -1656,6 +1703,19 @@ class BasestreamEnvironment(BaseEnvironment):
             }
         ]
         targets = {"/harbor/session"}
+        if self.settings.codex_bundle_path is not None:
+            target = _CODEX_BUNDLE_MOUNT.as_posix()
+            targets.add(target)
+            mounts.append(
+                {
+                    "mountPath": target,
+                    "name": "user-pvc",
+                    "readOnly": True,
+                    "subPath": self.settings.pvc_subpath(
+                        self.settings.codex_bundle_path
+                    ),
+                }
+            )
         for index, mount in enumerate(self._mounts):
             if mount.get("type") != "bind":
                 raise BasestreamError("BasestreamEnvironment supports only bind mounts")

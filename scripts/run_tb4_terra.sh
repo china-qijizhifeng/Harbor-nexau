@@ -69,6 +69,7 @@ remote_host="${HARBOR_TB4_TERRA_REMOTE_HOST:-basestream-cpu}"
 remote_work="${HARBOR_TB4_TERRA_REMOTE_WORK:-/gpfs/users/i-zhangguoqiang/terminal-code/Harbor-nexau-tb4-smoke}"
 remote_runtime="${HARBOR_TB4_TERRA_REMOTE_RUNTIME:-/gpfs/users/i-zhangguoqiang/terminal-code/Harbor-nexau}"
 remote_codex_home="${HARBOR_TB4_TERRA_REMOTE_CODEX_HOME:-/gpfs/users/i-zhangguoqiang/info/.codex}"
+remote_codex_bundle="${HARBOR_TB4_TERRA_REMOTE_CODEX_BUNDLE:-/gpfs/users/i-zhangguoqiang/info/.codex/packages/standalone/releases/0.148.0-x86_64-unknown-linux-musl}"
 remote_dataset="${HARBOR_TB4_TERRA_REMOTE_DATASET:-/gpfs/users/i-zhangguoqiang/datasets/tb4-4.0.0/terminal-bench}"
 remote_egress_state="${HARBOR_TB4_TERRA_REMOTE_EGRESS_STATE:-/gpfs/users/i-zhangguoqiang/terminal-code/NexMLTask/gpu_manager/deploy/basestream/.state.json}"
 cpu_monitor_timeout="${HARBOR_TB4_TERRA_CPU_MONITOR_TIMEOUT_MINUTES:-2880}"
@@ -94,6 +95,7 @@ for path in \
   "$remote_work" \
   "$remote_runtime" \
   "$remote_codex_home" \
+  "$remote_codex_bundle" \
   "$remote_dataset" \
   "$remote_egress_state"
 do
@@ -239,6 +241,10 @@ test -x "$runtime_python"
 test -f "$runtime_env"
 test -x "$remote_work/scripts/smoke_tb3.sh"
 test -f "$gpu_audit"
+test -x "$remote_codex_bundle/bin/codex"
+test -x "$remote_codex_bundle/bin/codex-code-mode-host"
+test -x "$remote_codex_bundle/codex-path/rg"
+test "$("$remote_codex_bundle/bin/codex" --version)" = 'codex-cli 0.148.0'
 test -d "$remote_dataset"
 test -f "$remote_egress_state"
 test -f "$monitor"
@@ -333,6 +339,7 @@ shift 3
         HARBOR_CODEX_REASONING_EFFORT=max \
         HARBOR_CODEX_REASONING_SUMMARY=detailed \
         HARBOR_BASESTREAM_BUILD_TIMEOUT_SEC="$gpu_mirror_timeout" \
+        HARBOR_BASESTREAM_CODEX_BUNDLE_PATH="$remote_codex_bundle" \
         HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER=20 \
         HARBOR_BASESTREAM_CONTROL_ROOT="$control_root" \
         HARBOR_NEXAU_ENV=nexau_harbor.basestream_environment:BasestreamEnvironment \
@@ -355,6 +362,7 @@ for assignment in \
   "remote_work=$remote_work" \
   "remote_runtime=$remote_runtime" \
   "remote_codex_home=$remote_codex_home" \
+  "remote_codex_bundle=$remote_codex_bundle" \
   "remote_dataset=$remote_dataset" \
   "remote_egress_state=$remote_egress_state" \
   "gpu_job=$gpu_job" \

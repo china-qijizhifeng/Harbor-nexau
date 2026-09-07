@@ -117,6 +117,7 @@ def test_terra_script_builds_cpu_and_gpu_monitors_without_exposing_key(
             "HARBOR_TB4_TERRA_REMOTE_WORK": remote_work,
             "HARBOR_TB4_TERRA_REMOTE_RUNTIME": "/remote/runtime",
             "HARBOR_TB4_TERRA_REMOTE_CODEX_HOME": "/remote/codex",
+            "HARBOR_TB4_TERRA_REMOTE_CODEX_BUNDLE": "/remote/codex-bundle",
             "HARBOR_TB4_TERRA_REMOTE_DATASET": "/remote/dataset",
             "HARBOR_TB4_TERRA_REMOTE_EGRESS_STATE": "/remote/egress.json",
             "HARBOR_TB4_TERRA_CPU_MONITOR_TIMEOUT_MINUTES": "111",
@@ -151,6 +152,8 @@ def test_terra_script_builds_cpu_and_gpu_monitors_without_exposing_key(
     assert "HARBOR_CODEX_CODE_MODE_ONLY=true" in remote_command
     assert "HARBOR_CODEX_RESPONSES_BRIDGE=false" in remote_command
     assert "HARBOR_BASESTREAM_BUILD_TIMEOUT_SEC=\"$gpu_mirror_timeout\"" in remote_command
+    assert "HARBOR_BASESTREAM_CODEX_BUNDLE_PATH=\"$remote_codex_bundle\"" in remote_command
+    assert "codex-cli 0.148.0" in remote_command
     assert "HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER=20" in remote_command
     assert "Basestream Agent dependency egress preflight: OK" in remote_command
     assert "runtime_python=$1" in remote_command
