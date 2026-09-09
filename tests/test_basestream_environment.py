@@ -115,6 +115,7 @@ def test_runtime_manifest_preserves_entrypoint_and_requests_exact_jax_resources(
 
     manifest = environment._runtime_manifest(alias="jax-env", image_ref=image)
 
+    assert manifest["metadata"]["annotations"]["project"] == "TerminalBench"
     pod_spec = manifest["spec"]["tasks"][0]["template"]["spec"]
     container = pod_spec["containers"][0]
     assert "command" not in container
@@ -218,6 +219,7 @@ def test_build_manifest_is_cpu_only_and_mounts_exact_context(tmp_path: Path) -> 
         timeout_sec=600,
     )
 
+    assert manifest["metadata"]["annotations"]["project"] == "TerminalBench"
     pod_spec = manifest["spec"]["tasks"][0]["template"]["spec"]
     container = pod_spec["containers"][0]
     assert container["command"] == ["/kaniko/executor"]
@@ -577,6 +579,7 @@ def test_prebuilt_mirror_uses_nexmltask_skopeo_preserve_digest_contract(
         timeout_sec=600,
     )
 
+    assert manifest["metadata"]["annotations"]["project"] == "TerminalBench"
     pod_spec = manifest["spec"]["tasks"][0]["template"]["spec"]
     container = pod_spec["containers"][0]
     assert container["image"].endswith(

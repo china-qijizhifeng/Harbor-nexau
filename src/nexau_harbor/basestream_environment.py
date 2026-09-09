@@ -224,6 +224,7 @@ class BasestreamSettings:
     namespace: str
     queue: str
     priority_class: str
+    project: str
     pvc_name: str
     pvc_host_root: Path
     control_root: Path
@@ -416,6 +417,7 @@ class BasestreamEnvironment(BaseEnvironment):
         namespace: str | None = None,
         queue: str | None = None,
         priority_class: str | None = None,
+        project: str | None = None,
         pvc_name: str | None = None,
         pvc_host_root: str | Path | None = None,
         control_root: str | Path | None = None,
@@ -475,6 +477,7 @@ class BasestreamEnvironment(BaseEnvironment):
             queue=queue or _env("HARBOR_BASESTREAM_QUEUE", "bg-agentic-coding"),
             priority_class=priority_class
             or _env("HARBOR_BASESTREAM_PRIORITY_CLASS", "higher-priority-job"),
+            project=project or _env("HARBOR_BASESTREAM_PROJECT", "TerminalBench"),
             pvc_name=pvc_name or _env("HARBOR_BASESTREAM_PVC", "i-zhangguoqiang"),
             pvc_host_root=host_root,
             control_root=provider_root,
@@ -620,6 +623,7 @@ class BasestreamEnvironment(BaseEnvironment):
             (self.settings.namespace, "namespace"),
             (self.settings.queue, "queue"),
             (self.settings.priority_class, "priority_class"),
+            (self.settings.project, "project"),
             (self.settings.pvc_name, "pvc_name"),
         ):
             if not value or any(character.isspace() for character in value):
@@ -1181,6 +1185,7 @@ class BasestreamEnvironment(BaseEnvironment):
                 "namespace": self.settings.namespace,
                 "annotations": {
                     "JobAlias": alias,
+                    "project": self.settings.project,
                     "scheduling.volcano.sh/queue-name": self.settings.queue,
                 },
                 "labels": {
@@ -1319,6 +1324,7 @@ class BasestreamEnvironment(BaseEnvironment):
                 "namespace": self.settings.namespace,
                 "annotations": {
                     "JobAlias": alias,
+                    "project": self.settings.project,
                     "scheduling.volcano.sh/queue-name": self.settings.queue,
                 },
                 "labels": {
@@ -1859,6 +1865,7 @@ class BasestreamEnvironment(BaseEnvironment):
                 "annotations": {
                     "JobAlias": alias,
                     "harbor/session-id": self.session_id,
+                    "project": self.settings.project,
                     "scheduling.volcano.sh/queue-name": self.settings.queue,
                 },
                 "labels": {

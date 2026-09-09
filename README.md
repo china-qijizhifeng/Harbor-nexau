@@ -112,7 +112,8 @@ scripts/run_tb4.sh \
 GPU并发默认是 1，可用 `HARBOR_NEXAU_BASESTREAM_CONCURRENCY` 调整。`jax-speedrun-gpu` 会原样
 申请 `16 CPU / 32 GiB / 1024000 MiB ephemeral-storage / 1 H100`；如果集群没有满足条件的空闲
 节点，它会保持排队而不是静默降配。数据集、jobs目录以及 GPU任务实际解析到的路径都必须位于
-`HARBOR_BASESTREAM_PVC_HOST_ROOT` 下。完整设计与安全边界见
+`HARBOR_BASESTREAM_PVC_HOST_ROOT` 下。所有提交的 Basestream Job 默认标记为项目
+`TerminalBench`，可通过 `HARBOR_BASESTREAM_PROJECT` 覆盖。完整设计与安全边界见
 [`docs/rfcs/0001-basestream-gpu-environment.md`](docs/rfcs/0001-basestream-gpu-environment.md)。
 
 ## 运行 TB3 smoke test
